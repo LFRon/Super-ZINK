@@ -12,30 +12,6 @@
 #include "sz_caps.h"
 #include "sz_debug.h"
 
-/* Everything we ask the driver about, chained through VkPhysicalDeviceFeatures2
- * in one call. Members are read by the feature expressions in sz_caps.h. */
-struct sz_caps_query {
-   VkPhysicalDeviceVulkan12Features f12;
-   VkPhysicalDeviceVulkan13Features f13;
-   VkPhysicalDeviceVulkan14Features f14;
-
-   /* Promoted extensions keep their original structure type as an alias of the
-    * core one (e.g. VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT
-    * == ..._FEATURES), so these are valid to chain on both 1.3 and 1.4. */
-   VkPhysicalDeviceDynamicRenderingLocalReadFeatures local_read;
-   VkPhysicalDeviceHostImageCopyFeaturesEXT host_image_copy;
-
-   VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer;
-   VkPhysicalDevicePresentWaitFeaturesKHR present_wait;
-   VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
-   VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT msrtss;
-   VkPhysicalDeviceShaderObjectFeaturesEXT shader_object;
-   VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsr;
-   VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64;
-
-   VkPhysicalDeviceVulkan14Properties props14;
-};
-
 static bool
 sz_api_at_least(uint32_t api, uint32_t required)
 {
@@ -71,6 +47,86 @@ sz_chain(VkBaseOutStructure **head, VkBaseOutStructure **tail, void *s)
       *head = b;
 
    *tail = b;
+}
+
+void
+sz_vk_features_prepare(struct sz_vk_features *f, uint32_t api_version)
+{
+   memset(f, 0, sizeof(*f));
+
+   f->f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+   f->f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+   f->f14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
+
+   /* Alias structure types: identical to their core counterparts, so linking
+    * them on a 1.4 device answers the same question the core struct would. */
+   f->local_read.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES;
+   f->host_image_copy.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
+   f->descriptor_buffer.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT;
+   f->present_wait.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
+   f->gpl.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT;
+   f->msrtss.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT;
+   f->shader_object.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT;
+   f->fsr.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+   f->image_int64.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT;
+
+   (void)api_version;
+}
+
+void
+sz_vk_features_link(struct sz_vk_features *f, uint32_t api_version,
+                    const struct sz_vk_feature_selection *sel,
+                    VkPhysicalDeviceFeatures2 *features2)
+{
+   features2->pNext = NULL;
+
+   VkBaseOutStructure *head = NULL;
+   VkBaseOutStructure *tail = NULL;
+
+   /* Core structs only exist on devices that know them; chaining a 1.4 struct
+    * into a 1.3 driver makes vkGetPhysicalDeviceFeatures2 return
+    * VK_ERROR_FEATURE_NOT_PRESENT on some drivers. */
+   if (sz_api_at_least(api_version, VK_API_VERSION_1_2))
+      sz_chain(&head, &tail, &f->f12);
+   if (sz_api_at_least(api_version, VK_API_VERSION_1_3))
+      sz_chain(&head, &tail, &f->f13);
+   if (sz_api_at_least(api_version, VK_API_VERSION_1_4))
+      sz_chain(&head, &tail, &f->f14);
+
+   /* Promoted-but-not-mandatory extensions: ask through their own structure so
+    * the answer is available on 1.3 as well as 1.4. On 1.4 the core struct
+    * already carries the feature bit. */
+   if (!sz_api_at_least(api_version, VK_API_VERSION_1_4) && sel->local_read)
+      sz_chain(&head, &tail, &f->local_read);
+   if (!sz_api_at_least(api_version, VK_API_VERSION_1_4) && sel->host_image_copy)
+      sz_chain(&head, &tail, &f->host_image_copy);
+
+   /* Extensions that 1.4 did not promote. */
+   if (sel->descriptor_buffer)
+      sz_chain(&head, &tail, &f->descriptor_buffer);
+   if (sel->present_wait)
+      sz_chain(&head, &tail, &f->present_wait);
+   if (sel->graphics_pipeline_library)
+      sz_chain(&head, &tail, &f->gpl);
+   if (sel->msrtss)
+      sz_chain(&head, &tail, &f->msrtss);
+   if (sel->shader_object)
+      sz_chain(&head, &tail, &f->shader_object);
+   if (sel->fragment_shading_rate)
+      sz_chain(&head, &tail, &f->fsr);
+   if (sel->shader_image_int64)
+      sz_chain(&head, &tail, &f->image_int64);
+
+   features2->pNext = head;
 }
 
 void
@@ -116,96 +172,38 @@ sz_caps_init(struct sz_caps *caps,
    }
 
    /* ── one features query, chained ───────────────────────────────────────── */
-   struct sz_caps_query q;
-   memset(&q, 0, sizeof(q));
+   struct sz_vk_feature_selection sel = {
+      .local_read = sz_ext_advertised(exts, ext_count,
+                                      VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME),
+      .host_image_copy = sz_ext_advertised(exts, ext_count,
+                                           VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME),
+      .descriptor_buffer = sz_ext_advertised(exts, ext_count,
+                                             VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME),
+      .present_wait = sz_ext_advertised(exts, ext_count,
+                                        VK_KHR_PRESENT_WAIT_EXTENSION_NAME),
+      .graphics_pipeline_library =
+         sz_ext_advertised(exts, ext_count,
+                           VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME),
+      .msrtss = sz_ext_advertised(exts, ext_count,
+                                  VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME),
+      .shader_object = sz_ext_advertised(exts, ext_count,
+                                         VK_EXT_SHADER_OBJECT_EXTENSION_NAME),
+      .fragment_shading_rate = sz_ext_advertised(exts, ext_count,
+                                                 VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME),
+      .shader_image_int64 = sz_ext_advertised(exts, ext_count,
+                                              VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME),
+   };
 
-   VkBaseOutStructure *head = NULL;
-   VkBaseOutStructure *tail = NULL;
+   struct sz_vk_features q;
+   sz_vk_features_prepare(&q, api);
 
-   /* Core feature structs are only chained on devices that know them. */
-   if (sz_api_at_least(api, VK_API_VERSION_1_2)) {
-      q.f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-      sz_chain(&head, &tail, &q.f12);
-   }
-   if (sz_api_at_least(api, VK_API_VERSION_1_3)) {
-      q.f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-      sz_chain(&head, &tail, &q.f13);
-   }
-   if (sz_api_at_least(api, VK_API_VERSION_1_4)) {
-      q.f14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
-      sz_chain(&head, &tail, &q.f14);
-   }
-
-   /* Promoted-but-not-mandatory extensions: ask through their own structure so
-    * the answer is available on 1.3 as well as 1.4. */
-   if (!sz_api_at_least(api, VK_API_VERSION_1_4) &&
-       sz_ext_advertised(exts, ext_count, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME)) {
-      q.local_read.sType =
-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES;
-      sz_chain(&head, &tail, &q.local_read);
-   }
-   if (!sz_api_at_least(api, VK_API_VERSION_1_4) &&
-       sz_ext_advertised(exts, ext_count, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) {
-      q.host_image_copy.sType =
-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
-      sz_chain(&head, &tail, &q.host_image_copy);
-   }
-
-   /* Extensions that 1.4 did not promote. */
-   if (sz_ext_advertised(exts, ext_count, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)) {
-      q.descriptor_buffer.sType =
-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT;
-      sz_chain(&head, &tail, &q.descriptor_buffer);
-   }
-   if (sz_ext_advertised(exts, ext_count, VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
-      q.present_wait.sType =
-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
-      sz_chain(&head, &tail, &q.present_wait);
-   }
-   if (sz_ext_advertised(exts, ext_count, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
-      q.gpl.sType =
-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT;
-      sz_chain(&head, &tail, &q.gpl);
-   }
-   if (sz_ext_advertised(exts, ext_count,
-                         VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME)) {
-      q.msrtss.sType =
-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT;
-      sz_chain(&head, &tail, &q.msrtss);
-   }
-   if (sz_ext_advertised(exts, ext_count, VK_EXT_SHADER_OBJECT_EXTENSION_NAME)) {
-      q.shader_object.sType =
-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT;
-      sz_chain(&head, &tail, &q.shader_object);
-   }
-   if (sz_ext_advertised(exts, ext_count, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
-      q.fsr.sType =
-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
-      sz_chain(&head, &tail, &q.fsr);
-   }
-   if (sz_ext_advertised(exts, ext_count,
-                         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME)) {
-      q.image_int64.sType =
-         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT;
-      sz_chain(&head, &tail, &q.image_int64);
-   }
-
-   if (get_features2 && head) {
-      VkPhysicalDeviceFeatures2 features2 = {
-         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-         .pNext = head,
-      };
+   VkPhysicalDeviceFeatures2 features2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+   };
+   sz_vk_features_link(&q, api, &sel, &features2);
+   if (get_features2) {
       get_features2(pdev, &features2);
-   }
-
-   /* The local-read nesting depth/stencil and multisampled bits live in
-    * VkPhysicalDeviceVulkan14Properties, which has no extension equivalent
-    * anywhere in vk.xml. On 1.3 they are simply unknowable, so both stay false
-    * and the depth/MSAA local-read paths stay off. */
-   if (get_props2 && sz_api_at_least(api, VK_API_VERSION_1_4)) {
-      q.props14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_PROPERTIES;
-      props2.pNext = &q.props14;
-      get_props2(pdev, &props2);
+      q.core = features2.features;
    }
 
    /* ── promoted capabilities: pick core or extension ─────────────────────── */
@@ -232,6 +230,7 @@ sz_caps_init(struct sz_caps *caps,
    SZ_CAP_OPTIONAL_LIST(SZ_CAP_RESOLVE)
 #undef SZ_CAP_RESOLVE
 
+   caps->core_features = q.core;
    caps->uses_vk14_core = vk14;
 
    FREE(exts);

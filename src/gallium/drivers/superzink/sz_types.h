@@ -35,6 +35,28 @@ struct sz_vk_entrypoints {
    PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
    PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2;
    PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
+   PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties;
+   PFN_vkCreateDevice CreateDevice;
+
+   /* Device-level entry points, resolved through vkGetDeviceProcAddr once the
+    * VkDevice exists. */
+   PFN_vkDestroyDevice DestroyDevice;
+   PFN_vkDeviceWaitIdle DeviceWaitIdle;
+   PFN_vkGetDeviceQueue2 GetDeviceQueue2;
+};
+
+/* Declared before struct sz_screen because sz_screen embeds them by value. */
+enum sz_queue_role {
+   SZ_QUEUE_GRAPHICS,
+   SZ_QUEUE_COMPUTE,
+   SZ_QUEUE_TRANSFER,
+   SZ_QUEUE_COUNT,
+};
+
+struct sz_queue {
+   VkQueue queue;
+   uint32_t family;
+   uint32_t index;
 };
 
 struct sz_screen {
@@ -52,6 +74,7 @@ struct sz_screen {
 
    VkInstance instance;
    uint32_t instance_api_version;
+   VkDevice dev;
    VkPhysicalDevice pdev;
    VkPhysicalDeviceProperties props;
    VkPhysicalDeviceMemoryProperties mem_props;
@@ -59,6 +82,8 @@ struct sz_screen {
 
    /* Built once here and treated as read-only afterwards (ADR-001). */
    struct sz_caps caps;
+
+   struct sz_queue queues[SZ_QUEUE_COUNT];
 
    int drm_fd;
 

@@ -112,11 +112,72 @@
      "VK_EXT_shader_image_atomic_int64",    SZ_CORE_NONE,                      \
      q.image_int64.shaderImageInt64Atomics)
 
+/* Every VkPhysicalDevice*Features structure Super-ZINK ever chains, in one
+ * place. Querying (sz_caps_init) and enabling (sz_device_create) both go
+ * through this, so the two can never drift: a feature that the caps table
+ * reports as "ok" but that device creation forgets to enable would otherwise
+ * fail silently at the first vkCmd* call that relies on it.
+ *
+ * The members are not pre-linked. sz_vk_features_prepare() only stamps sType;
+ * sz_vk_features_link() chains the subset the device actually offers. */
+struct sz_vk_features {
+   /* Not chained: VkPhysicalDeviceFeatures2 carries this one directly. */
+   VkPhysicalDeviceFeatures core;
+
+   VkPhysicalDeviceVulkan12Features f12;
+   VkPhysicalDeviceVulkan13Features f13;
+   VkPhysicalDeviceVulkan14Features f14;
+
+   /* Promoted extensions keep their original structure type as an alias of the
+    * core one (e.g. VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT
+    * == ..._FEATURES), so these are valid to chain on both 1.3 and 1.4. */
+   VkPhysicalDeviceDynamicRenderingLocalReadFeatures local_read;
+   VkPhysicalDeviceHostImageCopyFeaturesEXT host_image_copy;
+
+   VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer;
+   VkPhysicalDevicePresentWaitFeaturesKHR present_wait;
+   VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
+   VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT msrtss;
+   VkPhysicalDeviceShaderObjectFeaturesEXT shader_object;
+   VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsr;
+   VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64;
+
+   /* Not a feature: VkPhysicalDeviceVulkan14Properties carries the two
+    * local-read attachment bits, and vk.xml gives them no extension-side
+    * equivalent, so they only exist on a 1.4 device. Kept here because it is
+    * queried in the same pass. */
+   VkPhysicalDeviceVulkan14Properties props14;
+};
+
+/* Which of the optional extension structs to chain. Filled from the advertised
+ * extension list when querying, and from the capability snapshot when enabling;
+ * the same flags therefore mean "can ask" and "may enable". */
+struct sz_vk_feature_selection {
+   bool local_read;
+   bool host_image_copy;
+   bool descriptor_buffer;
+   bool present_wait;
+   bool graphics_pipeline_library;
+   bool msrtss;
+   bool shader_object;
+   bool fragment_shading_rate;
+   bool shader_image_int64;
+};
+
+void sz_vk_features_prepare(struct sz_vk_features *f, uint32_t api_version);
+void sz_vk_features_link(struct sz_vk_features *f, uint32_t api_version,
+                         const struct sz_vk_feature_selection *sel,
+                         VkPhysicalDeviceFeatures2 *features2);
+
 struct sz_caps {
 #define SZ_CAP_FIELD(field, name, ext, core, expr) bool field;
    SZ_CAP_REQUIRED_LIST(SZ_CAP_FIELD)
    SZ_CAP_OPTIONAL_LIST(SZ_CAP_FIELD)
 #undef SZ_CAP_FIELD
+
+   /* The 1.0 feature set verbatim, so device creation can gate on it instead
+    * of asking the driver a second, possibly different, question. */
+   VkPhysicalDeviceFeatures core_features;
 
    uint32_t instance_api_version;
    uint32_t device_api_version;

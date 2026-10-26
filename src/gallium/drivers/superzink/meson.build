@@ -3,6 +3,7 @@
 
 files_libsuperzink = files(
   'sz_caps.c',
+  'sz_device.c',
   'sz_debug.c',
   'sz_format.c',
   'sz_screen.c',

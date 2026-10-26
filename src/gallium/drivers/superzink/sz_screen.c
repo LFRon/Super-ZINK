@@ -16,6 +16,7 @@
  */
 
 #include "sz_caps.h"
+#include "sz_device.h"
 #include "sz_format.h"
 #include "sz_types.h"
 #include "sz_debug.h"
@@ -123,6 +124,8 @@ sz_load_instance_entrypoints(struct sz_screen *screen)
                          vkGetPhysicalDeviceFeatures2);
    SZ_LOAD_INSTANCE_PROC(&screen->vk, GetPhysicalDeviceProperties2,
                          vkGetPhysicalDeviceProperties2);
+   /* Available since 1.0, but only reachable through the instance. */
+   SZ_LOAD_INSTANCE_PROC(&screen->vk, CreateDevice, vkCreateDevice);
    return true;
 }
 
@@ -351,8 +354,8 @@ sz_screen_query_memory_info(struct pipe_screen *pscreen,
 static struct pipe_context *
 sz_screen_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
 {
-   mesa_loge("SZ: context creation is not implemented yet (Phase 1). "
-             "The screen enumerates devices only.");
+   mesa_loge("SZ: context creation is not implemented yet (Phase 1: the "
+             "VkDevice exists, the pipe_context does not).");
    return NULL;
 }
 
@@ -360,6 +363,8 @@ static void
 sz_screen_destroy(struct pipe_screen *pscreen)
 {
    struct sz_screen *screen = sz_screen(pscreen);
+
+   sz_device_finish(screen);
 
    /* The instance is destroyed via the entrypoint resolved while it was alive. */
    if (screen->instance != VK_NULL_HANDLE && screen->vk_GetInstanceProcAddr) {
@@ -395,6 +400,7 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
    screen->winsys = winsys;
    screen->driver_name_is_inferred = config && config->driver_name_is_inferred;
    screen->instance = VK_NULL_HANDLE;
+   screen->dev = VK_NULL_HANDLE;
    screen->api_version = 0;
 
    if (!sz_load_loader(screen))
@@ -414,6 +420,9 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       goto fail;
 
    if (!sz_select_physical_device(screen))
+      goto fail;
+
+   if (!sz_device_init(screen))
       goto fail;
 
    /* pipe_screen base */
@@ -455,7 +464,13 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       mesa_logi("SZ: deviceType=%d vendorID=0x%04x deviceID=0x%04x",
                 (int)screen->props.deviceType,
                 screen->props.vendorID, screen->props.deviceID);
-      mesa_logi("SZ: memory heaps=%u", screen->mem_props.memoryHeapCount);
+      mesa_logi("SZ: queues: graphics=family %u, compute=family %u, transfer=family %u",
+                screen->queues[SZ_QUEUE_GRAPHICS].family,
+                screen->queues[SZ_QUEUE_COMPUTE].family,
+                screen->queues[SZ_QUEUE_TRANSFER].family);
+      mesa_logi("SZ: memory types=%u heaps=%u",
+                screen->mem_props.memoryTypeCount,
+                screen->mem_props.memoryHeapCount);
       for (uint32_t i = 0; i < screen->mem_props.memoryHeapCount; i++) {
          mesa_logi("SZ:   heap[%u] size=%" PRIu64 " MiB flags=0x%x", i,
                    screen->mem_props.memoryHeaps[i].size / (1024 * 1024),
@@ -466,6 +481,7 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
    return &screen->base;
 
 fail:
+   sz_device_finish(screen);
    if (screen->instance != VK_NULL_HANDLE && screen->vk_GetInstanceProcAddr) {
       PFN_vkDestroyInstance DestroyInstance =
          (PFN_vkDestroyInstance)screen->vk_GetInstanceProcAddr(screen->instance,
