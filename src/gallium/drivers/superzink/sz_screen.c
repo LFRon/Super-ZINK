@@ -15,6 +15,7 @@
  * Phase 1 work.
  */
 
+#include "sz_caps.h"
 #include "sz_format.h"
 #include "sz_types.h"
 #include "sz_debug.h"
@@ -41,8 +42,10 @@
 #define SZ_VK_LIBNAME "libvulkan.so.1"
 #endif
 
-/* Vulkan 1.4 is a hard requirement (ADR-001). There is no fallback path. */
-#define SZ_MIN_API_VERSION VK_API_VERSION_1_4
+/* ADR-001: 1.3 is the floor; the real gate is the required capability list in
+ * sz_caps.h. A 1.4 device is not waved through -- 1.4 promotes only 16
+ * extensions and gates none of the ones we depend on most. */
+#define SZ_MIN_API_VERSION SZ_CAPS_MIN_API_VERSION
 
 #define SZ_INSTANCE_EXTENSIONS \
    VK_EXT_DEBUG_UTILS_EXTENSION_NAME
@@ -93,6 +96,11 @@ static bool
 sz_load_global_entrypoints(struct sz_screen *screen)
 {
    SZ_LOAD_GLOBAL_PROC(&screen->vk, CreateInstance, vkCreateInstance);
+   /* Present since 1.1; absent only on a 1.0 loader, which we reject anyway. */
+   screen->vk.EnumerateInstanceVersion =
+      (PFN_vkEnumerateInstanceVersion)
+         screen->vk_GetInstanceProcAddr(VK_NULL_HANDLE,
+                                        "vkEnumerateInstanceVersion");
    return true;
 }
 
@@ -109,6 +117,12 @@ sz_load_instance_entrypoints(struct sz_screen *screen)
                          vkGetPhysicalDeviceFormatProperties);
    SZ_LOAD_INSTANCE_PROC(&screen->vk, GetPhysicalDeviceImageFormatProperties2,
                          vkGetPhysicalDeviceImageFormatProperties2);
+   SZ_LOAD_INSTANCE_PROC(&screen->vk, EnumerateDeviceExtensionProperties,
+                         vkEnumerateDeviceExtensionProperties);
+   SZ_LOAD_INSTANCE_PROC(&screen->vk, GetPhysicalDeviceFeatures2,
+                         vkGetPhysicalDeviceFeatures2);
+   SZ_LOAD_INSTANCE_PROC(&screen->vk, GetPhysicalDeviceProperties2,
+                         vkGetPhysicalDeviceProperties2);
    return true;
 }
 
@@ -121,13 +135,35 @@ sz_create_instance(struct sz_screen *screen)
 {
    const char *exts[] = { SZ_INSTANCE_EXTENSIONS };
 
+   /* Ask for the highest version the loader offers, capped by our headers.
+    * Requesting only the floor would pin every 1.4 driver to the extension
+    * path, because a device never reports an apiVersion above its instance. */
+   uint32_t api = VK_API_VERSION_1_0;
+   if (screen->vk.EnumerateInstanceVersion) {
+      VkResult res = screen->vk.EnumerateInstanceVersion(&api);
+      if (res != VK_SUCCESS)
+         api = VK_API_VERSION_1_0;
+   }
+   api = MIN2(api, VK_HEADER_VERSION_COMPLETE);
+
+   if (api < SZ_MIN_API_VERSION) {
+      mesa_loge("SZ: the Vulkan loader supports %u.%u, but Super-ZINK needs "
+                "%u.%u or newer.",
+                VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api),
+                VK_API_VERSION_MAJOR(SZ_MIN_API_VERSION),
+                VK_API_VERSION_MINOR(SZ_MIN_API_VERSION));
+      return VK_ERROR_INCOMPATIBLE_DRIVER;
+   }
+
+   screen->instance_api_version = api;
+
    VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
       .pApplicationName = "Super-ZINK",
       .applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
       .pEngineName = "Super-ZINK",
       .engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
-      .apiVersion = SZ_MIN_API_VERSION,
+      .apiVersion = api,
    };
 
    VkInstanceCreateInfo ci = {
@@ -163,13 +199,18 @@ sz_select_physical_device(struct sz_screen *screen)
       return false;
    }
 
-   /* ADR-001 is a filter, not a post-check: a device that cannot meet the floor
-    * must not win on deviceType and then sink the whole screen. Rank only among
-    * devices that clear 1.4. */
+   /* ADR-001 is a filter, not a post-check: a device that fails it must not win
+    * on deviceType and then sink the whole screen. Ranking therefore only
+    * considers devices that pass the version floor *and* the required
+    * capability list. Probing costs one features query plus one extension
+    * enumeration per device, which is negligible next to ~100 format queries
+    * the screen does later. */
    int best_rank = -1;
    VkPhysicalDevice best = VK_NULL_HANDLE;
-   const char *rejected_name = NULL;
-   uint32_t rejected_version = 0;
+   struct sz_caps best_caps = { 0 };
+
+   char reject_why[512] = "";
+   const char *reject_name = NULL;
 
    for (uint32_t i = 0; i < count; i++) {
       VkPhysicalDeviceProperties props;
@@ -185,8 +226,30 @@ sz_select_physical_device(struct sz_screen *screen)
       }
 
       if (props.apiVersion < SZ_MIN_API_VERSION) {
-         rejected_name = props.deviceName;
-         rejected_version = props.apiVersion;
+         if (!reject_name) reject_name = props.deviceName;
+         snprintf(reject_why, sizeof(reject_why),
+                  "reports Vulkan %u.%u, below the %u.%u floor",
+                  VK_API_VERSION_MAJOR(props.apiVersion),
+                  VK_API_VERSION_MINOR(props.apiVersion),
+                  VK_API_VERSION_MAJOR(SZ_MIN_API_VERSION),
+                  VK_API_VERSION_MINOR(SZ_MIN_API_VERSION));
+         continue;
+      }
+
+      struct sz_caps caps;
+      sz_caps_init(&caps, devs[i], screen->instance_api_version,
+                   screen->vk.EnumerateDeviceExtensionProperties,
+                   screen->vk.GetPhysicalDeviceFeatures2,
+                   screen->vk.GetPhysicalDeviceProperties2);
+
+      const unsigned missing = sz_caps_missing_required_count(&caps);
+      if (missing > 0) {
+         if (!reject_name) reject_name = props.deviceName;
+         char list[384];
+         sz_caps_missing_required_str(&caps, list, sizeof(list));
+         snprintf(reject_why, sizeof(reject_why),
+                  "is missing %u required capabilit%s: %s",
+                  missing, missing == 1 ? "y" : "ies", list);
          continue;
       }
 
@@ -202,32 +265,26 @@ sz_select_physical_device(struct sz_screen *screen)
          best_rank = rank;
          best = devs[i];
          screen->props = props;
+         best_caps = caps;
       }
    }
 
    FREE(devs);
 
    if (best == VK_NULL_HANDLE) {
-      if (rejected_name) {
-         mesa_loge("SZ: no usable Vulkan device. \"%s\" reports Vulkan %u.%u but "
-                   "Super-ZINK requires Vulkan %u.%u or newer, and no other "
-                   "device qualifies. There is no fallback path by design.",
-                   rejected_name,
-                   VK_API_VERSION_MAJOR(rejected_version),
-                   VK_API_VERSION_MINOR(rejected_version),
-                   VK_API_VERSION_MAJOR(SZ_MIN_API_VERSION),
-                   VK_API_VERSION_MINOR(SZ_MIN_API_VERSION));
+      if (reject_name) {
+         mesa_loge("SZ: no usable Vulkan device. \"%s\" %s. "
+                   "No other device qualified, and there is no fallback path "
+                   "by design. Run with SZ_DEBUG=info to see the full "
+                   "capability table.",
+                   reject_name, reject_why);
       } else {
          mesa_loge("SZ: no usable Vulkan device found.");
       }
       return false;
    }
 
-   if (screen->props.apiVersion < SZ_MIN_API_VERSION) {
-      mesa_loge("SZ: invalid apiVersion 0x%x", screen->props.apiVersion);
-      return false;
-   }
-
+   screen->caps = best_caps;
    screen->pdev = best;
    screen->api_version = screen->props.apiVersion;
    screen->is_cpu = screen->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
@@ -390,6 +447,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
             VK_API_VERSION_MINOR(screen->api_version),
             VK_API_VERSION_PATCH(screen->api_version),
             screen->props.deviceName);
+
+   sz_caps_dump(&screen->caps);
 
    if (sz_debug_enabled(SZ_DEBUG_INFO)) {
       mesa_logi("SZ: screen created: %s", screen->renderer_string);

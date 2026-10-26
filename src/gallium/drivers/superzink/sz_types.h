@@ -16,6 +16,7 @@
 #include "util/simple_mtx.h"
 #include "util/u_dl.h"
 
+#include "sz_caps.h"
 #include "sz_debug.h"
 #include "sz_public.h"
 
@@ -23,6 +24,7 @@
  * so every later module shares one resolution pass. */
 struct sz_vk_entrypoints {
    PFN_vkCreateInstance CreateInstance;
+   PFN_vkEnumerateInstanceVersion EnumerateInstanceVersion;
    PFN_vkDestroyInstance DestroyInstance;
    PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
    PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;
@@ -30,6 +32,9 @@ struct sz_vk_entrypoints {
    PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties;
    PFN_vkGetPhysicalDeviceImageFormatProperties2
       GetPhysicalDeviceImageFormatProperties2;
+   PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
+   PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2;
+   PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
 };
 
 struct sz_screen {
@@ -46,10 +51,14 @@ struct sz_screen {
    struct sz_vk_entrypoints vk;
 
    VkInstance instance;
+   uint32_t instance_api_version;
    VkPhysicalDevice pdev;
    VkPhysicalDeviceProperties props;
    VkPhysicalDeviceMemoryProperties mem_props;
    uint32_t api_version;
+
+   /* Built once here and treated as read-only afterwards (ADR-001). */
+   struct sz_caps caps;
 
    int drm_fd;
 
