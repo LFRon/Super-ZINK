@@ -89,6 +89,7 @@ static const struct drm_driver_descriptor *driver_descriptors[] = {
    &tegra_driver_descriptor,
    &lima_driver_descriptor,
    &zink_driver_descriptor,
+   &superzink_driver_descriptor,
    &kmsro_driver_descriptor,
 };
 
@@ -398,6 +399,9 @@ pipe_loader_get_compatible_render_capable_device_fds(int kms_only_fd, unsigned i
 #endif
 #if defined GALLIUM_ZINK
       "zink",
+#endif
+#if defined GALLIUM_SUPERZINK
+      "superzink",
 #endif
    };
 

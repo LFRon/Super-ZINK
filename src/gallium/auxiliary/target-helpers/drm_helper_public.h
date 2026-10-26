@@ -27,6 +27,7 @@ extern const struct drm_driver_descriptor ethosu_driver_descriptor;
 extern const struct drm_driver_descriptor tegra_driver_descriptor;
 extern const struct drm_driver_descriptor lima_driver_descriptor;
 extern const struct drm_driver_descriptor zink_driver_descriptor;
+extern const struct drm_driver_descriptor superzink_driver_descriptor;
 extern const struct drm_driver_descriptor kmsro_driver_descriptor;
 
 #endif /* _DRM_HELPER_PUBLIC_H */

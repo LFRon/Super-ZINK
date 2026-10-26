@@ -437,6 +437,23 @@ DRM_DRIVER_DESCRIPTOR(zink, zink_driconf, ARRAY_SIZE(zink_driconf))
 DRM_DRIVER_DESCRIPTOR_STUB(zink)
 #endif
 
+#ifdef GALLIUM_SUPERZINK
+#include "superzink/sz_public.h"
+
+static struct pipe_screen *
+pipe_superzink_create_screen(int fd, const struct pipe_screen_config *config)
+{
+   struct pipe_screen *screen;
+   screen = superzink_drm_create_screen(fd, config, NULL);
+   return screen ? debug_screen_wrap(screen) : NULL;
+}
+
+DRM_DRIVER_DESCRIPTOR(superzink, NULL, 0)
+
+#else
+DRM_DRIVER_DESCRIPTOR_STUB(superzink)
+#endif
+
 #ifdef GALLIUM_ROCKET
 #include "rocket/drm/rkt_drm_public.h"
 
