@@ -73,9 +73,12 @@
 
 /* How many distinct sampler-set contents to cache. Every draw that rebinds the
  * same textures and samplers hits an existing entry, so this is the number of
- * *different* combinations an application uses, not the number of draws. Running
- * out only costs an eviction of the least recently used entry whose submission
- * has completed. */
+ * *different* combinations an application uses, not the number of draws. A slot
+ * is only reused once the submission that last bound it has completed, so a
+ * single command buffer that binds more distinct combinations than this cannot
+ * make progress: that is the known limit of a pool-based sampler set, and the
+ * reason the next step is VK_EXT_descriptor_buffer, where descriptors live in a
+ * buffer and are bump-allocated per draw. */
 #define SZ_SAMPLER_SET_POOL 1024
 
 /* VK_KHR_push_descriptor's own floor for maxPushDescriptors. A device that

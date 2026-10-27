@@ -237,10 +237,17 @@ sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
                                  ? sz_image_create_flags(tmpl->target)
                                  : 0;
 
-   /* 3D images are never attachments in Gallium's model. */
+   /* 3D images are never attachments in Gallium's model, and a 1D image cannot
+    * have a depth/stencil attachment in Vulkan at all -- but GL has 1D depth
+    * textures, so the sampled use has to survive while the attachment use does
+    * not. Creating the image with the attachment bit is what would fail. */
    if (type == VK_IMAGE_TYPE_3D) {
       usage &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+      if (usage == 0)
+         usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+   } else if (type == VK_IMAGE_TYPE_1D) {
+      usage &= ~(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
       if (usage == 0)
          usage = VK_IMAGE_USAGE_SAMPLED_BIT;
    }

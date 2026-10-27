@@ -298,7 +298,7 @@ sz_format_supported_image(struct sz_screen *screen,
    VkImageFormatProperties2 ifp = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
    };
-   const VkPhysicalDeviceImageFormatInfo2 info = {
+   VkPhysicalDeviceImageFormatInfo2 info = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
       .format = vkformat,
       .type = type,
@@ -307,8 +307,28 @@ sz_format_supported_image(struct sz_screen *screen,
       .flags = flags,
    };
 
-   if (screen->vk.GetPhysicalDeviceImageFormatProperties2(screen->pdev, &info,
-                                                          &ifp) != VK_SUCCESS)
+   VkResult query = screen->vk.GetPhysicalDeviceImageFormatProperties2(
+      screen->pdev, &info, &ifp);
+
+   /* No Vulkan implementation supports a 1D depth attachment -- 1D images
+    * cannot have a depth/stencil aspect at all -- but GL has
+    * GL_TEXTURE_1D depth textures and a shader may sample one. Asking with the
+    * attachment bit set answers "no such format", and since the state tracker
+    * probes for a renderable format first, the answer it hears is "this driver
+    * does not support depth textures", which turns into a GL_OUT_OF_MEMORY on
+    * glTexImage1D. Retrying as a sampled image is what makes 1D depth textures
+    * exist; attaching one to a framebuffer stays impossible, which is correct. */
+   if (query != VK_SUCCESS &&
+       (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+       (type == VK_IMAGE_TYPE_1D || type == VK_IMAGE_TYPE_3D)) {
+      info.usage = usage & ~VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+      if (info.usage == 0)
+         info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      query = screen->vk.GetPhysicalDeviceImageFormatProperties2(screen->pdev,
+                                                                 &info, &ifp);
+   }
+
+   if (query != VK_SUCCESS)
       return false;
 
    const unsigned samples = sz_vk_sample_count(sample_count);
