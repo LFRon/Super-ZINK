@@ -31,7 +31,10 @@ struct sz_spv_module *sz_spv_module_create(void);
 void sz_spv_module_destroy(struct sz_spv_module *m);
 
 /* Fills out the sections and returns the word array. The module keeps ownership;
- * the pointer is valid until sz_spv_module_destroy(). */
+ * the pointer is valid until sz_spv_module_destroy().
+ *
+ * `out_size` is in *bytes*, which is what VkShaderModuleCreateInfo wants; callers
+ * that index the array divide by four. */
 const uint32_t *sz_spv_finalize(struct sz_spv_module *m, size_t *out_size);
 
 /* Allocates a fresh result id. Ids are never reused, so no invalidation to
@@ -45,6 +48,8 @@ uint32_t sz_spv_type_bool(struct sz_spv_module *m);
 uint32_t sz_spv_type_int32(struct sz_spv_module *m);
 uint32_t sz_spv_type_uint32(struct sz_spv_module *m);
 uint32_t sz_spv_type_float32(struct sz_spv_module *m);
+uint32_t sz_spv_type_float(struct sz_spv_module *m, unsigned bits);
+uint32_t sz_spv_type_int(struct sz_spv_module *m, unsigned bits, bool is_signed);
 uint32_t sz_spv_type_vec(struct sz_spv_module *m, uint32_t component,
                          unsigned count);
 uint32_t sz_spv_type_ptr(struct sz_spv_module *m, SpvStorageClass storage,
@@ -52,8 +57,14 @@ uint32_t sz_spv_type_ptr(struct sz_spv_module *m, SpvStorageClass storage,
 uint32_t sz_spv_type_function(struct sz_spv_module *m, uint32_t result,
                               const uint32_t *params, unsigned count);
 
-/* Constants. */
+/* Constants. `sz_spv_const_bits` is the primitive: the bit pattern plus the type
+ * it is a constant *of*. The typed wrappers exist because passing a float's bits
+ * where an int is meant is silent otherwise. */
+uint32_t sz_spv_const_bits(struct sz_spv_module *m, uint32_t type, uint32_t bits);
 uint32_t sz_spv_const_float32(struct sz_spv_module *m, float value);
+uint32_t sz_spv_const_int32(struct sz_spv_module *m, int32_t value);
+uint32_t sz_spv_const_uint32(struct sz_spv_module *m, uint32_t value);
+uint32_t sz_spv_const_bool(struct sz_spv_module *m, bool value);
 uint32_t sz_spv_const_composite(struct sz_spv_module *m, uint32_t type,
                                 const uint32_t *members, unsigned count);
 
@@ -73,9 +84,15 @@ void sz_spv_decorate(struct sz_spv_module *m, uint32_t target,
 void sz_spv_decorate_builtin(struct sz_spv_module *m, uint32_t target,
                              SpvBuiltIn builtin);
 
+/* A decoration that takes no extra operand, such as Flat. */
+void sz_spv_decorate_bare(struct sz_spv_module *m, uint32_t target,
+                          SpvDecoration decoration);
+
 /* Globals. */
 uint32_t sz_spv_variable(struct sz_spv_module *m, uint32_t ptr_type,
                          SpvStorageClass storage);
+uint32_t sz_spv_variable_id(struct sz_spv_module *m, uint32_t id,
+                            uint32_t ptr_type, SpvStorageClass storage);
 
 /* Functions. */
 /* `id` must come from sz_spv_id(): OpEntryPoint names a function by id, so the
@@ -84,16 +101,45 @@ uint32_t sz_spv_variable(struct sz_spv_module *m, uint32_t ptr_type,
 void sz_spv_function(struct sz_spv_module *m, uint32_t id, uint32_t return_type,
                      uint32_t fn_type);
 uint32_t sz_spv_label(struct sz_spv_module *m);
+/* Same, with a caller-chosen id, so a branch can name a label that has not been
+ * emitted yet. */
+uint32_t sz_spv_label_id(struct sz_spv_module *m, uint32_t id);
 void sz_spv_function_end(struct sz_spv_module *m);
 
 /* Instructions. `type` is the result type, `result` the result id, or zero for
  * instructions that produce neither. */
-void sz_spv_load(struct sz_spv_module *m, uint32_t type, uint32_t result,
-                 uint32_t ptr);
+uint32_t sz_spv_load(struct sz_spv_module *m, uint32_t type, uint32_t ptr);
 void sz_spv_store(struct sz_spv_module *m, uint32_t ptr, uint32_t value);
 uint32_t sz_spv_composite_construct(struct sz_spv_module *m, uint32_t type,
                                     const uint32_t *members, unsigned count);
 void sz_spv_return(struct sz_spv_module *m);
+
+/* Generic result-producing emits. The translator needs dozens of opcodes, and a
+ * named wrapper per opcode would be more code than the translator itself --
+ * while a raw opcode with the operands spelled out keeps the NIR-to-SPIR-V
+ * mapping readable in one place. */
+uint32_t sz_spv_undef(struct sz_spv_module *m, uint32_t type);
+uint32_t sz_spv_access_chain(struct sz_spv_module *m, uint32_t result_type,
+                             uint32_t base, const uint32_t *indices,
+                             unsigned count);
+uint32_t sz_spv_composite_extract(struct sz_spv_module *m, uint32_t type,
+                                  uint32_t composite, const uint32_t *indices,
+                                  unsigned count);
+
+/* Emits `opcode` with a result type and a fresh result id, followed by
+ * `operands`. */
+uint32_t sz_spv_alu(struct sz_spv_module *m, SpvOp opcode, uint32_t type,
+                    const uint32_t *operands, unsigned count);
+
+/* Emits `opcode` with a fresh result id and no result type. */
+uint32_t sz_spv_result_only(struct sz_spv_module *m, SpvOp opcode,
+                            const uint32_t *operands, unsigned count);
+
+/* Extended instruction sets. */
+uint32_t sz_spv_ext_inst_import(struct sz_spv_module *m, const char *name);
+uint32_t sz_spv_ext_inst(struct sz_spv_module *m, uint32_t set, uint32_t opcode,
+                         uint32_t type, const uint32_t *operands,
+                         unsigned count);
 
 /* Raw escape hatch for instructions this API does not model yet. The opcode and
  * operands are appended verbatim to the function section. */

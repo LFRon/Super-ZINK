@@ -47,7 +47,21 @@ struct sz_state {
          unsigned count;
          struct pipe_vertex_element *elements;
       } ve;
-      struct pipe_shader_state shader;
+      struct {
+         struct pipe_shader_state base;
+
+         /* Our own copy of the IR. The state tracker keeps ownership of the one
+          * it passes in and frees it whenever it likes, so a shader that is
+          * bound for more than one draw cannot point at it. */
+         struct nir_shader *nir;
+         void *mem_ctx;
+
+         /* Translation happens at shader creation, not at first draw: a shader
+          * that cannot be translated has to fail where the state tracker can
+          * report a link error, while a draw has nowhere to put one. */
+         uint32_t *spirv;
+         size_t spirv_words;
+      } shader;
    } u;
 };
 

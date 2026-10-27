@@ -16,6 +16,7 @@
  */
 
 #include "sz_caps.h"
+#include "sz_compiler.h"
 #include "sz_context.h"
 #include "sz_device.h"
 #include "sz_format.h"
@@ -465,6 +466,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
    screen->base.context_create = sz_screen_context_create;
 
    u_init_pipe_screen_caps(&screen->base, !screen->is_cpu);
+
+   /* Every driver must answer this: st/mesa asserts on it in debug builds and
+    * dereferences the NULL in release builds, which is a crash inside the GLSL
+    * linker (nir_inline_functions) with no hint that the driver is at fault. */
+   for (unsigned i = 0; i < MESA_SHADER_STAGES; i++)
+      screen->base.nir_options[i] = sz_nir_options(i);
 
    /* Capabilities stay minimal until there is a compiler: without GLSL support
     * the state tracker would refuse to build a context and the failure would

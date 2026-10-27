@@ -90,8 +90,7 @@ sz_pipeline_bootstrap_vs(struct sz_screen *screen)
    sz_spv_function(m, main_fn, sz_spv_type_void(m),
                    sz_spv_type_function(m, sz_spv_type_void(m), NULL, 0));
    sz_spv_label(m);
-   const uint32_t value = sz_spv_id(m);
-   sz_spv_load(m, v4, value, input);
+   const uint32_t value = sz_spv_load(m, v4, input);
    sz_spv_store(m, position, value);
    sz_spv_return(m);
    sz_spv_function_end(m);
@@ -202,6 +201,37 @@ sz_pipeline_reset(struct sz_screen *screen, struct sz_gfx_pipeline *p)
    memset(p, 0, sizeof(*p));
 }
 
+/* Returns a module for `stage`: the translated shader when one is bound, the
+ * bootstrap shader otherwise. The bootstrap pair stays in use for the driver's
+ * own selftest, which draws without a shader bound. */
+static VkShaderModule
+sz_pipeline_module(struct sz_context *ctx, mesa_shader_stage stage)
+{
+   struct sz_screen *screen = ctx->screen;
+   const struct sz_state *shader = ctx->state.shaders[stage];
+
+   if (!shader || !shader->u.shader.spirv) {
+      return stage == MESA_SHADER_VERTEX ? sz_pipeline_bootstrap_vs(screen)
+                                         : sz_pipeline_bootstrap_fs(screen);
+   }
+
+   VkShaderModule module = VK_NULL_HANDLE;
+   const VkShaderModuleCreateInfo ci = {
+      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = shader->u.shader.spirv_words * sizeof(uint32_t),
+      .pCode = shader->u.shader.spirv,
+   };
+   VkResult result = screen->vk.CreateShaderModule(screen->dev, &ci, NULL,
+                                                  &module);
+   if (result != VK_SUCCESS) {
+      mesa_loge("SZ: vkCreateShaderModule(%s) failed: %d",
+                mesa_shader_stage_name(stage), result);
+      return VK_NULL_HANDLE;
+   }
+
+   return module;
+}
+
 /* Builds a pipeline for the current framebuffer formats and vertex layout.
  *
  * `elements` describes the attribute layout; the bootstrap shader only reads
@@ -216,8 +246,8 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
    struct sz_screen *screen = ctx->screen;
    struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
 
-   p->vs = sz_pipeline_bootstrap_vs(screen);
-   p->fs = sz_pipeline_bootstrap_fs(screen);
+   p->vs = sz_pipeline_module(ctx, MESA_SHADER_VERTEX);
+   p->fs = sz_pipeline_module(ctx, MESA_SHADER_FRAGMENT);
    if (p->vs == VK_NULL_HANDLE || p->fs == VK_NULL_HANDLE)
       goto fail;
 
@@ -246,10 +276,9 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
       },
    };
 
-   /* One binding, because the bootstrap shader reads one attribute. Attributes
-    * beyond location 0 would need shader input variables that do not exist yet,
-    * and declaring them would make the pipeline fail validation for an interface
-    * the shader never uses. */
+   /* One binding: the driver still assumes every attribute comes from the same
+    * buffer with the same stride, which is true of the single-buffer draws it
+    * supports today. */
    const VkVertexInputBindingDescription binding = {
       .binding = 0,
       .stride = stride,
@@ -259,8 +288,11 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
    const struct sz_state *ve = ctx->state.vertex_elements;
 
    VkVertexInputAttributeDescription attributes[PIPE_MAX_ATTRIBS];
-   unsigned attribute_count =
-      ve ? MIN2(MIN2(element_count, ve->u.ve.count), 1) : 0;
+   /* Every element gets a description. The vertex shader's input locations are
+    * `data.location - VERT_ATTRIB_GENERIC0`, which equals the element index, so
+    * the whole range has to be listed or a shader reading location 1 gets an
+    * undefined value with no error. */
+   unsigned attribute_count = ve ? MIN2(element_count, ve->u.ve.count) : 0;
 
    for (unsigned i = 0; i < attribute_count; i++) {
       const struct pipe_vertex_element *elem = &ve->u.ve.elements[i];
@@ -399,6 +431,8 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
    p->key.stride = stride;
    p->key.vertex_format = attribute_count ? attributes[0].format : VK_FORMAT_UNDEFINED;
    p->key.samples = samples;
+   p->key.vs = ctx->state.shaders[MESA_SHADER_VERTEX];
+   p->key.fs = ctx->state.shaders[MESA_SHADER_FRAGMENT];
    p->key.color_count = color_count;
    for (unsigned i = 0; i < color_count; i++)
       p->key.color[i] = color_formats[i];
@@ -422,6 +456,10 @@ sz_pipeline_key_matches(struct sz_gfx_pipeline *p, struct sz_context *ctx,
       return false;
    if (p->key.topology != topology || p->key.vertex_element_count != element_count ||
        p->key.stride != stride)
+      return false;
+
+   if (p->key.vs != ctx->state.shaders[MESA_SHADER_VERTEX] ||
+       p->key.fs != ctx->state.shaders[MESA_SHADER_FRAGMENT])
       return false;
 
    const struct sz_state *ve = ctx->state.vertex_elements;

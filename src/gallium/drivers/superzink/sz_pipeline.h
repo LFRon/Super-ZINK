@@ -44,6 +44,10 @@ struct sz_gfx_pipeline {
        * old one reads the vertices as the wrong type without any Vulkan error. */
       VkFormat vertex_format;
       VkSampleCountFlagBits samples;
+      /* Which shaders the pipeline was built from. Two programs with the same
+       * layout are still different pipelines. */
+      const void *vs;
+      const void *fs;
    } key;
 };
 

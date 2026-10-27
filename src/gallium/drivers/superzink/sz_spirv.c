@@ -44,7 +44,7 @@ struct sz_spv_module {
          unsigned kind;
          uint32_t a, b, c;
          uint32_t id;
-      } entry[64];
+      } entry[256];
       unsigned count;
    } types;
 };
@@ -240,44 +240,52 @@ sz_spv_type_bool(struct sz_spv_module *m)
 
 /* The cache key for an integer type has to include signedness, or int32 and
  * uint32 would collide and the second one would silently reuse the first. */
-static uint32_t
-sz_spv_type_int(struct sz_spv_module *m, unsigned signedness)
+uint32_t
+sz_spv_type_int(struct sz_spv_module *m, unsigned bits, bool is_signed)
 {
-   uint32_t id = sz_spv_type_lookup(m, SpvOpTypeInt, 32, signedness, 0);
+   const uint32_t signedness = is_signed ? 1 : 0;
+
+   uint32_t id = sz_spv_type_lookup(m, SpvOpTypeInt, bits, signedness, 0);
    if (id)
       return id;
 
    id = sz_spv_id(m);
-   const uint32_t ops[] = { id, 32, signedness };
+   const uint32_t ops[] = { id, bits, signedness };
    sz_spv_emit_simple(m, SEC_TYPES, SpvOpTypeInt, ops, 3);
-   sz_spv_type_record(m, SpvOpTypeInt, 32, signedness, 0, id);
+   sz_spv_type_record(m, SpvOpTypeInt, bits, signedness, 0, id);
    return id;
 }
 
 uint32_t
 sz_spv_type_int32(struct sz_spv_module *m)
 {
-   return sz_spv_type_int(m, 1);
+   return sz_spv_type_int(m, 32, true);
 }
 
 uint32_t
 sz_spv_type_uint32(struct sz_spv_module *m)
 {
-   return sz_spv_type_int(m, 0);
+   return sz_spv_type_int(m, 32, false);
+}
+
+uint32_t
+sz_spv_type_float(struct sz_spv_module *m, unsigned bits)
+{
+   uint32_t id = sz_spv_type_lookup(m, SpvOpTypeFloat, bits, 0, 0);
+   if (id)
+      return id;
+
+   id = sz_spv_id(m);
+   const uint32_t ops[] = { id, bits };
+   sz_spv_emit_simple(m, SEC_TYPES, SpvOpTypeFloat, ops, 2);
+   sz_spv_type_record(m, SpvOpTypeFloat, bits, 0, 0, id);
+   return id;
 }
 
 uint32_t
 sz_spv_type_float32(struct sz_spv_module *m)
 {
-   uint32_t id = sz_spv_type_lookup(m, SpvOpTypeFloat, 32, 0, 0);
-   if (id)
-      return id;
-
-   id = sz_spv_id(m);
-   const uint32_t ops[] = { id, 32 };
-   sz_spv_emit_simple(m, SEC_TYPES, SpvOpTypeFloat, ops, 2);
-   sz_spv_type_record(m, SpvOpTypeFloat, 32, 0, 0, id);
-   return id;
+   return sz_spv_type_float(m, 32);
 }
 
 uint32_t
@@ -326,20 +334,55 @@ sz_spv_type_function(struct sz_spv_module *m, uint32_t result,
 }
 
 uint32_t
+sz_spv_const_bits(struct sz_spv_module *m, uint32_t type, uint32_t bits)
+{
+   /* Keyed by (type, bits), not bits alone: 1.0f and the integer 0x3f800000 have
+    * the same bit pattern, and reusing one as the other produces a module that
+    * validates but computes the wrong thing. */
+   uint32_t id = sz_spv_type_lookup(m, SpvOpConstant, type, bits, 0);
+   if (id)
+      return id;
+
+   id = sz_spv_id(m);
+   const uint32_t ops[] = { type, id, bits };
+   sz_spv_emit_simple(m, SEC_TYPES, SpvOpConstant, ops, 3);
+   sz_spv_type_record(m, SpvOpConstant, type, bits, 0, id);
+   return id;
+}
+
+uint32_t
 sz_spv_const_float32(struct sz_spv_module *m, float value)
 {
    uint32_t bits;
    memcpy(&bits, &value, sizeof(bits));
+   return sz_spv_const_bits(m, sz_spv_type_float32(m), bits);
+}
 
-   uint32_t id = sz_spv_type_lookup(m, SpvOpConstant, bits, 0, 0);
+uint32_t
+sz_spv_const_int32(struct sz_spv_module *m, int32_t value)
+{
+   return sz_spv_const_bits(m, sz_spv_type_int(m, 32, true), (uint32_t)value);
+}
+
+uint32_t
+sz_spv_const_uint32(struct sz_spv_module *m, uint32_t value)
+{
+   return sz_spv_const_bits(m, sz_spv_type_int(m, 32, false), value);
+}
+
+uint32_t
+sz_spv_const_bool(struct sz_spv_module *m, bool value)
+{
+   const uint32_t type = sz_spv_type_bool(m);
+   uint32_t id = sz_spv_type_lookup(m, SpvOpConstantTrue, type, 0, 0);
    if (id)
       return id;
 
-   const uint32_t type = sz_spv_type_float32(m);
    id = sz_spv_id(m);
-   const uint32_t ops[] = { type, id, bits };
-   sz_spv_emit_simple(m, SEC_TYPES, SpvOpConstant, ops, 3);
-   sz_spv_type_record(m, SpvOpConstant, bits, 0, 0, id);
+   const uint32_t ops[] = { type, id };
+   sz_spv_emit_simple(m, SEC_TYPES,
+                      value ? SpvOpConstantTrue : SpvOpConstantFalse, ops, 2);
+   sz_spv_type_record(m, SpvOpConstantTrue, type, 0, 0, id);
    return id;
 }
 
@@ -432,9 +475,52 @@ uint32_t
 sz_spv_variable(struct sz_spv_module *m, uint32_t ptr_type,
                 SpvStorageClass storage)
 {
-   uint32_t id = sz_spv_id(m);
+   return sz_spv_variable_id(m, sz_spv_id(m), ptr_type, storage);
+}
+
+uint32_t
+sz_spv_variable_id(struct sz_spv_module *m, uint32_t id, uint32_t ptr_type,
+                   SpvStorageClass storage)
+{
    const uint32_t ops[] = { ptr_type, id, storage };
    sz_spv_emit_simple(m, SEC_TYPES, SpvOpVariable, ops, 3);
+   return id;
+}
+
+uint32_t
+sz_spv_ext_inst_import(struct sz_spv_module *m, const char *name)
+{
+   const size_t len = strlen(name);
+   const size_t name_words = (len + 4) / 4;
+
+   uint32_t *ops = calloc(1 + name_words, sizeof(*ops));
+   if (!ops)
+      return 0;
+
+   const uint32_t id = sz_spv_id(m);
+   ops[0] = id;
+   memcpy(&ops[1], name, len);
+   sz_spv_emit_simple(m, SEC_EXT_INST_IMPORTS, SpvOpExtInstImport, ops,
+                      1 + name_words);
+   free(ops);
+   return id;
+}
+
+uint32_t
+sz_spv_ext_inst(struct sz_spv_module *m, uint32_t set, uint32_t opcode,
+                uint32_t type, const uint32_t *operands, unsigned count)
+{
+   uint32_t ops[4 + 8];
+   const uint32_t id = sz_spv_id(m);
+   ops[0] = type;
+   ops[1] = id;
+   ops[2] = set;
+   ops[3] = opcode;
+   for (unsigned i = 0; i < count && i < 8; i++)
+      ops[4 + i] = operands[i];
+
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpExtInst, ops,
+                      4 + MIN2(count, 8));
    return id;
 }
 
@@ -449,7 +535,12 @@ sz_spv_function(struct sz_spv_module *m, uint32_t id, uint32_t return_type,
 uint32_t
 sz_spv_label(struct sz_spv_module *m)
 {
-   uint32_t id = sz_spv_id(m);
+   return sz_spv_label_id(m, sz_spv_id(m));
+}
+
+uint32_t
+sz_spv_label_id(struct sz_spv_module *m, uint32_t id)
+{
    const uint32_t ops[] = { id };
    sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpLabel, ops, 1);
    return id;
@@ -461,12 +552,13 @@ sz_spv_function_end(struct sz_spv_module *m)
    sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpFunctionEnd, NULL, 0);
 }
 
-void
-sz_spv_load(struct sz_spv_module *m, uint32_t type, uint32_t result,
-            uint32_t ptr)
+uint32_t
+sz_spv_load(struct sz_spv_module *m, uint32_t type, uint32_t ptr)
 {
-   const uint32_t ops[] = { type, result, ptr };
+   const uint32_t id = sz_spv_id(m);
+   const uint32_t ops[] = { type, id, ptr };
    sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpLoad, ops, 3);
+   return id;
 }
 
 void
@@ -497,6 +589,87 @@ void
 sz_spv_return(struct sz_spv_module *m)
 {
    sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpReturn, NULL, 0);
+}
+
+void
+sz_spv_decorate_bare(struct sz_spv_module *m, uint32_t target,
+                     SpvDecoration decoration)
+{
+   const uint32_t ops[] = { target, decoration };
+   sz_spv_emit_simple(m, SEC_DECORATIONS, SpvOpDecorate, ops, 2);
+}
+
+uint32_t
+sz_spv_undef(struct sz_spv_module *m, uint32_t type)
+{
+   const uint32_t id = sz_spv_id(m);
+   const uint32_t ops[] = { type, id };
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpUndef, ops, 2);
+   return id;
+}
+
+uint32_t
+sz_spv_access_chain(struct sz_spv_module *m, uint32_t result_type,
+                    uint32_t base, const uint32_t *indices, unsigned count)
+{
+   uint32_t ops[3 + 8];
+   const uint32_t id = sz_spv_id(m);
+   ops[0] = result_type;
+   ops[1] = id;
+   ops[2] = base;
+   for (unsigned i = 0; i < count && i < 8; i++)
+      ops[3 + i] = indices[i];
+
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpAccessChain, ops,
+                      3 + MIN2(count, 8));
+   return id;
+}
+
+uint32_t
+sz_spv_composite_extract(struct sz_spv_module *m, uint32_t type,
+                         uint32_t composite, const uint32_t *indices,
+                         unsigned count)
+{
+   uint32_t ops[3 + 8];
+   const uint32_t id = sz_spv_id(m);
+   ops[0] = type;
+   ops[1] = id;
+   ops[2] = composite;
+   for (unsigned i = 0; i < count && i < 8; i++)
+      ops[3 + i] = indices[i];
+
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpCompositeExtract, ops,
+                      3 + MIN2(count, 8));
+   return id;
+}
+
+uint32_t
+sz_spv_alu(struct sz_spv_module *m, SpvOp opcode, uint32_t type,
+           const uint32_t *operands, unsigned count)
+{
+   uint32_t ops[2 + 16];
+   const uint32_t id = sz_spv_id(m);
+   ops[0] = type;
+   ops[1] = id;
+   for (unsigned i = 0; i < count && i < 16; i++)
+      ops[2 + i] = operands[i];
+
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, opcode, ops, 2 + MIN2(count, 16));
+   return id;
+}
+
+uint32_t
+sz_spv_result_only(struct sz_spv_module *m, SpvOp opcode,
+                   const uint32_t *operands, unsigned count)
+{
+   uint32_t ops[1 + 8];
+   const uint32_t id = sz_spv_id(m);
+   ops[0] = id;
+   for (unsigned i = 0; i < count && i < 8; i++)
+      ops[1 + i] = operands[i];
+
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, opcode, ops, 1 + MIN2(count, 8));
+   return id;
 }
 
 void

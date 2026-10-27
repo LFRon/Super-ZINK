@@ -5,6 +5,8 @@ files_libsuperzink = files(
   'sz_batch.c',
   'sz_bo.c',
   'sz_caps.c',
+  'sz_compiler.c',
+  'sz_nir_to_spirv.c',
   'sz_context.c',
   'sz_device.c',
   'sz_debug.c',
@@ -28,6 +30,7 @@ libsuperzink = static_library(
   ],
   link_args : [ld_args_build_id],
   dependencies : [
+    idep_nir_headers,
     idep_mesautil,
     idep_vulkan_util_headers,
     idep_vulkan_util,

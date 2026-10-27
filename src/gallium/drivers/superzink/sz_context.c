@@ -15,6 +15,7 @@
 #include "sz_context.h"
 
 #include "sz_batch.h"
+#include "sz_compiler.h"
 #include "sz_debug.h"
 #include "sz_format.h"
 #include "sz_pipeline.h"
@@ -22,6 +23,7 @@
 #include "sz_resource.h"
 #include "sz_sync.h"
 
+#include "compiler/nir/nir.h"
 #include "util/format/u_format.h"
 #include "util/log.h"
 #include "util/macros.h"
@@ -219,7 +221,12 @@ sz_state_free(void *opaque)
    struct sz_state *state = opaque;
    if (!state)
       return;
-   free(state->u.ve.elements);
+   if (state->kind == SZ_STATE_SHADER) {
+      free(state->u.shader.spirv);
+      ralloc_free(state->u.shader.mem_ctx);
+   }
+   else if (state->kind == SZ_STATE_VERTEX_ELEMENTS)
+      free(state->u.ve.elements);
    free(state);
 }
 
@@ -410,12 +417,50 @@ sz_create_shader_state(struct pipe_context *pipe,
       return NULL;
 
    state->stage = stage;
-   state->u.shader = *templ;
+   state->u.shader.base = *templ;
 
-   /* The IR belongs to the state tracker; copying the struct must not make us a
-    * co-owner of it. Nothing compiles it yet, so dropping the pointer is
-    * correct and avoids a double free later. */
-   state->u.shader.ir.nir = NULL;
+   /* The IR belongs to the state tracker, which frees it independently of us, so
+    * the driver needs its own copy: a shader object outlives the one call that
+    * created it by design (cso_context keeps the bound object and rebinds it).
+    * Pointing at the caller's copy works until the caller frees it, which happens
+    * on the very next program change. */
+   if (templ->type != PIPE_SHADER_IR_NIR || !templ->ir.nir) {
+      sz_warn_once("SZ: only NIR shaders are supported");
+      state->u.shader.base.ir.nir = NULL;
+      return state;
+   }
+
+   state->u.shader.mem_ctx = ralloc_context(NULL);
+   if (!state->u.shader.mem_ctx) {
+      free(state);
+      return NULL;
+   }
+
+   state->u.shader.nir = nir_shader_clone(state->u.shader.mem_ctx, templ->ir.nir);
+   state->u.shader.base.ir.nir = state->u.shader.nir;
+
+   sz_lower_nir(state->u.shader.nir);
+
+   if (sz_debug_enabled(SZ_DEBUG_NIR)) {
+      mesa_logi("SZ: NIR %s shader:",
+                mesa_shader_stage_name(state->stage));
+      nir_print_shader(state->u.shader.nir, stderr);
+   }
+
+   char *error = NULL;
+   if (!sz_nir_to_spirv(state->u.shader.nir, &state->u.shader.spirv,
+                        &state->u.shader.spirv_words, &error)) {
+      /* The caller reads error_message only when it asks for compile errors, and
+       * frees it with free(), which is why this is strdup and not ralloc. */
+      ((struct pipe_shader_state *)templ)->error_message =
+         error ? error : strdup("superzink: shader translation failed");
+      ralloc_free(state->u.shader.mem_ctx);
+      free(state);
+      return NULL;
+   }
+
+   sz_compiler_dump_spirv(state->u.shader.spirv, state->u.shader.spirv_words,
+                          mesa_shader_stage_name(state->stage));
 
    return state;
 }
