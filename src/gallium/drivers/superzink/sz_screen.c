@@ -501,6 +501,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
                    "whose command submission does not round-trip");
          goto fail_submit;
       }
+      if (sz_render_selftest(screen) != 0) {
+         mesa_loge("SZ: SZ_DEBUG=selftest failed; refusing to publish a screen "
+                   "that cannot render a triangle");
+         goto fail_submit;
+      }
    }
 
    if (sz_debug_enabled(SZ_DEBUG_INFO)) {

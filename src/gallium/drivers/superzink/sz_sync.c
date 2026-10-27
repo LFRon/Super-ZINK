@@ -5,6 +5,8 @@
 
 #include "sz_sync.h"
 
+#include "sz_format.h"
+
 #include "util/format/u_format.h"
 #include "util/log.h"
 #include "util/macros.h"
@@ -70,6 +72,20 @@ sz_sync_state_for(enum sz_access access)
          .layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       };
 
+   case SZ_ACCESS_VERTEX_BUFFER:
+      return (struct sz_sync_state) {
+         .stages = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
+         .access = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT,
+         .layout = VK_IMAGE_LAYOUT_UNDEFINED,
+      };
+
+   case SZ_ACCESS_INDEX_BUFFER:
+      return (struct sz_sync_state) {
+         .stages = VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
+         .access = VK_ACCESS_2_INDEX_READ_BIT,
+         .layout = VK_IMAGE_LAYOUT_UNDEFINED,
+      };
+
    case SZ_ACCESS_PRESENT:
       return (struct sz_sync_state) {
          .stages = VK_PIPELINE_STAGE_2_NONE,
@@ -131,6 +147,20 @@ sz_sync_state_from_layout(VkImageLayout layout, struct sz_sync_state *out)
    }
 }
 
+/* Whether an access mask contains any write. A barrier only has to be recorded
+ * for a reader when the previous use actually wrote. */
+static bool
+sz_access_has_write(VkAccessFlags2 access)
+{
+   return (access & (VK_ACCESS_2_SHADER_WRITE_BIT |
+                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                     VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                     VK_ACCESS_2_HOST_WRITE_BIT |
+                     VK_ACCESS_2_MEMORY_WRITE_BIT |
+                     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)) != 0;
+}
+
 /* The stage/access a resource is *already* visible through.
  *
  * VK_IMAGE_LAYOUT_UNDEFINED is only legal when the old contents may be thrown
@@ -155,26 +185,6 @@ sz_sync_source(const struct sz_resource *res, VkImageLayout *out_layout,
    *out_layout = current.layout;
    *out_stage = current.stages;
    *out_access = current.access;
-}
-
-static VkImageAspectFlags
-sz_image_aspect(const struct sz_resource *res)
-{
-   const struct util_format_description *desc =
-      util_format_description(res->base.format);
-   if (!desc)
-      return VK_IMAGE_ASPECT_COLOR_BIT;
-
-   const bool depth = util_format_has_depth(desc);
-   const bool stencil = util_format_has_stencil(desc);
-
-   if (depth && stencil)
-      return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-   if (depth)
-      return VK_IMAGE_ASPECT_DEPTH_BIT;
-   if (stencil)
-      return VK_IMAGE_ASPECT_STENCIL_BIT;
-   return VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
 static uint32_t
@@ -210,12 +220,47 @@ sz_resource_access(struct sz_screen *screen, VkCommandBuffer cmd,
    if (!res)
       return VK_IMAGE_LAYOUT_UNDEFINED;
 
-   /* Buffers have no layout, so there is no transition to record. Hazards
-    * between two buffer accesses are sz_memory_barrier's job. */
-   if (res->buffer != VK_NULL_HANDLE)
-      return VK_IMAGE_LAYOUT_UNDEFINED;
-
    const struct sz_sync_state dst = sz_sync_state_for(access);
+
+   /* Buffers have no layout, so the only thing to synchronise is a pending
+    * write. A buffer that was never written needs nothing, which is the common
+    * case for a static vertex buffer drawn every frame. */
+   if (res->buffer != VK_NULL_HANDLE) {
+      if (res->pending_write_stages != 0) {
+         const VkBufferMemoryBarrier2 barrier = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .srcStageMask = res->pending_write_stages,
+            .srcAccessMask = res->pending_write_access,
+            .dstStageMask = dst.stages,
+            .dstAccessMask = dst.access,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = res->buffer,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+         };
+
+         const VkDependencyInfo dep = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &barrier,
+         };
+
+         screen->vk.CmdPipelineBarrier2(cmd, &dep);
+         res->pending_write_stages = 0;
+         res->pending_write_access = 0;
+      }
+
+      /* Marked before the write is recorded, not after: the caller issues the
+       * copy or fill immediately after this returns, so in command order the
+       * write precedes any later read's barrier either way. */
+      if (sz_access_has_write(dst.access)) {
+         res->pending_write_stages = dst.stages;
+         res->pending_write_access = dst.access;
+      }
+
+      return VK_IMAGE_LAYOUT_UNDEFINED;
+   }
 
    /* Nothing to do when the layout already matches and the contents are still
     * valid. Skipping is not merely an optimisation: a barrier whose source mask
@@ -241,7 +286,7 @@ sz_resource_access(struct sz_screen *screen, VkCommandBuffer cmd,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .image = res->image,
       .subresourceRange = {
-         .aspectMask = sz_image_aspect(res),
+         .aspectMask = sz_format_aspect(res->base.format),
          .baseMipLevel = 0,
          .levelCount = VK_REMAINING_MIP_LEVELS,
          .baseArrayLayer = 0,

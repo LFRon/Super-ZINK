@@ -434,6 +434,8 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(GetImageMemoryRequirements, vkGetImageMemoryRequirements);
    SZ_DEV_PROC(GetImageMemoryRequirements2, vkGetImageMemoryRequirements2);
    SZ_DEV_PROC(BindImageMemory, vkBindImageMemory);
+   SZ_DEV_PROC(CreateImageView, vkCreateImageView);
+   SZ_DEV_PROC(DestroyImageView, vkDestroyImageView);
 
    SZ_DEV_PROC(CreateCommandPool, vkCreateCommandPool);
    SZ_DEV_PROC(DestroyCommandPool, vkDestroyCommandPool);
@@ -460,6 +462,18 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdEndRendering, vkCmdEndRendering);
    SZ_DEV_PROC(CmdSetViewport, vkCmdSetViewport);
    SZ_DEV_PROC(CmdSetScissor, vkCmdSetScissor);
+   SZ_DEV_PROC(CmdBindPipeline, vkCmdBindPipeline);
+   SZ_DEV_PROC(CmdBindVertexBuffers, vkCmdBindVertexBuffers);
+   SZ_DEV_PROC(CmdBindIndexBuffer, vkCmdBindIndexBuffer);
+   SZ_DEV_PROC(CmdDraw, vkCmdDraw);
+   SZ_DEV_PROC(CmdDrawIndexed, vkCmdDrawIndexed);
+
+   SZ_DEV_PROC(CreateShaderModule, vkCreateShaderModule);
+   SZ_DEV_PROC(DestroyShaderModule, vkDestroyShaderModule);
+   SZ_DEV_PROC(CreatePipelineLayout, vkCreatePipelineLayout);
+   SZ_DEV_PROC(DestroyPipelineLayout, vkDestroyPipelineLayout);
+   SZ_DEV_PROC(CreateGraphicsPipelines, vkCreateGraphicsPipelines);
+   SZ_DEV_PROC(DestroyPipeline, vkDestroyPipeline);
 
 #undef SZ_DEV_PROC
 }

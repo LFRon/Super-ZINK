@@ -62,6 +62,8 @@ struct sz_vk_entrypoints {
    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
    PFN_vkGetImageMemoryRequirements2 GetImageMemoryRequirements2;
    PFN_vkBindImageMemory BindImageMemory;
+   PFN_vkCreateImageView CreateImageView;
+   PFN_vkDestroyImageView DestroyImageView;
 
    /* Command submission (sz_batch / sz_sync). */
    PFN_vkCreateCommandPool CreateCommandPool;
@@ -89,6 +91,19 @@ struct sz_vk_entrypoints {
    PFN_vkCmdEndRendering CmdEndRendering;
    PFN_vkCmdSetViewport CmdSetViewport;
    PFN_vkCmdSetScissor CmdSetScissor;
+   PFN_vkCmdBindPipeline CmdBindPipeline;
+   PFN_vkCmdBindVertexBuffers CmdBindVertexBuffers;
+   PFN_vkCmdBindIndexBuffer CmdBindIndexBuffer;
+   PFN_vkCmdDraw CmdDraw;
+   PFN_vkCmdDrawIndexed CmdDrawIndexed;
+
+   /* Pipelines and shaders (sz_pipeline). */
+   PFN_vkCreateShaderModule CreateShaderModule;
+   PFN_vkDestroyShaderModule DestroyShaderModule;
+   PFN_vkCreatePipelineLayout CreatePipelineLayout;
+   PFN_vkDestroyPipelineLayout DestroyPipelineLayout;
+   PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines;
+   PFN_vkDestroyPipeline DestroyPipeline;
 };
 
 /* Declared before struct sz_screen because sz_screen embeds them by value. */

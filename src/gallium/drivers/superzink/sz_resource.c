@@ -328,6 +328,57 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
       return NULL;
    }
 
+   /* A whole-resource view, which is what a framebuffer attachment needs. Cube
+    * maps get a cube view; everything else becomes 2D or 3D view of the same
+    * shape, so the view never reinterprets anything. */
+   VkImageViewType view_type;
+   switch (tmpl->target) {
+   case PIPE_TEXTURE_1D:
+      view_type = VK_IMAGE_VIEW_TYPE_1D;
+      break;
+   case PIPE_TEXTURE_1D_ARRAY:
+      view_type = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+      break;
+   case PIPE_TEXTURE_2D_ARRAY:
+      view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      break;
+   case PIPE_TEXTURE_3D:
+      view_type = VK_IMAGE_VIEW_TYPE_3D;
+      break;
+   case PIPE_TEXTURE_CUBE:
+      view_type = VK_IMAGE_VIEW_TYPE_CUBE;
+      break;
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      view_type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+      break;
+   default:
+      view_type = VK_IMAGE_VIEW_TYPE_2D;
+      break;
+   }
+
+   const VkImageViewCreateInfo view_ci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = res->image,
+      .viewType = view_type,
+      .format = format,
+      .subresourceRange = {
+         .aspectMask = sz_format_aspect(tmpl->format),
+         .baseMipLevel = 0,
+         .levelCount = VK_REMAINING_MIP_LEVELS,
+         .baseArrayLayer = 0,
+         .layerCount = VK_REMAINING_ARRAY_LAYERS,
+      },
+   };
+
+   vkres = screen->vk.CreateImageView(screen->dev, &view_ci, NULL, &res->view);
+   if (vkres != VK_SUCCESS) {
+      mesa_loge("SZ: vkCreateImageView failed (VkResult %d)", vkres);
+      sz_bo_free(res->bo);
+      screen->vk.DestroyImage(screen->dev, res->image, NULL);
+      FREE(res);
+      return NULL;
+   }
+
    if (sz_debug_enabled(SZ_DEBUG_INFO)) {
       mesa_logi("SZ: image %ux%ux%u %s, %u level%s, %u sample%s, %s%s -> "
                 "%" PRIu64 " bytes",
@@ -384,11 +435,15 @@ sz_screen_resource_destroy(struct pipe_screen *pscreen,
    struct sz_screen *screen = sz_screen(pscreen);
    struct sz_resource *res = sz_resource(pres);
 
-   /* No context exists yet at Phase 1, so there is nothing in flight that could
-    * still reference this. Once submits exist, this becomes a deferred free
-    * keyed on the timeline value recorded at destruction. */
+   /* Nothing defers the destroy yet, which is only safe because a resource is
+    * never destroyed while a batch that touches it is still in flight: the state
+    * tracker destroys resources at GL object deletion, and the batch that last
+    * used one has been submitted (not necessarily completed). That is a real
+    * hazard and becomes a deferred free keyed on the timeline value in Phase 3. */
    if (res->buffer != VK_NULL_HANDLE)
       screen->vk.DestroyBuffer(screen->dev, res->buffer, NULL);
+   if (res->view != VK_NULL_HANDLE)
+      screen->vk.DestroyImageView(screen->dev, res->view, NULL);
    if (res->image != VK_NULL_HANDLE)
       screen->vk.DestroyImage(screen->dev, res->image, NULL);
 

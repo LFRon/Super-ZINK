@@ -37,6 +37,25 @@ sz_vk_sample_count(unsigned sample_count)
     VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT |                               \
     VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)
 
+VkImageAspectFlags
+sz_format_aspect(enum pipe_format format)
+{
+   const struct util_format_description *desc = util_format_description(format);
+   if (!desc)
+      return VK_IMAGE_ASPECT_COLOR_BIT;
+
+   const bool depth = util_format_has_depth(desc);
+   const bool stencil = util_format_has_stencil(desc);
+
+   if (depth && stencil)
+      return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+   if (depth)
+      return VK_IMAGE_ASPECT_DEPTH_BIT;
+   if (stencil)
+      return VK_IMAGE_ASPECT_STENCIL_BIT;
+   return VK_IMAGE_ASPECT_COLOR_BIT;
+}
+
 VkFormatFeatureFlags
 sz_format_features_from_bindings(unsigned bindings)
 {

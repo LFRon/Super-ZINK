@@ -59,6 +59,8 @@ struct sz_sampler_view {
    struct pipe_sampler_view base;
 };
 
+struct sz_gfx_pipeline;
+
 struct sz_context {
    struct pipe_context base;
    struct sz_screen *screen;
@@ -66,6 +68,16 @@ struct sz_context {
    /* Recorded command stream. A batch is acquired on first use and submitted by
     * sz_context_flush(). NULL when nothing is being recorded. */
    struct sz_batch *batch;
+
+   /* Dynamic rendering is active. Draws inside one render pass share it; the
+    * pass is ended on flush, on a framebuffer change, and around any command
+    * that is illegal inside one. */
+   bool rendering;
+   unsigned render_extent[2];
+   VkFormat render_color_formats[PIPE_MAX_COLOR_BUFS];
+   unsigned render_color_count;
+
+   struct sz_gfx_pipeline *pipeline;
 
    /* Shadow state. Kept so later phases can diff it and record only what
     * changed, and so the current values are available when a pipeline object is
@@ -82,6 +94,8 @@ struct sz_context {
       void *shaders[MESA_SHADER_STAGES];
 
       struct pipe_framebuffer_state framebuffer;
+      struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
+      unsigned num_vertex_buffers;
       struct pipe_viewport_state viewports[PIPE_MAX_VIEWPORTS];
       unsigned num_viewports;
       struct pipe_scissor_state scissors[PIPE_MAX_VIEWPORTS];
@@ -110,5 +124,14 @@ struct pipe_context *sz_context_create(struct sz_screen *screen,
  * owns, hangs or returns stale pixels -- neither shows up until something
  * actually reads the result back. */
 unsigned sz_context_selftest(struct sz_screen *screen);
+
+/* SZ_DEBUG=selftest: renders one triangle through sz_draw_vbo and verifies the
+ * pixels. Returns the number of failed checks.
+ *
+ * Separate from sz_context_selftest() on purpose: that one drives Vulkan
+ * directly and proves submission works, while this one drives the Gallium entry
+ * points and proves a draw reaches the attachment. A failure in either is a
+ * different bug. */
+unsigned sz_render_selftest(struct sz_screen *screen);
 
 #endif /* SZ_CONTEXT_H */

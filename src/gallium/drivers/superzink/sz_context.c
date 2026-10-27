@@ -17,6 +17,8 @@
 #include "sz_batch.h"
 #include "sz_debug.h"
 #include "sz_format.h"
+#include "sz_pipeline.h"
+#include "sz_renderpass.h"
 #include "sz_resource.h"
 #include "sz_sync.h"
 
@@ -143,11 +145,29 @@ sz_context_cmd(struct sz_context *ctx)
    return ctx->batch->cmd;
 }
 
+/* For commands Vulkan forbids inside a render pass: clears, copies and
+ * pipeline barriers. Ends the pass first, and the next draw starts a fresh one --
+ * which costs a begin/end pair per clear/copy interleaved with draws, and is the
+ * price of not having to prove that a clear never lands between two draws in
+ * Phase 1. */
+static VkCommandBuffer
+sz_context_cmd_no_pass(struct sz_context *ctx)
+{
+   VkCommandBuffer cmd = sz_context_cmd(ctx);
+   if (cmd != VK_NULL_HANDLE && ctx->rendering)
+      sz_renderpass_end(ctx, cmd);
+   return cmd;
+}
+
 static void
 sz_context_submit(struct sz_context *ctx)
 {
    if (!ctx->batch)
       return;
+
+   /* A render pass cannot outlive the command buffer's recording. Ending it
+    * here rather than in every caller means no path can forget. */
+   sz_renderpass_end(ctx, ctx->batch->cmd);
 
    struct sz_batch *batch = ctx->batch;
    ctx->batch = NULL;
@@ -215,15 +235,117 @@ sz_create_blend_state(struct pipe_context *pipe,
 static void
 sz_delete_state(struct pipe_context *pipe, void *opaque)
 {
+   struct sz_context *ctx = sz_context(pipe);
+   struct sz_state *state = opaque;
+
+   if (!state) {
+      sz_state_free(opaque);
+      return;
+   }
+
+   /* The state tracker deletes a state object as soon as it replaces it, which
+    * can be while it is still the bound one. Leaving the shadow pointer dangling
+    * would make the next draw read freed memory. */
+   switch (state->kind) {
+   case SZ_STATE_BLEND:
+      if (ctx->state.blend == state)
+         ctx->state.blend = NULL;
+      break;
+   case SZ_STATE_RASTERIZER:
+      if (ctx->state.rasterizer == state)
+         ctx->state.rasterizer = NULL;
+      break;
+   case SZ_STATE_DEPTH_STENCIL_ALPHA:
+      if (ctx->state.depth_stencil_alpha == state)
+         ctx->state.depth_stencil_alpha = NULL;
+      break;
+   case SZ_STATE_VERTEX_ELEMENTS:
+      if (ctx->state.vertex_elements == state)
+         ctx->state.vertex_elements = NULL;
+      break;
+   case SZ_STATE_SAMPLER:
+      /* Sampler objects and sampler views share these arrays, so both are
+       * cleared by identity rather than by position. */
+      for (unsigned s = 0; s < MESA_SHADER_STAGES; s++) {
+         for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++) {
+            if (ctx->state.sampler_states[s][i] == state)
+               ctx->state.sampler_states[s][i] = NULL;
+         }
+      }
+      break;
+   case SZ_STATE_SHADER:
+      for (unsigned s = 0; s < MESA_SHADER_STAGES; s++) {
+         if (ctx->state.shaders[s] == state)
+            ctx->state.shaders[s] = NULL;
+      }
+      break;
+   }
+
    sz_state_free(opaque);
 }
 
 static void
-sz_bind_state(struct pipe_context *pipe, void *opaque)
+sz_bind_typed(struct sz_context *ctx, struct sz_state *state)
 {
-   /* Recording the binding is Phase 2's job: nothing reads it until a pipeline
-    * is created. Keeping the entry point rather than leaving it NULL matters
-    * because cso_context calls it unconditionally. */
+   switch (state->kind) {
+   case SZ_STATE_BLEND:
+      ctx->state.blend = state;
+      break;
+   case SZ_STATE_RASTERIZER:
+      ctx->state.rasterizer = state;
+      break;
+   case SZ_STATE_DEPTH_STENCIL_ALPHA:
+      ctx->state.depth_stencil_alpha = state;
+      break;
+   case SZ_STATE_VERTEX_ELEMENTS:
+      ctx->state.vertex_elements = state;
+      break;
+   default:
+      break;
+   }
+}
+
+/* One entry point per slot, because NULL carries no kind and therefore cannot say
+ * which slot to clear. cso_context really does pass NULL when a state is unbound,
+ * so "cannot happen" would be a crash rather than a missing draw. */
+static void
+sz_bind_blend_state(struct pipe_context *pipe, void *opaque)
+{
+   struct sz_context *ctx = sz_context(pipe);
+   if (opaque)
+      sz_bind_typed(ctx, opaque);
+   else
+      ctx->state.blend = NULL;
+}
+
+static void
+sz_bind_rasterizer_state(struct pipe_context *pipe, void *opaque)
+{
+   struct sz_context *ctx = sz_context(pipe);
+   if (opaque)
+      sz_bind_typed(ctx, opaque);
+   else
+      ctx->state.rasterizer = NULL;
+}
+
+static void
+sz_bind_depth_stencil_alpha_state(struct pipe_context *pipe, void *opaque)
+{
+   struct sz_context *ctx = sz_context(pipe);
+   if (opaque)
+      sz_bind_typed(ctx, opaque);
+   else
+      ctx->state.depth_stencil_alpha = NULL;
+}
+
+static void
+sz_bind_vertex_elements_state(struct pipe_context *pipe, void *opaque)
+{
+   struct sz_context *ctx = sz_context(pipe);
+   if (opaque)
+      sz_bind_typed(ctx, opaque);
+   else
+      ctx->state.vertex_elements = NULL;
 }
 
 static void *
@@ -420,7 +542,7 @@ sz_clear_render_target(struct pipe_context *pipe, struct pipe_surface *dst,
       return;
    }
 
-   VkCommandBuffer cmd = sz_context_cmd(ctx);
+   VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
       return;
 
@@ -474,7 +596,7 @@ sz_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *dst,
    if (aspect == 0)
       return;
 
-   VkCommandBuffer cmd = sz_context_cmd(ctx);
+   VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
       return;
 
@@ -563,7 +685,7 @@ sz_clear_texture(struct pipe_context *pipe, struct pipe_resource *res,
       return;
    }
 
-   VkCommandBuffer cmd = sz_context_cmd(ctx);
+   VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
       return;
 
@@ -617,7 +739,7 @@ sz_resource_copy_region(struct pipe_context *pipe, struct pipe_resource *dst,
    struct sz_resource *sdst = sz_resource(dst);
    struct sz_resource *ssrc = sz_resource(src);
 
-   VkCommandBuffer cmd = sz_context_cmd(ctx);
+   VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
       return;
 
@@ -701,9 +823,29 @@ static void
 sz_set_framebuffer_state(struct pipe_context *pipe,
                          const struct pipe_framebuffer_state *fb)
 {
+   struct sz_context *ctx = sz_context(pipe);
+   const struct pipe_framebuffer_state *cur = &ctx->state.framebuffer;
+
+   /* A dynamic rendering instance names concrete views, so it cannot be
+    * retargeted: changing the attachments mid-pass has to close it. */
+   bool changed = cur->nr_cbufs != fb->nr_cbufs || cur->width != fb->width ||
+                  cur->height != fb->height ||
+                  cur->zsbuf.texture != fb->zsbuf.texture;
+
+   for (unsigned i = 0; !changed && i < fb->nr_cbufs; i++)
+      changed = cur->cbufs[i].texture != fb->cbufs[i].texture ||
+                cur->cbufs[i].level != fb->cbufs[i].level ||
+                cur->cbufs[i].first_layer != fb->cbufs[i].first_layer;
+
+   if (changed && ctx->rendering) {
+      VkCommandBuffer cmd = sz_context_cmd(ctx);
+      if (cmd != VK_NULL_HANDLE)
+         sz_renderpass_end(ctx, cmd);
+   }
+
    /* pipe_framebuffer_state holds the surfaces by value in this Mesa version, so
     * a struct copy is the whole update. */
-   sz_context(pipe)->state.framebuffer = *fb;
+   ctx->state.framebuffer = *fb;
 }
 
 static void
@@ -843,6 +985,12 @@ static void
 sz_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
                       const struct pipe_vertex_buffer *buffers)
 {
+   struct sz_context *ctx = sz_context(pipe);
+
+   const unsigned n = MIN2(count, PIPE_MAX_ATTRIBS);
+   if (n)
+      memcpy(ctx->state.vertex_buffers, buffers, n * sizeof(*buffers));
+   ctx->state.num_vertex_buffers = n;
 }
 
 static void
@@ -899,12 +1047,189 @@ sz_set_stream_output_targets(struct pipe_context *pipe, unsigned num_targets,
 {
 }
 
+/* Records the viewport and scissor for slot 0.
+ *
+ * GL's viewport is in window coordinates with y pointing up from the bottom,
+ * Vulkan's viewport is in framebuffer coordinates with y pointing down. The
+ * negative height flips it, which is exactly what GL expects and what keeps
+ * gl_Position's -1..1 range landing on the right pixels.
+ *
+ * Clamping happens in template: Gallium's viewport z is 0..1 already (GL's
+ * glDepthRange is folded in by the state tracker), so no remap is needed. */
+static void
+sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
+{
+   const struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
+
+   VkViewport viewport = {
+      .x = 0.0f,
+      .y = (float)fb->height,
+      .width = (float)fb->width,
+      .height = -(float)fb->height,
+      .minDepth = 0.0f,
+      .maxDepth = 1.0f,
+   };
+
+   if (ctx->state.num_viewports > 0) {
+      const struct pipe_viewport_state *vp = &ctx->state.viewports[0];
+      viewport.x = vp->translate[0] - vp->scale[0];
+      viewport.y = vp->translate[1] + vp->scale[1];
+      viewport.width = 2.0f * vp->scale[0];
+      viewport.height = -2.0f * vp->scale[1];
+      viewport.minDepth = vp->translate[2] - vp->scale[2];
+      viewport.maxDepth = vp->translate[2] + vp->scale[2];
+   }
+
+   VkRect2D scissor = {
+      .offset = { 0, 0 },
+      .extent = { fb->width, fb->height },
+   };
+
+   if (ctx->state.num_scissors > 0) {
+      const struct pipe_scissor_state *sc = &ctx->state.scissors[0];
+      scissor.offset.x = sc->minx;
+      scissor.offset.y = sc->miny;
+      scissor.extent.width = sc->maxx - sc->minx;
+      scissor.extent.height = sc->maxy - sc->miny;
+   }
+
+   if (scissor.extent.width == 0 || scissor.extent.height == 0)
+      return;
+
+   ctx->screen->vk.CmdSetViewport(cmd, 0, 1, &viewport);
+   ctx->screen->vk.CmdSetScissor(cmd, 0, 1, &scissor);
+}
+
+/* Gallium primitive -> Vulkan topology.
+ *
+ * LINE_LOOP has no Vulkan equivalent; Gallium sets was_line_loop and rewrites the
+ * indices, so treating it as a strip is correct for the draws the state tracker
+ * already expanded. */
+static VkPrimitiveTopology
+sz_topology(enum mesa_prim mode)
+{
+   switch (mode) {
+   case MESA_PRIM_POINTS:
+      return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+   case MESA_PRIM_LINES:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+   case MESA_PRIM_LINE_LOOP:
+   case MESA_PRIM_LINE_STRIP:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+   case MESA_PRIM_TRIANGLES:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+   case MESA_PRIM_TRIANGLE_STRIP:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+   case MESA_PRIM_TRIANGLE_FAN:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+   case MESA_PRIM_LINES_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+   case MESA_PRIM_PATCHES:
+      return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+   default:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+   }
+}
+
 static void
 sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset,
             const struct pipe_draw_indirect_info *indirect,
             const struct pipe_draw_start_count_bias *draws, unsigned num_draws)
 {
+   struct sz_context *ctx = sz_context(pipe);
+
+   if (indirect || num_draws == 0) {
+      sz_warn_once("SZ: indirect draws are not implemented, ignoring");
+      return;
+   }
+
+   const struct sz_state *ve = ctx->state.vertex_elements;
+   if (!ve || ve->u.ve.count == 0) {
+      sz_warn_once("SZ: draw without vertex elements, ignoring");
+      return;
+   }
+
+   if (ctx->state.num_vertex_buffers == 0) {
+      sz_warn_once("SZ: draw without vertex buffers, ignoring");
+      return;
+   }
+
+   VkCommandBuffer cmd = sz_context_cmd(ctx);
+   if (cmd == VK_NULL_HANDLE)
+      return;
+
+   if (!ctx->rendering && !sz_renderpass_begin(ctx, cmd))
+      return;
+
+   /* The index buffer is part of pipe_draw_info, not context state, so it is
+    * bound per draw. Binding it when it has not changed is what Phase 3's state
+    * tracker removes; Phase 1 correctness first. */
+   struct sz_resource *index = NULL;
+   if (info->index_size) {
+      if (info->has_user_indices) {
+         sz_warn_once("SZ: user index buffers are not implemented, ignoring");
+         return;
+      }
+      index = sz_resource(info->index.resource);
+      if (!index || index->buffer == VK_NULL_HANDLE)
+         return;
+
+      sz_resource_access(ctx->screen, cmd, index, SZ_ACCESS_INDEX_BUFFER);
+
+      const VkIndexType type = info->index_size == 4 ? VK_INDEX_TYPE_UINT32
+                                                     : VK_INDEX_TYPE_UINT16;
+      ctx->screen->vk.CmdBindIndexBuffer(cmd, index->buffer, 0, type);
+   }
+
+   const unsigned stride = ve->u.ve.elements[0].src_stride;
+   const VkPrimitiveTopology topology = sz_topology(info->mode);
+
+   struct sz_gfx_pipeline *pipeline =
+      sz_pipeline_get(ctx, topology, ve->u.ve.count, stride);
+   if (!pipeline)
+      return;
+
+   ctx->screen->vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    pipeline->pipeline);
+
+   sz_draw_viewport(ctx, cmd);
+
+   /* One binding, matching the bootstrap shader's single input location. */
+   const struct pipe_vertex_buffer *vb = &ctx->state.vertex_buffers[0];
+   if (vb->is_user_buffer || !vb->buffer.resource) {
+      sz_warn_once("SZ: user vertex buffers are not implemented, ignoring");
+      return;
+   }
+
+   struct sz_resource *vres = sz_resource(vb->buffer.resource);
+   if (vres->buffer == VK_NULL_HANDLE)
+      return;
+
+   sz_resource_access(ctx->screen, cmd, vres, SZ_ACCESS_VERTEX_BUFFER);
+
+   const VkDeviceSize offset = vb->buffer_offset;
+   ctx->screen->vk.CmdBindVertexBuffers(cmd, 0, 1, &vres->buffer, &offset);
+
+   for (unsigned i = 0; i < num_draws; i++) {
+      if (draws[i].count == 0)
+         continue;
+
+      if (info->index_size) {
+         ctx->screen->vk.CmdDrawIndexed(cmd, draws[i].count, info->instance_count,
+                                        draws[i].start, (int32_t)draws[i].index_bias,
+                                        info->start_instance);
+      } else {
+         ctx->screen->vk.CmdDraw(cmd, draws[i].count, info->instance_count,
+                                 draws[i].start, info->start_instance);
+      }
+   }
 }
 
 static void
@@ -952,7 +1277,7 @@ sz_clear_buffer(struct pipe_context *pipe, struct pipe_resource *res,
    if (sres->buffer == VK_NULL_HANDLE || clear_value_size != 4)
       return;
 
-   VkCommandBuffer cmd = sz_context_cmd(ctx);
+   VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
       return;
 
@@ -1045,8 +1370,12 @@ sz_context_destroy(struct pipe_context *pipe)
 {
    struct sz_context *ctx = sz_context(pipe);
 
+   /* Anything recorded and not yet submitted still names the pipeline and the
+    * attachments, so it has to reach the queue before they are destroyed. */
    sz_context_submit(ctx);
    sz_queue_wait_idle(&ctx->screen->batch_state);
+
+   sz_pipeline_finish(ctx);
 
    /* Nothing in ctx->state is owned here: every object was created by a create_*
     * entry point and is destroyed by its matching delete_* entry point, which the
@@ -1060,6 +1389,21 @@ sz_context_destroy(struct pipe_context *pipe)
 /* ------------------------------------------------------------------------- */
 /* Self-test                                                                  */
 /* ------------------------------------------------------------------------- */
+
+/* Exact comparison is too strict for a rendered texel: the hardware is allowed
+ * to round an 8-bit conversion either way, so a correct draw can land one step
+ * off. Two steps still catches a wrong colour, a flipped channel or a stale
+ * frame. */
+static bool
+sz_rgba_close(const uint8_t *a, const uint8_t *b, unsigned tolerance)
+{
+   for (unsigned i = 0; i < 4; i++) {
+      const int diff = (int)a[i] - (int)b[i];
+      if (diff > (int)tolerance || diff < -(int)tolerance)
+         return false;
+   }
+   return true;
+}
 
 unsigned
 sz_context_selftest(struct sz_screen *screen)
@@ -1220,6 +1564,246 @@ out:
    return failures;
 }
 
+/* SZ_DEBUG=selftest: render one triangle through the real Gallium entry points.
+ *
+ * The 1.C self-test proves recording and submitting work; this one proves a draw
+ * reaches pixels. It goes through sz_draw_vbo, sz_renderpass_begin and
+ * sz_pipeline_get rather than calling Vulkan directly, because those three are
+ * where a bug produces no error at all -- just a black screen.
+ *
+ * The triangle covers exactly the left half of the target. Checking one texel on
+ * each side separates "rasterised in the right place" from "something drew": a
+ * full-screen triangle would pass even with the viewport transform inverted. */
+unsigned
+sz_render_selftest(struct sz_screen *screen)
+{
+   unsigned failures = 0;
+   const unsigned w = 64, h = 64;
+
+   /* Left half in NDC, as six vec4 vertices (two triangles). */
+   static const float vertices[6][4] = {
+      { -1.0f, -1.0f, 0.0f, 1.0f },
+      {  0.0f, -1.0f, 0.0f, 1.0f },
+      { -1.0f,  1.0f, 0.0f, 1.0f },
+      {  0.0f, -1.0f, 0.0f, 1.0f },
+      {  0.0f,  1.0f, 0.0f, 1.0f },
+      { -1.0f,  1.0f, 0.0f, 1.0f },
+   };
+
+   /* Distinct from the pipeline colour in every channel, so a missing clear and
+    * a missing draw cannot both look like a pass. */
+   const union pipe_color_union clear_color = {
+      .f = { 0.1f, 0.2f, 0.3f, 1.0f },
+   };
+   const uint8_t expect_clear[4] = { 26, 51, 77, 255 };
+   const uint8_t expect_tri[4] = { 64, 128, 191, 255 };
+
+   struct pipe_context *pipe = NULL;
+   void *velems = NULL;
+   struct pipe_resource *rt = NULL;
+   struct pipe_resource *vbuf = NULL;
+   struct pipe_resource *readback = NULL;
+
+   const struct pipe_resource rt_tmpl = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+      .usage = PIPE_USAGE_DEFAULT,
+      .width0 = w,
+      .height0 = h,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 0,
+   };
+
+   const struct pipe_resource vbuf_tmpl = {
+      .target = PIPE_BUFFER,
+      .format = PIPE_FORMAT_R8_UNORM,
+      .usage = PIPE_USAGE_STAGING,
+      .width0 = sizeof(vertices),
+      .height0 = 1,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 0,
+   };
+
+   const struct pipe_resource rb_tmpl = {
+      .target = PIPE_BUFFER,
+      .format = PIPE_FORMAT_R8_UNORM,
+      .usage = PIPE_USAGE_STAGING,
+      .width0 = w * h * 4,
+      .height0 = 1,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 0,
+   };
+
+   pipe = sz_context_create(screen, 0);
+   if (!pipe) {
+      mesa_loge("SZ: render selftest: could not create a context");
+      return 1;
+   }
+
+   rt = screen->base.resource_create(&screen->base, &rt_tmpl);
+   vbuf = screen->base.resource_create(&screen->base, &vbuf_tmpl);
+   readback = screen->base.resource_create(&screen->base, &rb_tmpl);
+
+   if (!rt || !vbuf || !readback) {
+      mesa_loge("SZ: render selftest: could not create the resources");
+      failures++;
+      goto out;
+   }
+
+   memcpy(sz_resource_map(sz_resource(vbuf)), vertices, sizeof(vertices));
+   sz_bo_flush(sz_resource(vbuf)->bo, 0, sizeof(vertices));
+
+   const struct pipe_vertex_element elem = {
+      .src_offset = 0,
+      .vertex_buffer_index = 0,
+      .src_format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+      .src_stride = sizeof(vertices[0]),
+   };
+
+   velems = pipe->create_vertex_elements_state(pipe, 1, &elem);
+   if (!velems) {
+      mesa_loge("SZ: render selftest: could not create vertex elements");
+      failures++;
+      goto out;
+   }
+
+   struct pipe_framebuffer_state fb = {
+      .width = w,
+      .height = h,
+      .nr_cbufs = 1,
+      .cbufs = {
+         {
+            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .texture = rt,
+            .level = 0,
+            .first_layer = 0,
+            .last_layer = 0,
+         },
+      },
+   };
+
+   pipe->set_framebuffer_state(pipe, &fb);
+   pipe->bind_vertex_elements_state(pipe, velems);
+
+   const struct pipe_vertex_buffer vb = {
+      .is_user_buffer = false,
+      .buffer_offset = 0,
+      .buffer.resource = vbuf,
+   };
+   pipe->set_vertex_buffers(pipe, 1, &vb);
+
+   const struct pipe_viewport_state vp = {
+      .scale = { w / 2.0f, h / 2.0f, 0.5f },
+      .translate = { w / 2.0f, h / 2.0f, 0.5f },
+   };
+   pipe->set_viewport_states(pipe, 0, 1, &vp);
+
+   const struct pipe_scissor_state sc = {
+      .minx = 0, .miny = 0, .maxx = w, .maxy = h,
+   };
+   pipe->set_scissor_states(pipe, 0, 1, &sc);
+
+   pipe->clear(pipe, PIPE_CLEAR_COLOR, 0, 0, NULL, &clear_color, 0.0, 0);
+
+   const struct pipe_draw_info info = {
+      .mode = MESA_PRIM_TRIANGLES,
+      .instance_count = 1,
+   };
+   const struct pipe_draw_start_count_bias draw = {
+      .start = 0,
+      .count = ARRAY_SIZE(vertices),
+   };
+   pipe->draw_vbo(pipe, &info, 0, NULL, &draw, 1);
+
+   pipe->flush(pipe, NULL, 0);
+   sz_queue_wait_idle(&screen->batch_state);
+
+   /* Reading the result back is a transfer on the image, so it is recorded
+    * outside the context to keep the test independent of the transfer entry
+    * points that Phase 1 has not implemented yet. */
+   struct sz_resource *img = sz_resource(rt);
+   struct sz_resource *rb = sz_resource(readback);
+
+   struct sz_batch *batch = sz_batch_begin(&screen->batch_state);
+   if (!batch) {
+      failures++;
+      goto out;
+   }
+   const VkCommandBuffer cmd = batch->cmd;
+
+   sz_resource_access(screen, cmd, img, SZ_ACCESS_TRANSFER_SRC);
+
+   const VkBufferImageCopy region = {
+      .imageSubresource = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .mipLevel = 0,
+         .baseArrayLayer = 0,
+         .layerCount = 1,
+      },
+      .imageExtent = { w, h, 1 },
+   };
+
+   screen->vk.CmdCopyImageToBuffer(cmd, img->image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   rb->buffer, 1, &region);
+
+   sz_memory_barrier(screen, cmd, VK_PIPELINE_STAGE_2_COPY_BIT,
+                     VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+
+   if (!sz_batch_end(batch) ||
+       !sz_batch_submit(batch, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT)) {
+      failures++;
+      goto out;
+   }
+
+   sz_queue_wait_idle(&screen->batch_state);
+   sz_bo_invalidate(rb->bo, 0, sz_bo_size(rb->bo));
+
+   const uint8_t *pixels = sz_resource_map(rb);
+   if (!pixels) {
+      mesa_loge("SZ: render selftest: the readback buffer is not host visible");
+      failures++;
+      goto out;
+   }
+
+   /* Inside the triangle's half, and one texel clear of the boundary. */
+   const uint8_t *inside = pixels + (h / 2 * w + w / 4) * 4;
+   const uint8_t *outside = pixels + (h / 2 * w + 3 * w / 4) * 4;
+
+   if (!sz_rgba_close(inside, expect_tri, 2)) {
+      mesa_loge("SZ: render selftest: inside the triangle is %u,%u,%u,%u, "
+                "expected %u,%u,%u,%u", inside[0], inside[1], inside[2],
+                inside[3], expect_tri[0], expect_tri[1], expect_tri[2],
+                expect_tri[3]);
+      failures++;
+   }
+
+   if (!sz_rgba_close(outside, expect_clear, 2)) {
+      mesa_loge("SZ: render selftest: outside the triangle is %u,%u,%u,%u, "
+                "expected %u,%u,%u,%u", outside[0], outside[1], outside[2],
+                outside[3], expect_clear[0], expect_clear[1], expect_clear[2],
+                expect_clear[3]);
+      failures++;
+   }
+
+   if (failures == 0)
+      mesa_logi("SZ: render selftest: draw %ux%u ok", w, h);
+
+out:
+   if (velems)
+      pipe->delete_vertex_elements_state(pipe, velems);
+   pipe_resource_reference(&rt, NULL);
+   pipe_resource_reference(&vbuf, NULL);
+   pipe_resource_reference(&readback, NULL);
+   sz_context_destroy(pipe);
+   return failures;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Entry point                                                                */
 /* ------------------------------------------------------------------------- */
@@ -1240,7 +1824,7 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
 
    /* State objects. */
    pipe->create_blend_state = sz_create_blend_state;
-   pipe->bind_blend_state = sz_bind_state;
+   pipe->bind_blend_state = sz_bind_blend_state;
    pipe->delete_blend_state = sz_delete_state;
 
    pipe->create_sampler_state = sz_create_sampler_state;
@@ -1248,11 +1832,11 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->delete_sampler_state = sz_delete_state;
 
    pipe->create_rasterizer_state = sz_create_rasterizer_state;
-   pipe->bind_rasterizer_state = sz_bind_state;
+   pipe->bind_rasterizer_state = sz_bind_rasterizer_state;
    pipe->delete_rasterizer_state = sz_delete_state;
 
    pipe->create_depth_stencil_alpha_state = sz_create_depth_stencil_alpha_state;
-   pipe->bind_depth_stencil_alpha_state = sz_bind_state;
+   pipe->bind_depth_stencil_alpha_state = sz_bind_depth_stencil_alpha_state;
    pipe->delete_depth_stencil_alpha_state = sz_delete_state;
 
    pipe->create_fs_state = sz_create_fs_state;
@@ -1284,7 +1868,7 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->delete_ms_state = sz_delete_state;
 
    pipe->create_vertex_elements_state = sz_create_vertex_elements_state;
-   pipe->bind_vertex_elements_state = sz_bind_state;
+   pipe->bind_vertex_elements_state = sz_bind_vertex_elements_state;
    pipe->delete_vertex_elements_state = sz_delete_state;
 
    /* Parameter state. */

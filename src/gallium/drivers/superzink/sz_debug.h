@@ -48,4 +48,16 @@ sz_debug_enabled(enum sz_debug_flag flag)
          mesa_logw("SZ: " fmt, ##__VA_ARGS__);                                 \
    } while (0)
 
+/* Same as sz_warn() but only the first time each call site reaches it. Used for
+ * "this path is not implemented yet" messages that would otherwise repeat once
+ * per draw and drown the log. */
+#define sz_warn_once(fmt, ...)                                                 \
+   do {                                                                        \
+      static bool warned_;                                                     \
+      if (!warned_) {                                                          \
+         warned_ = true;                                                       \
+         sz_warn(fmt, ##__VA_ARGS__);                                          \
+      }                                                                        \
+   } while (0)
+
 #endif /* SZ_DEBUG_H */

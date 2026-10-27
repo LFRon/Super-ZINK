@@ -32,8 +32,30 @@ struct sz_resource {
    VkImage image;
    VkBuffer buffer;
 
+   /* A whole-resource view of `image`, created alongside it.
+    *
+    * Vulkan cannot bind an image to a framebuffer or a descriptor without a
+    * view, and the two differ only in how much of the image they address. The
+    * cost is one extra object per texture, which is far less than creating and
+    * destroying a view per binding -- and GL rebinds constantly. Views that
+    * reinterpret the format or address a sub-range need their own object and
+    * arrive with the sampler-view work. */
+   VkImageView view;
+
    /* Current layout, or VK_IMAGE_LAYOUT_UNDEFINED for buffers. */
    VkImageLayout layout;
+
+   /* Buffers only, because images express the same information through their
+    * layout. The last stage and access that wrote this buffer, used to emit a
+    * barrier only when a write is actually pending. Without it a buffer read as
+    * vertex data after a transfer write is a data race that Vulkan will not
+    * detect and that shows up as stale vertices.
+    *
+    * There is no per-range tracking: one stage/access pair covers the whole
+    * buffer, so a write to one end forces a barrier before reading the other.
+    * Coarse but never wrong. */
+   VkPipelineStageFlags2 pending_write_stages;
+   VkAccessFlags2 pending_write_access;
 
    /* Set when the resource was created with linear tiling, which forbids
     * VK_IMAGE_TILING_OPTIMAL-only usage and needs explicit cache flushes. */

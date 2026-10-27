@@ -9,9 +9,12 @@ files_libsuperzink = files(
   'sz_device.c',
   'sz_debug.c',
   'sz_format.c',
+  'sz_pipeline.c',
   'sz_range.c',
+  'sz_renderpass.c',
   'sz_resource.c',
   'sz_screen.c',
+  'sz_spirv.c',
   'sz_sync.c',
 )
 

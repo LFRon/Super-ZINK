@@ -26,6 +26,11 @@ VkImageType sz_image_type(enum pipe_texture_target target);
 VkImageCreateFlags sz_image_create_flags(enum pipe_texture_target target);
 VkSampleCountFlagBits sz_vk_sample_count(unsigned sample_count);
 
+/* The VkImageAspectFlags a format's data lives in. Shared so image creation,
+ * barrier recording and attachment setup cannot disagree about whether a format
+ * has a stencil part. */
+VkImageAspectFlags sz_format_aspect(enum pipe_format format);
+
 /* Whether a resource created with these bindings must be linearly tiled. */
 bool sz_bindings_require_linear(unsigned bindings);
 
