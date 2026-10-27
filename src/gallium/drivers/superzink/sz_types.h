@@ -43,6 +43,24 @@ struct sz_vk_entrypoints {
    PFN_vkDestroyDevice DestroyDevice;
    PFN_vkDeviceWaitIdle DeviceWaitIdle;
    PFN_vkGetDeviceQueue2 GetDeviceQueue2;
+
+   /* Memory and resources (sz_bo / sz_resource). */
+   PFN_vkAllocateMemory AllocateMemory;
+   PFN_vkFreeMemory FreeMemory;
+   PFN_vkMapMemory MapMemory;
+   PFN_vkUnmapMemory UnmapMemory;
+   PFN_vkFlushMappedMemoryRanges FlushMappedMemoryRanges;
+   PFN_vkInvalidateMappedMemoryRanges InvalidateMappedMemoryRanges;
+   PFN_vkCreateBuffer CreateBuffer;
+   PFN_vkDestroyBuffer DestroyBuffer;
+   PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements;
+   PFN_vkGetBufferMemoryRequirements2 GetBufferMemoryRequirements2;
+   PFN_vkBindBufferMemory BindBufferMemory;
+   PFN_vkCreateImage CreateImage;
+   PFN_vkDestroyImage DestroyImage;
+   PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
+   PFN_vkGetImageMemoryRequirements2 GetImageMemoryRequirements2;
+   PFN_vkBindImageMemory BindImageMemory;
 };
 
 /* Declared before struct sz_screen because sz_screen embeds them by value. */
@@ -58,6 +76,12 @@ struct sz_queue {
    uint32_t family;
    uint32_t index;
 };
+
+/* Forward declarations for the per-screen subsystems, so sz_types.h stays the
+ * single place that defines the screen without pulling in every module header. */
+struct sz_bo_state;
+struct sz_bo;
+struct sz_resource;
 
 struct sz_screen {
    struct pipe_screen base;
@@ -84,6 +108,9 @@ struct sz_screen {
    struct sz_caps caps;
 
    struct sz_queue queues[SZ_QUEUE_COUNT];
+
+   /* Device memory suballocator (sz_bo). */
+   struct sz_bo_state *bo;
 
    int drm_fd;
 

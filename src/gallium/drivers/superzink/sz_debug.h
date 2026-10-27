@@ -26,6 +26,7 @@ enum sz_debug_flag {
    SZ_DEBUG_NO_PACE   = (1 << 7),
    SZ_DEBUG_FLUSHSYNC = (1 << 8),
    SZ_DEBUG_QUIET     = (1 << 9),
+   SZ_DEBUG_SELFTEST  = (1 << 10),
 };
 
 extern uint32_t sz_debug;

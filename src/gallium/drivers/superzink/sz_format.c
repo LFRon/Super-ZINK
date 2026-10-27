@@ -19,10 +19,16 @@
 
 /* Gallium passes sample_count == 0 both for "single sample" and for "don't
  * care". Vulkan wants a concrete count, and 1 satisfies both readings. */
-static unsigned
+VkSampleCountFlagBits
 sz_vk_sample_count(unsigned sample_count)
 {
-   return MAX2(sample_count, 1);
+   const unsigned clamped = MAX2(sample_count, 1);
+   /* Vulkan only defines powers of two. A request for 3x MSAA is answered with
+    * the next supported count by the caller, not here. */
+   unsigned bit = 1;
+   while (bit < clamped && bit < 64)
+      bit <<= 1;
+   return (VkSampleCountFlagBits)bit;
 }
 
 /* Feature bits that describe VkBuffer usage rather than VkImage usage. */
@@ -97,7 +103,7 @@ sz_image_usage_from_bindings(unsigned bindings, enum pipe_format format)
    return usage;
 }
 
-static VkImageCreateFlags
+VkImageCreateFlags
 sz_image_create_flags(enum pipe_texture_target target)
 {
    switch (target) {
@@ -109,7 +115,7 @@ sz_image_create_flags(enum pipe_texture_target target)
    }
 }
 
-static VkImageType
+VkImageType
 sz_image_type(enum pipe_texture_target target)
 {
    switch (target) {
@@ -124,6 +130,13 @@ sz_image_type(enum pipe_texture_target target)
 }
 
 /* Fetch the driver's feature bits for one tiling mode. */
+bool
+sz_bindings_require_linear(unsigned bindings)
+{
+   return !!(bindings & (PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET |
+                         PIPE_BIND_SCANOUT | PIPE_BIND_SHARED));
+}
+
 static VkFormatFeatureFlags
 sz_tiling_features(struct sz_screen *screen,
                    VkFormat format,
@@ -169,9 +182,7 @@ sz_format_supported_image(struct sz_screen *screen,
    /* Scanout, display and shared images leave our process as dmabufs, so the
     * consumer cannot know our optimal layout: they must be linear. A format
     * that RADV can only render to optimally is therefore not displayable. */
-   const bool needs_linear =
-      bindings & (PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET |
-                  PIPE_BIND_SCANOUT | PIPE_BIND_SHARED);
+   const bool needs_linear = sz_bindings_require_linear(bindings);
    const VkImageTiling tiling =
       needs_linear ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
 

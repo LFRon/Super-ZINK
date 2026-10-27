@@ -19,6 +19,7 @@ sz_debug_options[] = {
    { "no_pace",   SZ_DEBUG_NO_PACE,   "Disable the frame pacer (A/B comparisons)" },
    { "flushsync", SZ_DEBUG_FLUSHSYNC, "Force synchronous submits and presents" },
    { "quiet",     SZ_DEBUG_QUIET,     "Suppress warnings" },
+   { "selftest",  SZ_DEBUG_SELFTEST,  "Round-trip buffers and images through the allocator at startup" },
    DEBUG_NAMED_VALUE_END
 };
 

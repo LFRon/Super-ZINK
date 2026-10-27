@@ -20,6 +20,15 @@ VkImageUsageFlags sz_image_usage_from_bindings(unsigned bindings,
 /* Translate Gallium bindings to the VkFormatFeatureFlags that must be present. */
 VkFormatFeatureFlags sz_format_features_from_bindings(unsigned bindings);
 
+/* Mapping tables shared with sz_resource, so image creation and image support
+ * queries can never disagree about what a target means. */
+VkImageType sz_image_type(enum pipe_texture_target target);
+VkImageCreateFlags sz_image_create_flags(enum pipe_texture_target target);
+VkSampleCountFlagBits sz_vk_sample_count(unsigned sample_count);
+
+/* Whether a resource created with these bindings must be linearly tiled. */
+bool sz_bindings_require_linear(unsigned bindings);
+
 /* The single entry point behind pipe_screen::is_format_supported(). */
 bool sz_format_supported(struct sz_screen *screen,
                          enum pipe_format format,

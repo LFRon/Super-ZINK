@@ -418,6 +418,23 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(DeviceWaitIdle, vkDeviceWaitIdle);
    SZ_DEV_PROC(GetDeviceQueue2, vkGetDeviceQueue2);
 
+   SZ_DEV_PROC(AllocateMemory, vkAllocateMemory);
+   SZ_DEV_PROC(FreeMemory, vkFreeMemory);
+   SZ_DEV_PROC(MapMemory, vkMapMemory);
+   SZ_DEV_PROC(UnmapMemory, vkUnmapMemory);
+   SZ_DEV_PROC(FlushMappedMemoryRanges, vkFlushMappedMemoryRanges);
+   SZ_DEV_PROC(InvalidateMappedMemoryRanges, vkInvalidateMappedMemoryRanges);
+   SZ_DEV_PROC(CreateBuffer, vkCreateBuffer);
+   SZ_DEV_PROC(DestroyBuffer, vkDestroyBuffer);
+   SZ_DEV_PROC(GetBufferMemoryRequirements, vkGetBufferMemoryRequirements);
+   SZ_DEV_PROC(GetBufferMemoryRequirements2, vkGetBufferMemoryRequirements2);
+   SZ_DEV_PROC(BindBufferMemory, vkBindBufferMemory);
+   SZ_DEV_PROC(CreateImage, vkCreateImage);
+   SZ_DEV_PROC(DestroyImage, vkDestroyImage);
+   SZ_DEV_PROC(GetImageMemoryRequirements, vkGetImageMemoryRequirements);
+   SZ_DEV_PROC(GetImageMemoryRequirements2, vkGetImageMemoryRequirements2);
+   SZ_DEV_PROC(BindImageMemory, vkBindImageMemory);
+
 #undef SZ_DEV_PROC
 }
 
@@ -562,7 +579,9 @@ sz_device_init(struct sz_screen *screen)
    sz_verify_enabled_features(screen, &features);
 
    sz_load_device_entrypoints(screen);
-   if (!screen->vk.DestroyDevice || !screen->vk.GetDeviceQueue2) {
+   if (!screen->vk.DestroyDevice || !screen->vk.GetDeviceQueue2 ||
+       !screen->vk.AllocateMemory || !screen->vk.CreateBuffer ||
+       !screen->vk.CreateImage || !screen->vk.BindBufferMemory) {
       mesa_loge("SZ: the device is missing required entry points");
       sz_device_finish(screen);
       return false;

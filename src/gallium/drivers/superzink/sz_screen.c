@@ -18,6 +18,7 @@
 #include "sz_caps.h"
 #include "sz_device.h"
 #include "sz_format.h"
+#include "sz_resource.h"
 #include "sz_types.h"
 #include "sz_debug.h"
 
@@ -364,6 +365,7 @@ sz_screen_destroy(struct pipe_screen *pscreen)
 {
    struct sz_screen *screen = sz_screen(pscreen);
 
+   sz_bo_finish(screen);
    sz_device_finish(screen);
 
    /* The instance is destroyed via the entrypoint resolved while it was alive. */
@@ -425,6 +427,9 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
    if (!sz_device_init(screen))
       goto fail;
 
+   sz_bo_init(screen);
+   sz_resource_screen_init(screen);
+
    /* pipe_screen base */
    screen->base.destroy = sz_screen_destroy;
    screen->base.get_name = sz_screen_get_name;
@@ -459,6 +464,14 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
 
    sz_caps_dump(&screen->caps);
 
+   if (sz_debug_enabled(SZ_DEBUG_SELFTEST)) {
+      if (sz_resource_selftest(screen) != 0) {
+         mesa_loge("SZ: SZ_DEBUG=selftest failed; refusing to publish a screen "
+                   "whose resource layer does not round-trip");
+         goto fail;
+      }
+   }
+
    if (sz_debug_enabled(SZ_DEBUG_INFO)) {
       mesa_logi("SZ: screen created: %s", screen->renderer_string);
       mesa_logi("SZ: deviceType=%d vendorID=0x%04x deviceID=0x%04x",
@@ -481,6 +494,7 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
    return &screen->base;
 
 fail:
+   sz_bo_finish(screen);
    sz_device_finish(screen);
    if (screen->instance != VK_NULL_HANDLE && screen->vk_GetInstanceProcAddr) {
       PFN_vkDestroyInstance DestroyInstance =

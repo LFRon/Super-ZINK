@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: MIT
 
 files_libsuperzink = files(
+  'sz_bo.c',
   'sz_caps.c',
   'sz_device.c',
   'sz_debug.c',
   'sz_format.c',
+  'sz_range.c',
+  'sz_resource.c',
   'sz_screen.c',
 )
 
@@ -31,3 +34,14 @@ driver_superzink = declare_dependency(
   compile_args : '-DGALLIUM_SUPERZINK',
   link_with : [libsuperzink],
 )
+
+if with_tests
+  test(
+    'sz_range_test',
+    executable(
+      'sz_range_test',
+      ['sz_range_test.c', 'sz_range.c'],
+      include_directories : [inc_src, inc_include],
+    ),
+  )
+endif
