@@ -26,6 +26,7 @@
 #include "sz_resource.h"
 #include "sz_sync.h"
 
+#include "util/format/u_format.h"
 #include "util/format/u_formats.h"
 #include "util/log.h"
 #include "util/macros.h"
@@ -209,6 +210,96 @@ sz_blit_stencil(struct sz_context *ctx, VkCommandBuffer cmd,
 }
 
 
+/* Blits between two formats that Vulkan will not blit between.
+ *
+ * vkCmdBlitImage only accepts "compatible" formats -- same size and family --
+ * so the format conversions GL allows (RGBA8 to RGBA32F, sRGB to linear, UINT to
+ * float) have no vkCmd* equivalent at all. The state tracker hits this on the
+ * ordinary glBlitFramebuffer path, not on some exotic one.
+ *
+ * The conversion therefore happens where Mesa already has a complete and tested
+ * implementation for it: util_format_translate. Both ends go through the same
+ * transfer path the driver already uses for texture upload and readback, which
+ * means staging allocations, barriers and waiting are all already handled -- and
+ * the cost is two round trips, which is the right trade for a blit that changes
+ * format. A shader-based blit would be faster and is the natural upgrade once
+ * there is an internal pipeline to hang it on.
+ *
+ * Scaling is not supported here: util_format_translate converts a rectangle, it
+ * does not resample. A cross-format blit that also scales is refused rather than
+ * silently done without filtering.
+ */
+static bool
+sz_blit_cross_format(struct pipe_context *pipe,
+                     const struct pipe_blit_info *info)
+{
+   struct sz_context *ctx = sz_context(pipe);
+   const enum pipe_format src_format = info->src.resource->format;
+   const enum pipe_format dst_format = info->dst.resource->format;
+
+   if (!sz_box_equals(&info->src.box, &info->dst.box)) {
+      sz_warn_once("a blit that changes format and scales is not implemented");
+      return true;
+   }
+
+   const struct util_format_description *src_desc =
+      util_format_description(src_format);
+   const struct util_format_description *dst_desc =
+      util_format_description(dst_format);
+   if (!src_desc || !dst_desc ||
+       util_format_get_blockwidth(src_format) != 1 ||
+       util_format_get_blockheight(src_format) != 1 ||
+       util_format_get_blockwidth(dst_format) != 1 ||
+       util_format_get_blockheight(dst_format) != 1) {
+      sz_warn_once("cross-format blit between compressed formats is not "
+                   "implemented");
+      return true;
+   }
+
+   struct pipe_transfer *src_transfer = NULL, *dst_transfer = NULL;
+   struct pipe_box box = info->src.box;
+   if (box.width <= 0 || box.height <= 0 || box.depth <= 0)
+      return true;
+
+   /* The destination box may be at a different origin, so it is described
+    * separately even though the extents match. */
+   const struct pipe_box dst_box = info->dst.box;
+
+   const void *src = pipe->texture_map(pipe, info->src.resource, info->src.level,
+                                        PIPE_MAP_READ, &box, &src_transfer);
+   if (!src) {
+      sz_warn_once("could not map the source of a cross-format blit");
+      return true;
+   }
+
+   void *dst = pipe->texture_map(pipe, info->dst.resource, info->dst.level,
+                                  PIPE_MAP_WRITE, &dst_box, &dst_transfer);
+   if (!dst) {
+      pipe->texture_unmap(pipe, src_transfer);
+      sz_warn_once("could not map the destination of a cross-format blit");
+      return true;
+   }
+
+   /* Level by level: util_format_translate converts one 2D slice, so a blit of a
+    * 3D resource (or an array, whose layers are separate slices) walks the
+    * slices here. */
+   const unsigned slices = MAX2(box.depth, 1);
+   for (unsigned z = 0; z < slices; z++) {
+      util_format_translate(dst_format, dst, dst_transfer->stride, dst_box.x,
+                            dst_box.y, src_format, src,
+                            src_transfer->stride, box.x, box.y, box.width,
+                            box.height);
+      dst = (uint8_t *)dst + dst_transfer->layer_stride;
+      src = (const uint8_t *)src + src_transfer->layer_stride;
+   }
+
+   pipe->texture_unmap(pipe, dst_transfer);
+   pipe->texture_unmap(pipe, src_transfer);
+
+   ctx->screen->stats.copies++;
+   return true;
+}
+
 static void
 sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
                const struct pipe_blit_info *info, struct sz_resource *src,
@@ -217,10 +308,15 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
                unsigned dst_samples)
 {
    if (src_format != dst_format) {
-      sz_warn_once("blit between different Vulkan formats is not implemented "
-                   "(%s vs %s)",
-                   util_format_name(info->src.resource->format),
-                   util_format_name(info->dst.resource->format));
+      /* Only the colour aspect has a generic conversion; a depth or stencil
+       * blit that also changes format has no equivalent anywhere in Vulkan or
+       * in util_format. */
+      if (aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
+         sz_warn_once("a depth or stencil blit that changes format is not "
+                      "implemented");
+         return;
+      }
+      sz_blit_cross_format(&ctx->base, info);
       return;
    }
 

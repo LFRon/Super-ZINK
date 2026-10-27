@@ -943,6 +943,14 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       dst.base = SZ_BASE_BOOL;
 
    /* Pure aliases. */
+   /* b2b1 truncates a bool to one bit, which in SPIR-V is already the only
+    * bool there is: the value passes through unchanged. */
+   if (op == nir_op_b2b1) {
+      t->defs_id[alu->def.index] = sz_alu_source(t, &alu->src[0], dst.ncomp);
+      t->def_types[alu->def.index] = dst;
+      return;
+   }
+
    if (op == nir_op_mov) {
       const uint32_t src = sz_alu_source_as(t, &alu->src[0], &dst, dst.ncomp);
       t->defs_id[alu->def.index] = src;
