@@ -2647,6 +2647,158 @@ sz_emit_shader(struct sz_translate *t, uint32_t function)
    return !t->failed;
 }
 
+/* Checks the module's control-flow cross references before it is handed over.
+ *
+ * A phi names two ids that are not results of its own: the value on each
+ * incoming edge, and the block that edge comes from. Both are written as raw
+ * numbers during emission, so a bookkeeping mistake produces a module that is
+ * merely *wrong* rather than one that fails to build -- and the consumer of a
+ * wrong module is a driver's SPIR-V parser, which on RADV means a segfault
+ * inside vkCreateGraphicsPipelines. The translator's whole design is that a
+ * refusal is cheaper than a wrong shader, so the same rule applies here: walk
+ * the result, and if a phi points at something that is not a label or not a
+ * defined value, say so and fail.
+ *
+ * This costs one pass over the words at shader-compile time, which is nothing
+ * next to the compile itself, and it turns a class of "the driver crashed"
+ * reports into a legible translation error. */
+static bool
+sz_spv_verify_cfg(struct sz_translate *t, const uint32_t *words, size_t count,
+                  char **error)
+{
+   const size_t n = count / 4;
+   if (n == 0)
+      return true;
+
+   const uint32_t bound = words[3];
+   if (bound == 0 || bound > 4u * 1024 * 1024) {
+      if (error)
+         *error = strdup("the emitted module has an implausible id bound");
+      return false;
+   }
+
+   uint8_t *kind = calloc(bound, 1);
+   if (!kind)
+      return true;
+
+   /* 1 = a defined value id, 2 = an OpLabel id. */
+   size_t i = 5;
+   while (i < n) {
+      const uint16_t wc = words[i] >> 16;
+      const uint16_t op = words[i] & 0xFFFF;
+      if (wc == 0)
+         break;
+
+      uint32_t result = 0;
+      bool has_result = false;
+
+      if (op == SpvOpLabel && wc >= 2) {
+         result = words[i + 1];
+         has_result = true;
+         if (result < bound)
+            kind[result] = 2;
+      } else if ((op >= SpvOpTypeVoid && op <= SpvOpTypeForwardPointer) ||
+                 op == SpvOpVariable || op == SpvOpFunction ||
+                 op == SpvOpFunctionParameter || op == SpvOpConstant ||
+                 op == SpvOpConstantComposite || op == SpvOpConstantTrue ||
+                 op == SpvOpConstantFalse || op == SpvOpUndef ||
+                 op == SpvOpExtInst || op == SpvOpExtInstImport ||
+                 op == SpvOpSampledImage || op == SpvOpImage ||
+                 op == SpvOpCompositeConstruct || op == SpvOpCompositeExtract ||
+                 op == SpvOpCompositeInsert || op == SpvOpVectorShuffle ||
+                 op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain ||
+                 op == SpvOpPtrAccessChain || op == SpvOpLoad ||
+                 op == SpvOpSelect || op == SpvOpPhi || op == SpvOpBitcast ||
+                 op == SpvOpIAdd || op == SpvOpISub || op == SpvOpIMul ||
+                 op == SpvOpSDiv || op == SpvOpUDiv || op == SpvOpFAdd ||
+                 op == SpvOpFSub || op == SpvOpFMul || op == SpvOpFDiv ||
+                 op == SpvOpFNegate || op == SpvOpSNegate || op == SpvOpNot ||
+                 op == SpvOpBitwiseAnd || op == SpvOpBitwiseOr ||
+                 op == SpvOpBitwiseXor || op == SpvOpLogicalAnd ||
+                 op == SpvOpLogicalOr || op == SpvOpLogicalNot ||
+                 op == SpvOpLogicalEqual || op == SpvOpLogicalNotEqual ||
+                 op == SpvOpShiftLeftLogical || op == SpvOpShiftRightLogical ||
+                 op == SpvOpShiftRightArithmetic || op == SpvOpIEqual ||
+                 op == SpvOpINotEqual || op == SpvOpSLessThan ||
+                 op == SpvOpSGreaterThan || op == SpvOpSGreaterThanEqual ||
+                 op == SpvOpULessThan || op == SpvOpUGreaterThan ||
+                 op == SpvOpUGreaterThanEqual || op == SpvOpFOrdEqual ||
+                 op == SpvOpFOrdLessThan || op == SpvOpFUnordNotEqual ||
+                 op == SpvOpFOrdGreaterThanEqual ||
+                 op == SpvOpFUnordGreaterThanEqual ||
+                 op == SpvOpFUnordLessThan || op == SpvOpFOrdNotEqual ||
+                 op == SpvOpConvertFToS || op == SpvOpConvertFToU ||
+                 op == SpvOpConvertSToF || op == SpvOpConvertUToF ||
+                 op == SpvOpFConvert || op == SpvOpSConvert ||
+                 op == SpvOpUConvert || op == SpvOpImageFetch ||
+                 op == SpvOpImageQuerySize || op == SpvOpImageQuerySizeLod ||
+                 op == SpvOpImageQueryLevels || op == SpvOpImageQuerySamples ||
+                 op == SpvOpImageQueryLod || op == SpvOpImageGather ||
+                 op == SpvOpImageDrefGather || op == SpvOpDPdx ||
+                 op == SpvOpDPdy || op == SpvOpFwidth || op == SpvOpDPdxFine ||
+                 op == SpvOpDPdyFine || op == SpvOpDPdxCoarse ||
+                 op == SpvOpDPdyCoarse ||
+                 (op >= SpvOpImageSampleImplicitLod &&
+                  op <= SpvOpImageSparseDrefGather)) {
+         if (wc >= 3) {
+            result = words[i + 2];
+            has_result = true;
+         }
+      }
+
+      if (has_result && result < bound && kind[result] == 0)
+         kind[result] = 1;
+
+      i += wc;
+   }
+
+   /* 2 = labels, 1 = values. Now check the phis. */
+   bool ok = true;
+   i = 5;
+   while (i < n && ok) {
+      const uint16_t wc = words[i] >> 16;
+      const uint16_t op = words[i] & 0xFFFF;
+      if (wc == 0)
+         break;
+
+      if (op == SpvOpPhi && wc >= 5) {
+         for (unsigned k = 2; k + 1 < wc; k += 2) {
+            const uint32_t value = words[i + 1 + k];
+            const uint32_t parent = words[i + 2 + k];
+            if (value >= bound || kind[value] == 0 || kind[value] == 2) {
+               if (error && !*error)
+               {
+                  char buf[160];
+                  snprintf(buf, sizeof(buf),
+                           "a phi references value id %u, which the module never "
+                           "defines (id bound %u)", value, bound);
+                  *error = strdup(buf);
+               }
+               ok = false;
+               break;
+            }
+            if (parent >= bound || kind[parent] != 2) {
+               if (error && !*error)
+               {
+                  char buf[160];
+                  snprintf(buf, sizeof(buf),
+                           "a phi references parent block id %u, which is not a "
+                           "label the module emits", parent);
+                  *error = strdup(buf);
+               }
+               ok = false;
+               break;
+            }
+         }
+      }
+
+      i += wc;
+   }
+
+   free(kind);
+   return ok;
+}
+
 bool
 sz_nir_to_spirv(struct nir_shader *nir,
                 const struct pipe_stream_output_info *so, uint32_t **words,
@@ -2749,6 +2901,11 @@ sz_nir_to_spirv(struct nir_shader *nir,
 
    size_t bytes = 0;
    const uint32_t *module = sz_spv_finalize(t.m, &bytes);
+
+   /* Before handing the words over: a wrong module is a driver crash, not an
+    * error the consumer can report. */
+   if (module && !sz_spv_verify_cfg(&t, module, bytes, error))
+      goto fail;
 
    /* The caller owns the words: the module is gone by the time it is uploaded.
     * sz_spv_finalize() reports bytes, not words -- mixing the two over-reads the
