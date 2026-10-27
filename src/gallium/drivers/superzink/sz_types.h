@@ -105,6 +105,14 @@ struct sz_vk_entrypoints {
    PFN_vkCmdCopyImage2 CmdCopyImage2;
    PFN_vkCmdBlitImage2 CmdBlitImage2;
    PFN_vkCmdResolveImage2 CmdResolveImage2;
+
+   /* Queries (sz_query). */
+   PFN_vkCreateQueryPool CreateQueryPool;
+   PFN_vkDestroyQueryPool DestroyQueryPool;
+   PFN_vkResetQueryPool ResetQueryPool;
+   PFN_vkCmdBeginQuery CmdBeginQuery;
+   PFN_vkCmdEndQuery CmdEndQuery;
+   PFN_vkGetQueryPoolResults GetQueryPoolResults;
    PFN_vkCmdCopyBuffer CmdCopyBuffer;
    PFN_vkCmdFillBuffer CmdFillBuffer;
    PFN_vkCmdUpdateBuffer CmdUpdateBuffer;

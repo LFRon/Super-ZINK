@@ -171,6 +171,14 @@ struct sz_context {
     * the command buffer. */
    unsigned dirty;
 
+   /* Conditional rendering. The predicate is resolved when glBeginConditional-
+    * Render is called -- the GL specification allows blocking there, and doing
+    * it once is far cheaper than testing the condition per draw. Draws recorded
+    * while `condition_passes` is false are dropped. */
+   struct pipe_query *condition_query;
+   bool condition_expected;
+   bool condition_passes;
+
    /* Draw stream: draws accumulate here and leave as one vkCmdDrawMulti* call.
     *
     * The invariant that makes this correct is that every state setter flushes
@@ -258,6 +266,10 @@ struct sz_context {
 VkCommandBuffer sz_context_cmd(struct sz_context *ctx);
 VkCommandBuffer sz_context_cmd_no_pass(struct sz_context *ctx);
 
+/* Ends the batch being recorded and hands it to the queue. Used by the query
+ * module, which has to submit before a result can be read. */
+void sz_context_submit(struct sz_context *ctx);
+
 /* Emits the pending draw batch (and any state it needs) into the current command
  * buffer. Every state setter, every non-draw command and every submission calls
  * it first, which is what makes the batching correct: whatever a draw needs is
@@ -270,6 +282,21 @@ sz_context(struct pipe_context *pipe)
 {
    return (struct sz_context *)pipe;
 }
+
+/* Query objects (sz_query.c). */
+struct pipe_query *sz_create_query(struct pipe_context *pipe,
+                                   unsigned query_type, unsigned index);
+void sz_destroy_query(struct pipe_context *pipe, struct pipe_query *query);
+bool sz_begin_query(struct pipe_context *pipe, struct pipe_query *query);
+bool sz_end_query(struct pipe_context *pipe, struct pipe_query *query);
+bool sz_get_query_result(struct pipe_context *pipe, struct pipe_query *query,
+                         bool wait, union pipe_query_result *result);
+void sz_get_query_result_resource(struct pipe_context *pipe,
+                                  struct pipe_query *query,
+                                  enum pipe_query_flags flags,
+                                  enum pipe_query_value_type result_type,
+                                  int index, struct pipe_resource *resource,
+                                  unsigned offset);
 
 /* Creates the pipe_context. Returns NULL on failure. */
 struct pipe_context *sz_context_create(struct sz_screen *screen,

@@ -22,6 +22,7 @@
 #include "sz_debug.h"
 #include "sz_format.h"
 #include "sz_pipeline.h"
+#include "sz_query.h"
 #include "sz_renderpass.h"
 #include "sz_resource.h"
 #include "sz_sync.h"
@@ -177,7 +178,7 @@ sz_context_cmd_no_pass(struct sz_context *ctx)
    return cmd;
 }
 
-static void
+void
 sz_context_submit(struct sz_context *ctx)
 {
    /* Draws are queued, not recorded, so a submission has to drain them even when
@@ -1507,6 +1508,42 @@ sz_set_shader_images(struct pipe_context *pipe, mesa_shader_stage shader,
 }
 
 static void
+sz_render_condition(struct pipe_context *pipe, struct pipe_query *query,
+                    bool condition, enum pipe_render_cond_flag mode)
+{
+   struct sz_context *ctx = sz_context(pipe);
+
+   /* Draws issued before the condition belongs to the previous block. */
+   sz_draw_flush(ctx);
+
+   bool passes = true;
+   if (query) {
+      uint64_t value = 0;
+      /* `condition` is glBeginConditionalRender's *inverted* flag, not "draw
+       * when true": Mesa passes GL_QUERY_*_INVERTED straight through
+       * (condrender.c). So the block runs when the query result is non-zero and
+       * the app did not ask for the inverted form.
+       *
+       * The GL specification allows blocking here (GL_QUERY_WAIT), and the
+       * result cannot change afterwards, so the predicate is resolved once
+       * instead of being tested per draw. */
+      if (sz_query_result_u64(ctx, query, &value, true))
+         passes = (value != 0) != condition;
+      else {
+         sz_warn_once("conditional render with an unavailable query; the "
+                      "block is discarded");
+         passes = false;
+      }
+   }
+
+   ctx->condition_query = query;
+   ctx->condition_expected = condition;
+   ctx->condition_passes = passes;
+
+   (void)mode;
+}
+
+static void
 sz_set_clip_state(struct pipe_context *pipe, const struct pipe_clip_state *c)
 {
    sz_context(pipe)->state.clip = *c;
@@ -1770,6 +1807,14 @@ sz_draw_flush(struct sz_context *ctx)
 {
    if (ctx->pending.count == 0)
       return;
+
+   /* Inside a discarded conditional-render block the draws are dropped, not
+    * recorded: GL says the commands have no effect. The state is dropped with
+    * them, because a new batch re-emits everything anyway. */
+   if (ctx->condition_query && !ctx->condition_passes) {
+      ctx->pending.count = 0;
+      return;
+   }
 
    VkCommandBuffer cmd = sz_context_cmd(ctx);
    if (cmd == VK_NULL_HANDLE) {
@@ -2404,7 +2449,21 @@ sz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
          .row_pitch = t->row_pitch,
       };
 
-      sz_oneshot(ctx, &job);
+      /* Uploads are recorded into the command buffer that is already being
+       * built, not submitted on their own.
+       *
+       * They used to go through sz_oneshot(), which ends the command buffer,
+       * submits it and waits. That split an occlusion query (or any other
+       * begin/end pair) across two command buffers, which Vulkan forbids, and
+       * it cost a submit per client-array draw -- a dozen per frame in
+       * glxgears. The staging resource stays alive through the existing
+       * retirement table, which defers its destruction to the submission this
+       * copy is part of. */
+      VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
+      if (cmd != VK_NULL_HANDLE)
+         sz_copy_job_record(ctx, cmd, &job);
+      else
+         sz_oneshot(ctx, &job);
    }
 
    pipe_resource_reference(&t->staging, NULL);
@@ -3073,6 +3132,13 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->clear_buffer = sz_clear_buffer;
    pipe->resource_copy_region = sz_resource_copy_region;
    pipe->blit = sz_blit;
+   pipe->create_query = sz_create_query;
+   pipe->destroy_query = sz_destroy_query;
+   pipe->begin_query = sz_begin_query;
+   pipe->end_query = sz_end_query;
+   pipe->get_query_result = sz_get_query_result;
+   pipe->get_query_result_resource = sz_get_query_result_resource;
+   pipe->render_condition = sz_render_condition;
    pipe->flush_resource = sz_flush_resource;
    pipe->texture_subdata = sz_texture_subdata;
    pipe->buffer_subdata = sz_buffer_subdata;

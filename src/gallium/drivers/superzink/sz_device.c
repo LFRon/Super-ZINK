@@ -503,6 +503,12 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdCopyImage2, vkCmdCopyImage2);
    SZ_DEV_PROC(CmdBlitImage2, vkCmdBlitImage2);
    SZ_DEV_PROC(CmdResolveImage2, vkCmdResolveImage2);
+   SZ_DEV_PROC(CreateQueryPool, vkCreateQueryPool);
+   SZ_DEV_PROC(DestroyQueryPool, vkDestroyQueryPool);
+   SZ_DEV_PROC(ResetQueryPool, vkResetQueryPool);
+   SZ_DEV_PROC(CmdBeginQuery, vkCmdBeginQuery);
+   SZ_DEV_PROC(CmdEndQuery, vkCmdEndQuery);
+   SZ_DEV_PROC(GetQueryPoolResults, vkGetQueryPoolResults);
    SZ_DEV_PROC(CmdCopyBuffer, vkCmdCopyBuffer);
    SZ_DEV_PROC(CmdFillBuffer, vkCmdFillBuffer);
    SZ_DEV_PROC(CmdUpdateBuffer, vkCmdUpdateBuffer);

@@ -264,10 +264,15 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    if (src->image == VK_NULL_HANDLE || dst->image == VK_NULL_HANDLE)
       return;
 
-   /* Window rectangles, render conditions, blending and swizzling each need a
-    * different mechanism (scissored blits, conditional rendering, a shader).
-    * Refusing is honest; doing half of it is a wrong picture. */
-   if (info->num_window_rectangles || info->render_condition_enable ||
+   /* Window rectangles, conditional rendering, blending and swizzling each need
+    * a different mechanism (scissored blits, predication, a shader). Refusing is
+    * honest; doing half of it is a wrong picture.
+    *
+    * The condition is taken from our own state rather than from
+    * pipe_blit_info::render_condition_enable: the state tracker only fills that
+    * field in its glDrawPixels path, so on the glBlitFramebuffer path it is
+    * uninitialised stack garbage (observed as 1 with no condition set). */
+   if (info->num_window_rectangles || ctx->condition_query ||
        info->alpha_blend || info->swizzle_enable) {
       sz_warn_once("blit with window rectangles, a render condition, alpha "
                    "blending or swizzle is not implemented");

@@ -15,6 +15,7 @@ files_libsuperzink = files(
   'sz_dmabuf.c',
   'sz_format.c',
   'sz_pipeline.c',
+  'sz_query.c',
   'sz_range.c',
   'sz_renderpass.c',
   'sz_resource.c',

@@ -631,6 +631,13 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->seamless_cube_map = true;
       caps->depth_clip_disable = true;
       caps->fragment_shader_texture_lod = true;
+
+      /* Occlusion queries map straight onto VK_QUERY_TYPE_OCCLUSION.
+       * Conditional rendering is evaluated on the CPU when
+       * glBeginConditionalRender is called, which the GL specification allows
+       * and which works on devices without VK_EXT_conditional_rendering. */
+      caps->occlusion_query = true;
+      caps->conditional_render = true;
    }
 
    /* Shader limits. st_extensions.c reads max_instructions == 0 as "this stage
