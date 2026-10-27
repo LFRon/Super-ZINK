@@ -239,6 +239,15 @@ sz_base_from_alu_type(nir_alu_type type, enum sz_base *out)
 static uint32_t
 sz_scalar_type(struct sz_translate *t, enum sz_base base, unsigned bits)
 {
+   /* A one-bit integer and a bool are the same thing in SPIR-V, and only one of
+    * them exists: OpTypeInt requires 8, 16, 32 or 64 bits, so `OpTypeInt 1 0`
+    * is rejected -- by the validation layer if it is installed, and by a crash
+    * inside RADV's parser if it is not. NIR records a bool as a one-bit value
+    * whose base type the opcode table may still call uint (iand, ior, inot on
+    * booleans), so the bit width decides. */
+   if (bits == 1)
+      return sz_spv_type_bool(t->m);
+
    switch (base) {
    case SZ_BASE_FLOAT:
       return sz_spv_type_float(t->m, bits);
@@ -765,7 +774,12 @@ static uint32_t sz_glsl450;
 
 /* Applies a source swizzle, producing a value with `ncomp` components. */
 static uint32_t
-sz_alu_source(struct sz_translate *t, const nir_alu_src *src, unsigned ncomp)
+sz_const_as(struct sz_translate *t, const nir_load_const_instr *lconst,
+            const struct sz_dtype *want);
+
+static uint32_t
+sz_alu_source_as(struct sz_translate *t, const nir_alu_src *src,
+                  const struct sz_dtype *want, unsigned ncomp)
 {
    const nir_def *def = src->src.ssa;
    if (def == NULL) {
@@ -775,7 +789,19 @@ sz_alu_source(struct sz_translate *t, const nir_alu_src *src, unsigned ncomp)
    const uint32_t base = sz_scalar_type(t, t->def_types[def->index].base,
                                         t->def_types[def->index].bits);
    const unsigned n = def->num_components;
-   const uint32_t id = t->defs_id[def->index];
+
+   /* A constant has no type in NIR, only a bit pattern: the type it was given
+    * when it was emitted is a guess made from its uses. When the use this call
+    * serves wants a different one -- the same 0 used as the int arm of one select
+    * and the float arm of another -- the guess is the wrong side, and emitting it
+    * unchanged produces OpSelect with operands of two types, which SPIR-V
+    * rejects. */
+   const nir_load_const_instr *lconst = t->consts[def->index];
+   uint32_t id = t->defs_id[def->index];
+   if (want && lconst && t->def_types[def->index].base != want->base &&
+       t->def_types[def->index].bits == want->bits &&
+       n == want->ncomp && want->ncomp == ncomp)
+      id = sz_const_as(t, lconst, want);
 
    bool identity = n == ncomp;
    for (unsigned i = 0; identity && i < n; i++)
@@ -804,6 +830,12 @@ sz_alu_source(struct sz_translate *t, const nir_alu_src *src, unsigned ncomp)
    return sz_spv_composite_construct(t->m,
                                      sz_dtype_type(t, &t->def_types[def->index]),
                                      comps, ncomp);
+}
+
+static uint32_t
+sz_alu_source(struct sz_translate *t, const nir_alu_src *src, unsigned ncomp)
+{
+   return sz_alu_source_as(t, src, NULL, ncomp);
 }
 
 static uint32_t
@@ -894,9 +926,16 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       return;
    }
 
+   /* A one-bit result is a bool, whatever the opcode table calls it: the
+    * comparison ops declare nir_type_uint, and the logical ops on bools come
+    * from GLSL's && and ||. Deciding here rather than per op is what keeps
+    * OpBitwiseAnd/OpNot away from bool operands, which SPIR-V rejects. */
+   if (dst.bits == 1)
+      dst.base = SZ_BASE_BOOL;
+
    /* Pure aliases. */
    if (op == nir_op_mov) {
-      const uint32_t src = sz_alu_source(t, &alu->src[0], dst.ncomp);
+      const uint32_t src = sz_alu_source_as(t, &alu->src[0], &dst, dst.ncomp);
       t->defs_id[alu->def.index] = src;
       t->def_types[alu->def.index] = dst;
       return;
@@ -907,7 +946,7 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       uint32_t comps[16];
 
       for (unsigned i = 0; i < dst.ncomp; i++)
-         comps[i] = sz_alu_source(t, &alu->src[i], 1);
+         comps[i] = sz_alu_source_as(t, &alu->src[i], &dst, 1);
 
       const uint32_t vec = sz_spv_composite_construct(
          t->m, sz_dtype_type(t, &dst), comps, dst.ncomp);
@@ -918,8 +957,8 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
 
    if (op == nir_op_bcsel) {
       const uint32_t cond = sz_alu_source(t, &alu->src[0], dst.ncomp);
-      const uint32_t a = sz_alu_source(t, &alu->src[1], dst.ncomp);
-      const uint32_t b = sz_alu_source(t, &alu->src[2], dst.ncomp);
+      const uint32_t a = sz_alu_source_as(t, &alu->src[1], &dst, dst.ncomp);
+      const uint32_t b = sz_alu_source_as(t, &alu->src[2], &dst, dst.ncomp);
       const uint32_t ops[] = { cond, a, b };
       t->defs_id[alu->def.index] =
          sz_spv_alu(t->m, SpvOpSelect, sz_dtype_type(t, &dst), ops, 3);
@@ -998,6 +1037,30 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       if (sz_alu_maps[i].op != op)
          continue;
 
+      /* GLSL's && and || lower to the *bitwise* ops on bool operands, and
+       * SPIR-V has no bitwise operation on a bool: OpBitwiseAnd needs an
+       * integer type. The logical set is the same truth table. */
+      SpvOp spirv = sz_alu_maps[i].spirv;
+      if (dst.base == SZ_BASE_BOOL) {
+         switch (op) {
+         case nir_op_iand:
+            spirv = SpvOpLogicalAnd;
+            break;
+         case nir_op_ior:
+            spirv = SpvOpLogicalOr;
+            break;
+         case nir_op_inot:
+            spirv = SpvOpLogicalNot;
+            break;
+         case nir_op_ixor:
+            /* There is no OpLogicalXor; "not equal" is the same truth table. */
+            spirv = SpvOpLogicalNotEqual;
+            break;
+         default:
+            break;
+         }
+      }
+
       /* Only the sources the op declares exist: the rest of nir_alu_src[] is
        * uninitialised, and reading it dereferences a NULL nir_def. */
       const unsigned nsrcs = MIN2(nir_op_infos[op].num_inputs, 3);
@@ -1011,11 +1074,10 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
             t->m, sz_scalar_type(t, dst.base, dst.bits), 0);
          const uint32_t cmp[] = { ops[0], zero };
          t->defs_id[alu->def.index] =
-            sz_spv_alu(t->m, sz_alu_maps[i].spirv, sz_dtype_type(t, &dst), cmp,
-                       2);
+            sz_spv_alu(t->m, spirv, sz_dtype_type(t, &dst), cmp, 2);
       } else {
-         t->defs_id[alu->def.index] = sz_spv_alu(
-            t->m, sz_alu_maps[i].spirv, sz_dtype_type(t, &dst), ops, nsrcs);
+         t->defs_id[alu->def.index] =
+            sz_spv_alu(t->m, spirv, sz_dtype_type(t, &dst), ops, nsrcs);
       }
       t->def_types[alu->def.index] = dst;
       return;
@@ -1194,9 +1256,13 @@ sz_emit_load_ubo(struct sz_translate *t, nir_intrinsic_instr *intrin,
       return;
 
    /* nir_lower_uniforms_to_ubo() puts the whole byte offset in src[1] and leaves
-    * base at zero, but base is part of the intrinsic's contract, so both are
-    * added rather than one being assumed empty. */
-   const unsigned base = nir_intrinsic_base(intrin);
+    * base at zero. load_ubo has no BASE index at all -- only load_ubo_vec4 does
+    * -- and nir_intrinsic_base() asserts on that in a debug build and reads
+    * const_index[-1], the previous intrinsic's metadata, in a release build. A
+    * garbage base of one word is enough to make a shader read the wrong uniform
+    * and, for gl_FbWposYTransform, flip gl_FragCoord.y into nonsense. */
+   const unsigned base =
+      nir_intrinsic_has_base(intrin) ? (unsigned)nir_intrinsic_base(intrin) : 0u;
 
    const uint32_t uint_type = sz_spv_type_uint32(t->m);
    const uint32_t word_ptr_type =

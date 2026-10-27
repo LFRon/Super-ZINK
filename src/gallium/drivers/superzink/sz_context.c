@@ -1442,6 +1442,7 @@ sz_set_constant_buffer(struct pipe_context *pipe, mesa_shader_stage shader,
                        uint index, const struct pipe_constant_buffer *buf)
 {
    struct sz_context *ctx = sz_context(pipe);
+   struct sz_screen *screen = ctx->screen;
 
    if (shader >= MESA_SHADER_STAGES || index >= SZ_MAX_CONST_BUFFERS) {
       sz_warn_once("ignoring a constant buffer outside the supported range");
@@ -1449,6 +1450,12 @@ sz_set_constant_buffer(struct pipe_context *pipe, mesa_shader_stage shader,
    }
 
    struct pipe_constant_buffer *dst = &ctx->state.constant_buffers[shader][index];
+
+   if (sz_debug_enabled(SZ_DEBUG_TRACE))
+      sz_trace_("constbuf stage=%d index=%u buffer=%p user=%p size=%u off=%u",
+                (int)shader, index, (void *)(buf ? buf->buffer : NULL),
+                buf ? buf->user_buffer : NULL, buf ? buf->buffer_size : 0,
+                buf ? buf->buffer_offset : 0);
 
    sz_state_changed(ctx, SZ_DIRTY_DESCRIPTORS);
 
@@ -1460,19 +1467,54 @@ sz_set_constant_buffer(struct pipe_context *pipe, mesa_shader_stage shader,
       return;
    }
 
-   /* st is asked for real buffers (caps->prefer_real_buffer_in_constbuf0), so a
-    * client-memory pointer here means some other path -- a draw module or a
-    * blit shader -- and copying it would need an uploader this phase does not
-    * have yet. Say so once instead of reading stale descriptors. */
-   if (!buf->buffer) {
-      sz_warn_once("constant buffers in client memory are not implemented, "
-                   "ignoring");
+   if (buf->buffer) {
+      pipe_resource_reference(&dst->buffer, buf->buffer);
+      dst->buffer_offset = buf->buffer_offset;
+      dst->buffer_size = buf->buffer_size;
+      dst->user_buffer = NULL;
       return;
    }
 
-   pipe_resource_reference(&dst->buffer, buf->buffer);
-   dst->buffer_offset = buf->buffer_offset;
-   dst->buffer_size = buf->buffer_size;
+   /* Client memory. st uploads most constants itself, but not all of them: the
+    * default uniform block it hands the driver this way carries
+    * gl_FbWposYTransform and the other values the frontend derives per draw, and
+    * a shader that reads gl_FragCoord reads them. Dropping the pointer leaves
+    * the descriptor pointing at whatever the previous draw put there, which is
+    * how a texelFetch through gl_FragCoord ends up sampling outside the texture
+    * and returning zero.
+    *
+    * The offset is aligned to minUniformBufferOffsetAlignment because
+    * VkDescriptorBufferInfo::offset must be, and the resource the uploader
+    * returns is referenced by the caller: it must not be the same buffer the
+    * uploader hands out next time. */
+   const unsigned alignment =
+      MAX2((unsigned)screen->props.limits.minUniformBufferOffsetAlignment, 16u);
+   const unsigned size = buf->buffer_size;
+   if (size == 0) {
+      pipe_resource_reference(&dst->buffer, NULL);
+      dst->buffer_offset = 0;
+      dst->buffer_size = 0;
+      return;
+   }
+
+   struct pipe_resource *uploaded = NULL;
+   struct pipe_resource *release = NULL;
+   unsigned offset = 0;
+   u_upload_data(pipe->const_uploader, 0, size, alignment, buf->user_buffer,
+                 &offset, &uploaded, &release);
+   if (release)
+      pipe_resource_reference(&release, NULL);
+   u_upload_unmap(pipe->const_uploader);
+
+   if (!uploaded) {
+      sz_warn_once("could not upload a constant buffer from client memory");
+      return;
+   }
+
+   pipe_resource_reference(&dst->buffer, NULL);
+   dst->buffer = uploaded;
+   dst->buffer_offset = offset;
+   dst->buffer_size = size;
    dst->user_buffer = NULL;
 }
 

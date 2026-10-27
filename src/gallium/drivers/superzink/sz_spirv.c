@@ -291,6 +291,13 @@ sz_spv_type_float32(struct sz_spv_module *m)
 uint32_t
 sz_spv_type_vec(struct sz_spv_module *m, uint32_t component, unsigned count)
 {
+   /* OpTypeVector's component count must be 2, 3 or 4: a one-component vector
+    * is the component type itself. Callers reach this with a count that is
+    * computed (a projected 1D coordinate, for instance), so the degenerate case
+    * has to be handled here rather than trusted to every caller. */
+   if (count == 1)
+      return component;
+
    uint32_t id = sz_spv_type_lookup(m, SpvOpTypeVector, component, count, 0);
    if (id)
       return id;
@@ -345,6 +352,38 @@ sz_spv_type_image(struct sz_spv_module *m, uint32_t sampled_type, SpvDim dim,
    uint32_t id = sz_spv_type_lookup(m, SpvOpTypeImage, sampled_type, flags, 0);
    if (id)
       return id;
+
+   /* Some image shapes are not covered by the Shader capability and need their
+    * own: a 1D texture (GL_TEXTURE_1D, which GLSL 1.30 still has), a buffer
+    * texture, a cube array, and a multisampled array. Declaring the capability
+    * is what makes spirv-val accept the type; without it the module is invalid
+    * and the Vulkan driver's parser is entitled to do anything, including
+    * segfault. */
+   switch (dim) {
+   case SpvDim1D:
+      sz_spv_capability(m, sampled ? SpvCapabilitySampled1D
+                                    : SpvCapabilityImage1D);
+      break;
+   case SpvDimBuffer:
+      sz_spv_capability(m, sampled ? SpvCapabilitySampledBuffer
+                                    : SpvCapabilityImageBuffer);
+      break;
+   case SpvDimCube:
+      if (arrayed)
+         sz_spv_capability(m, SpvCapabilitySampledCubeArray);
+      break;
+   case SpvDimRect:
+      sz_spv_capability(m, SpvCapabilitySampledRect);
+      break;
+   case SpvDimSubpassData:
+      sz_spv_capability(m, SpvCapabilityInputAttachment);
+      break;
+   default:
+      break;
+   }
+   if (ms && arrayed)
+      sz_spv_capability(m, sampled ? SpvCapabilitySampledImageArrayDynamicIndexing
+                                    : SpvCapabilityImageMSArray);
 
    /* Every texture in this driver is a sampled texture with an ordinary GL
     * format, so the format operand is Unknown: it only matters for storage

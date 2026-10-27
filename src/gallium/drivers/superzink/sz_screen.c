@@ -562,8 +562,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * look like a driver bug rather than a missing feature. */
    {
       struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
-      caps->glsl_feature_level = 120;
-      caps->glsl_feature_level_compatibility = 120;
+      caps->glsl_feature_level = 130;
+      caps->glsl_feature_level_compatibility = 130;
       caps->max_texture_2d_size = 16384;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
@@ -631,6 +631,22 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->seamless_cube_map = true;
       caps->depth_clip_disable = true;
       caps->fragment_shader_texture_lod = true;
+
+      /* gl_FragCoord's conventions, as Vulkan defines them: the origin is the
+       * upper-left corner of the framebuffer and pixel centres are at half
+       * integers (0.5, 1.5, ...). Saying so is what makes the frontend leave
+       * gl_FragCoord alone; a driver that reports neither convention gets the
+       * "add half a pixel" adjustment instead, and since these two flags have no
+       * default, the pixel-centre selection below them is unreachable and the
+       * shader gets whatever the compiler decided that means -- in practice a
+       * gl_FragCoord biased by half a pixel in both axes.
+       *
+       * The viewport is emitted with a positive height (see sz_emit_viewport),
+       * so the framebuffer keeps Vulkan's own orientation and the y flip that GL
+       * expects is done here, by the frontend, through
+       * gl_FbWposYTransform. */
+      caps->fs_coord_origin_upper_left = true;
+      caps->fs_coord_pixel_center_half_integer = true;
 
       /* Occlusion queries map straight onto VK_QUERY_TYPE_OCCLUSION.
        * Conditional rendering is evaluated on the CPU when
