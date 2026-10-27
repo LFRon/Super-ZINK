@@ -668,10 +668,16 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
       .pVertexAttributeDescriptions = attribute_count ? attributes : NULL,
    };
 
+   /* Vulkan restarts on the largest index of the index type, which is exactly
+    * GL's GL_PRIMITIVE_RESTART_FIXED_INDEX. An application that chose its own
+    * index through glPrimitiveRestartIndex is handled above the driver: cso's
+    * vbuf rewrites the buffer when caps->emulate_nonfixed_primitive_restart is
+    * set, so what arrives here is always the fixed index. */
    const VkPipelineInputAssemblyStateCreateInfo input_assembly = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
       .topology = topology,
-      .primitiveRestartEnable = VK_FALSE,
+      .primitiveRestartEnable =
+         ctx->state.primitive_restart ? VK_TRUE : VK_FALSE,
    };
 
    /* Viewport and scissor are dynamic: GL changes them per draw and per viewport

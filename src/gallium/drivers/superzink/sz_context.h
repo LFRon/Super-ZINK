@@ -213,6 +213,7 @@ struct sz_context {
       int32_t instance_count;
       uint32_t start_instance;
       VkPrimitiveTopology topology;
+      bool primitive_restart;
       struct sz_resource *index_buffer;
       VkDeviceSize index_offset;
       VkIndexType index_type;
@@ -274,6 +275,9 @@ struct sz_context {
       float default_inner_level[2];
       unsigned patch_vertices;
       unsigned sample_mask;
+      /* Per draw in Gallium, per pipeline in Vulkan: the batch flushes when it
+       * changes, and the pipeline key carries it. */
+      bool primitive_restart;
    } state;
 };
 

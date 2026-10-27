@@ -2187,7 +2187,7 @@ static bool
 sz_pending_compatible(const struct sz_context *ctx, bool indexed,
                       VkPrimitiveTopology topology, int32_t instance_count,
                       uint32_t start_instance, const struct sz_resource *index,
-                      VkIndexType type)
+                      VkIndexType type, bool primitive_restart)
 {
    if (ctx->pending.count == 0)
       return true;
@@ -2195,6 +2195,8 @@ sz_pending_compatible(const struct sz_context *ctx, bool indexed,
       return false;
    if (ctx->pending.instance_count != instance_count ||
        ctx->pending.start_instance != start_instance)
+      return false;
+   if (ctx->pending.primitive_restart != primitive_restart)
       return false;
    if (indexed &&
        (ctx->pending.index_buffer != index || ctx->pending.index_type != type))
@@ -2212,7 +2214,8 @@ sz_draw_append(struct sz_context *ctx, const struct pipe_draw_info *info,
 
    if (!sz_pending_compatible(ctx, indexed, topology,
                               (int32_t)info->instance_count,
-                              info->start_instance, index, type))
+                              info->start_instance, index, type,
+                              info->primitive_restart))
       sz_draw_flush(ctx);
 
    if (ctx->pending.count == 0) {
@@ -2220,12 +2223,18 @@ sz_draw_append(struct sz_context *ctx, const struct pipe_draw_info *info,
       ctx->pending.instance_count = (int32_t)info->instance_count;
       ctx->pending.start_instance = info->start_instance;
       ctx->pending.topology = topology;
+      ctx->pending.primitive_restart = info->primitive_restart;
       ctx->pending.index_buffer = index;
       ctx->pending.index_type = type;
       ctx->pending.index_offset = 0;
       /* The index binding is part of the batch, so it is re-emitted whenever a
        * new batch starts. */
       ctx->dirty |= SZ_DIRTY_INDEX_BUFFER | SZ_DIRTY_PIPELINE;
+   }
+
+   if (ctx->state.primitive_restart != info->primitive_restart) {
+      ctx->state.primitive_restart = info->primitive_restart;
+      ctx->dirty |= SZ_DIRTY_PIPELINE;
    }
 
    for (unsigned i = 0; i < num_draws; i++) {

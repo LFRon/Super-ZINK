@@ -44,6 +44,9 @@ struct sz_pipeline_key {
    VkFormat depth;
    VkPrimitiveTopology topology;
    VkSampleCountFlagBits samples;
+   /* Primitive restart is per draw in Gallium, but Vulkan bakes it into the
+    * input assembly state, so it belongs in the key. */
+   bool primitive_restart;
    unsigned vertex_binding_count;
    VkVertexInputBindingDescription vertex_bindings[PIPE_MAX_ATTRIBS];
    unsigned vertex_attribute_count;

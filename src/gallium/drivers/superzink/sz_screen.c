@@ -606,11 +606,17 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
          BITFIELD_BIT(MESA_PRIM_LINE_STRIP_ADJACENCY) |
          BITFIELD_BIT(MESA_PRIM_TRIANGLES_ADJACENCY) |
          BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP_ADJACENCY);
-      /* No mode supports a restart index yet: that needs
-       * primitiveRestartEnable and VK_DYNAMIC_STATE_PRIMITIVE_RESTART_INDEX on
-       * the pipeline. An empty mask makes the primitive converter split the
-       * draw at the restart index, which is slower and always right. */
-      caps->supported_prim_modes_with_restart = 0;
+      /* Vulkan's primitive restart is the largest index of the index type,
+       * which is GL's GL_PRIMITIVE_RESTART_FIXED_INDEX exactly. Every mode the
+       * pipeline can build restarts the same way, so the mask is the one above. */
+      caps->supported_prim_modes_with_restart = caps->supported_prim_modes;
+      /* An index the application chose through glPrimitiveRestartIndex is not
+       * expressible in Vulkan at all. Declaring the emulation makes cso's vbuf
+       * rewrite those indices to the fixed one on the way in, which is what
+       * turns NV_primitive_restart into a capability rather than a lie. */
+      caps->primitive_restart_fixed_index = true;
+      caps->emulate_nonfixed_primitive_restart = true;
+      caps->primitive_restart = true;
 
       /* Constant buffers arrive as real buffers rather than client memory, so
        * the driver never has to invent an upload path for them. */
