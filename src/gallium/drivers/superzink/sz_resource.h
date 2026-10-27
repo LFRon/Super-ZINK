@@ -61,6 +61,13 @@ struct sz_resource {
     * VK_IMAGE_TILING_OPTIMAL-only usage and needs explicit cache flushes. */
    bool linear;
 
+   /* Set when the tiling is VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT rather than
+    * plain linear. Such an image is still described as linear pitch-wise, but
+    * Vulkan refuses to describe its subresources with a colour/depth aspect: for
+    * vkGetImageSubresourceLayout the aspect has to be
+    * VK_IMAGE_ASPECT_MEMORY_PLANE_i_BIT_EXT (VUID 09433). */
+   bool drm_modifier;
+
    /* Set when the contents are known to be undefined, so the next write may use
     * loadOp=DONT_CARE / discard instead of preserving garbage. */
    bool undefined_contents;
@@ -103,13 +110,23 @@ void *sz_resource_map(struct sz_resource *res);
 /* Installs the pipe_screen resource entry points. */
 void sz_resource_screen_init(struct sz_screen *screen);
 
+/* Destroys every resource still waiting for a submission to finish. Called from
+ * screen teardown, after the queue has gone idle and before the device is
+ * destroyed. */
+void sz_resource_reclaim_all(struct sz_screen *screen);
+
+/* Destroys the retired resources whose submission has completed. Cheap when the
+ * table is empty, so callers on hot paths may call it unconditionally. */
+void sz_resource_reclaim(struct sz_screen *screen);
+
 /* Wraps a VkImage whose memory was imported from a dma-buf into a
  * pipe_resource. Used by sz_dmabuf's resource_from_handle, which owns the
  * VkImage creation because only it knows the plane layout. */
 struct pipe_resource *sz_resource_wrap_imported(struct sz_screen *screen,
                                                 const struct pipe_resource *tmpl,
                                                 VkImage image,
-                                                VkDeviceMemory memory);
+                                                VkDeviceMemory memory,
+                                                bool drm_modifier);
 
 /* SZ_DEBUG=selftest: round-trips representative buffers and images through the
  * real device and the allocator. Returns the number of failed checks, so a

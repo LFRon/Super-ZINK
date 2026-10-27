@@ -130,6 +130,19 @@ sz_screen_is_dmabuf_modifier_supported(struct pipe_screen *pscreen,
 
 /* ── layout queries ──────────────────────────────────────────────────────── */
 
+/* A DRM-modifier image has no colour/depth aspect to report a layout for: its
+ * subresources are planes, and Vulkan rejects anything else from
+ * vkGetImageSubresourceLayout (VUID 09433). Everything we create or import uses
+ * LINEAR, i.e. one plane, so plane 0 is the answer. */
+static VkImageAspectFlags
+sz_dmabuf_layout_aspect(const struct sz_resource *res)
+{
+   if (res->drm_modifier)
+      return VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;
+
+   return sz_format_aspect(res->base.format);
+}
+
 /* The DRI frontend asks for a resource's stride, offset and modifier before it
  * asks for a handle, because a dma-buf it cannot describe is not usable. Those
  * queries arrive as `WINSYS_HANDLE_TYPE_KMS` on the older code path and as
@@ -168,7 +181,7 @@ sz_screen_resource_get_param(struct pipe_screen *pscreen,
       return false;
 
    const VkImageSubresource subresource = {
-      .aspectMask = sz_format_aspect(res->base.format),
+      .aspectMask = sz_dmabuf_layout_aspect(res),
       .mipLevel = level,
       .arrayLayer = layer,
    };
@@ -245,7 +258,7 @@ sz_screen_resource_get_handle(struct pipe_screen *pscreen,
    sz_queue_wait_idle(&screen->batch_state);
 
    const VkImageSubresource subresource = {
-      .aspectMask = sz_format_aspect(res->base.format),
+      .aspectMask = sz_dmabuf_layout_aspect(res),
       .mipLevel = 0,
       .arrayLayer = handle->layer,
    };
@@ -458,7 +471,7 @@ sz_screen_resource_from_handle(struct pipe_screen *pscreen,
    }
 
    struct pipe_resource *pres =
-      sz_resource_wrap_imported(screen, tmpl, image, memory);
+      sz_resource_wrap_imported(screen, tmpl, image, memory, use_modifier);
    if (!pres) {
       screen->vk.FreeMemory(screen->dev, memory, NULL);
       screen->vk.DestroyImage(screen->dev, image, NULL);

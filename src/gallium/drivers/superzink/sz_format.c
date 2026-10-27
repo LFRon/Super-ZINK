@@ -109,12 +109,13 @@ sz_image_usage_from_bindings(unsigned bindings, enum pipe_format format)
    if (bindings & PIPE_BIND_SHADER_IMAGE)
       usage |= VK_IMAGE_USAGE_STORAGE_BIT;
 
-   /* Images that leave our process as dmabufs, or that the winsys may resolve,
-    * must be legal transfer source and destination for the copy/resolve paths
-    * we use instead of rendering to them twice. */
-   if (bindings & (PIPE_BIND_SHARED | PIPE_BIND_DISPLAY_TARGET |
-                   PIPE_BIND_SCANOUT | PIPE_BIND_LINEAR))
-      usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   /* Every image is a legal transfer source and destination. The paths that need
+    * it are not conditional on the bind flags: st clears a surface through
+    * vkCmdClearDepthStencilImage or vkCmdClearColorImage (VUID 02659/02660),
+    * uploads a texture through vkCmdCopyBufferToImage (VUID 00177), and reads
+    * any of them back the same way. Vulkan cannot widen an image's usage after
+    * creation, so the flags are declared here for all of them. */
+   usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
    if (usage == 0)
       usage = VK_IMAGE_USAGE_SAMPLED_BIT;

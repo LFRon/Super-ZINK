@@ -91,14 +91,38 @@ sz_mem_type_name(const struct sz_screen *screen, uint32_t type)
    return "other";
 }
 
+/* VkMemoryAllocateInfo::flags shared by every allocation the driver makes.
+ * VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT is only legal once the
+ * bufferDeviceAddress feature is enabled, which ADR-001 makes a hard
+ * requirement, but it is still spelled out rather than assumed: a device that
+ * somehow lacked it would otherwise fail every allocation with a validation
+ * error instead of a clear message here. */
+static VkMemoryAllocateFlags
+sz_device_address_alloc_flag(const struct sz_screen *screen)
+{
+   return screen->caps.buffer_device_address
+             ? VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+             : 0;
+}
+
 static struct sz_mem_block *
 sz_block_create(struct sz_screen *screen, uint64_t size, uint32_t mem_type)
 {
    const VkMemoryPropertyFlags props =
       screen->mem_props.memoryTypes[mem_type].propertyFlags;
 
+   /* Every buffer carries VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, and a
+    * buffer with that usage may only be bound to memory allocated with this flag
+    * (VUID 03339). Blocks are shared between buffers and images, and the flag
+    * costs nothing for an image. */
+   VkMemoryAllocateFlagsInfo flags_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = sz_device_address_alloc_flag(screen),
+   };
+
    VkMemoryAllocateInfo ai = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &flags_info,
       .allocationSize = size,
       .memoryTypeIndex = mem_type,
    };
@@ -270,13 +294,18 @@ sz_bo_alloc_private(struct sz_screen *screen, const VkMemoryRequirements *req,
    const VkMemoryPropertyFlags real =
       screen->mem_props.memoryTypes[mem_type].propertyFlags;
 
+   VkMemoryAllocateFlagsInfo flags_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .pNext = export_info,
+      .flags = sz_device_address_alloc_flag(screen),
+   };
+
    VkMemoryAllocateInfo ai = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &flags_info,
       .allocationSize = req->size,
       .memoryTypeIndex = mem_type,
    };
-   if (export_info)
-      ai.pNext = export_info;
 
    struct sz_mem_block *block = CALLOC_STRUCT(sz_mem_block);
    if (!block)

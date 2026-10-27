@@ -26,6 +26,7 @@
 struct sz_vk_entrypoints {
    PFN_vkCreateInstance CreateInstance;
    PFN_vkEnumerateInstanceVersion EnumerateInstanceVersion;
+   PFN_vkEnumerateInstanceExtensionProperties EnumerateInstanceExtensionProperties;
    PFN_vkDestroyInstance DestroyInstance;
    PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
    PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;
@@ -73,6 +74,12 @@ struct sz_vk_entrypoints {
    PFN_vkGetMemoryFdPropertiesKHR GetMemoryFdPropertiesKHR;
    PFN_vkGetImageDrmFormatModifierPropertiesEXT GetImageDrmFormatModifierPropertiesEXT;
 
+   /* Descriptors (sz_descriptor). ADR-008: push descriptors only, so this is
+    * the whole descriptor surface: a layout to push against and the push. */
+   PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout;
+   PFN_vkDestroyDescriptorSetLayout DestroyDescriptorSetLayout;
+   PFN_vkCmdPushDescriptorSetKHR CmdPushDescriptorSetKHR;
+
    /* Command submission (sz_batch / sz_sync). */
    PFN_vkCreateCommandPool CreateCommandPool;
    PFN_vkDestroyCommandPool DestroyCommandPool;
@@ -100,6 +107,7 @@ struct sz_vk_entrypoints {
    PFN_vkCmdEndRendering CmdEndRendering;
    PFN_vkCmdSetViewport CmdSetViewport;
    PFN_vkCmdSetScissor CmdSetScissor;
+   PFN_vkCmdSetBlendConstants CmdSetBlendConstants;
    PFN_vkCmdBindPipeline CmdBindPipeline;
    PFN_vkCmdBindVertexBuffers CmdBindVertexBuffers;
    PFN_vkCmdBindIndexBuffer CmdBindIndexBuffer;
@@ -135,6 +143,21 @@ struct sz_bo_state;
 struct sz_bo;
 struct sz_resource;
 
+/* How many destroyed resources may wait for a submission to finish before a
+ * destroy has to stall the queue to make room. Destroying a resource is common
+ * (the constant-buffer uploader churns one per frame), so this is not a rare
+ * path. */
+#define SZ_MAX_RETIRED_RESOURCES 64
+
+/* A pipe_resource the frontend has released while a submission that may still
+ * read its VkBuffer/VkImage is in flight. `value` is the timeline value that
+ * submission signals; once completed_value reaches it the resource is free to
+ * be torn down. */
+struct sz_retired_resource {
+   struct pipe_resource *res;
+   uint64_t value;
+};
+
 struct sz_screen {
    struct pipe_screen base;
    struct pipe_screen *wrapped; /* debug_screen_wrap() wrapper, freed on destroy */
@@ -166,12 +189,20 @@ struct sz_screen {
     * context. */
    struct sz_queue_state batch_state;
 
+   /* Resources awaiting the timeline value in `value`. See
+    * sz_screen_resource_destroy(). */
+   struct sz_retired_resource retired_resources[SZ_MAX_RETIRED_RESOURCES];
+   unsigned num_retired_resources;
+
    /* pipe_context::destroy has no way to reach the screen's flag, so the screen
     * tracks it here. See sz_screen_context_create(). */
    bool context_alive;
 
    /* Device memory suballocator (sz_bo). */
    struct sz_bo_state *bo;
+
+   /* One descriptor set layout per stage, indexed by descriptor set. */
+   VkDescriptorSetLayout descriptor_set_layout;
 
    int drm_fd;
 

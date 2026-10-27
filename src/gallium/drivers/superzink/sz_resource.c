@@ -72,6 +72,20 @@ sz_buffer_usage_from_bindings(unsigned bindings)
    if (bindings & PIPE_BIND_QUERY_BUFFER)
       usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
+   /* Gallium lets a buffer be bound for a purpose its creation bind flags never
+    * mentioned -- the state tracker uploads client vertex arrays into a buffer
+    * created for something else, then binds it with vkCmdBindVertexBuffers,
+    * which requires VK_BUFFER_USAGE_VERTEX_BUFFER_BIT (VUID 00627). Vulkan has
+    * no way to widen a VkBuffer's usage after creation, and buffers are untyped
+    * linear memory, so the flags are declared as a superset instead: the cost is
+    * a few bits, the cost of the alternative is a validation error now and a
+    * driver-side rejection later. */
+   usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+
    /* bufferDeviceAddress is a required capability, so every buffer can carry a
     * device address. Declaring the usage up front avoids a second VkBuffer when
     * a shader starts using pointers. */
@@ -368,6 +382,7 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
    if (!res)
       return NULL;
    res->linear = ci.tiling != VK_IMAGE_TILING_OPTIMAL;
+   res->drm_modifier = ci.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
    res->exportable = exportable;
 
    VkResult vkres = screen->vk.CreateImage(screen->dev, &ci, NULL, &res->image);
@@ -466,7 +481,8 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
 struct pipe_resource *
 sz_resource_wrap_imported(struct sz_screen *screen,
                           const struct pipe_resource *tmpl,
-                          VkImage image, VkDeviceMemory memory)
+                          VkImage image, VkDeviceMemory memory,
+                          bool drm_modifier)
 {
    const VkFormat format = vk_format_from_pipe_format(tmpl->format);
 
@@ -479,6 +495,7 @@ sz_resource_wrap_imported(struct sz_screen *screen,
    /* Linear by definition: it is a dma-buf, and this phase only accepts
     * DRM_FORMAT_MOD_LINEAR. */
    res->linear = true;
+   res->drm_modifier = drm_modifier;
    /* The contents belong to whoever made the buffer, so the first write may not
     * discard them. */
    res->undefined_contents = false;
@@ -524,20 +541,13 @@ sz_screen_resource_create(struct pipe_screen *pscreen,
 }
 
 static void
-sz_screen_resource_destroy(struct pipe_screen *pscreen,
-                           struct pipe_resource *pres)
+sz_resource_destroy_now(struct sz_screen *screen, struct pipe_resource *pres)
 {
    if (!pres)
       return;
 
-   struct sz_screen *screen = sz_screen(pscreen);
    struct sz_resource *res = sz_resource(pres);
 
-   /* Nothing defers the destroy yet, which is only safe because a resource is
-    * never destroyed while a batch that touches it is still in flight: the state
-    * tracker destroys resources at GL object deletion, and the batch that last
-    * used one has been submitted (not necessarily completed). That is a real
-    * hazard and becomes a deferred free keyed on the timeline value in Phase 3. */
    if (res->buffer != VK_NULL_HANDLE)
       screen->vk.DestroyBuffer(screen->dev, res->buffer, NULL);
    if (res->view != VK_NULL_HANDLE)
@@ -553,6 +563,75 @@ sz_screen_resource_destroy(struct pipe_screen *pscreen,
    sz_bo_free(res->bo);
 
    FREE(res);
+}
+
+void
+sz_resource_reclaim(struct sz_screen *screen)
+{
+   const uint64_t completed = screen->batch_state.completed_value;
+
+   for (unsigned i = 0; i < screen->num_retired_resources; ) {
+      if (screen->retired_resources[i].value > completed) {
+         i++;
+         continue;
+      }
+
+      struct pipe_resource *pres = screen->retired_resources[i].res;
+      screen->num_retired_resources--;
+      screen->retired_resources[i] =
+         screen->retired_resources[screen->num_retired_resources];
+      sz_resource_destroy_now(screen, pres);
+   }
+}
+
+static void
+sz_screen_resource_destroy(struct pipe_screen *pscreen,
+                           struct pipe_resource *pres)
+{
+   if (!pres)
+      return;
+
+   struct sz_screen *screen = sz_screen(pscreen);
+
+   /* The last reference just went away, which says nothing about the GPU: a
+    * draw recorded into the current command buffer, or a batch already
+    * submitted, may still name this VkBuffer. Destroying it there is a
+    * use-after-free the validation layer reports as a device loss, so the
+    * teardown waits for the submission that will make it safe.
+    *
+    * next_value + 1 rather than next_value: the batch being recorded has not
+    * signalled yet and will take the next value on submission. Waiting for one
+    * value more than strictly needed costs nothing -- the value only has to be
+    * *at least* as large as the submission that references the resource. */
+   const uint64_t retire_value = screen->batch_state.next_value + 1;
+
+   sz_resource_reclaim(screen);
+
+   if (screen->num_retired_resources == SZ_MAX_RETIRED_RESOURCES) {
+      /* Every slot is held by a submission that has not finished. There is no
+       * way to make progress without waiting, so wait: the queue is idle
+       * afterwards and the whole table drains. */
+      sz_queue_wait_idle(&screen->batch_state);
+      sz_resource_reclaim(screen);
+   }
+
+   if (screen->num_retired_resources < SZ_MAX_RETIRED_RESOURCES) {
+      screen->retired_resources[screen->num_retired_resources].res = pres;
+      screen->retired_resources[screen->num_retired_resources].value =
+         retire_value;
+      screen->num_retired_resources++;
+      return;
+   }
+
+   sz_resource_destroy_now(screen, pres);
+}
+
+void
+sz_resource_reclaim_all(struct sz_screen *screen)
+{
+   for (unsigned i = 0; i < screen->num_retired_resources; i++)
+      sz_resource_destroy_now(screen, screen->retired_resources[i].res);
+   screen->num_retired_resources = 0;
 }
 
 void *
@@ -809,6 +888,13 @@ sz_resource_selftest(struct sz_screen *screen)
 
    unsigned failures = sz_selftest_buffer_roundtrip(screen);
    failures += sz_selftest_image_roundtrip(screen);
+
+   /* resource_destroy() defers the teardown until the submission that may still
+    * name the resource has retired, so the deferred table has to be drained
+    * before the counters say anything: nothing else runs during screen
+    * creation, which makes waiting here free. */
+   sz_queue_wait_idle(&screen->batch_state);
+   sz_resource_reclaim_all(screen);
 
    sz_bo_get_stats(screen, &end);
 
