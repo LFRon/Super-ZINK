@@ -523,32 +523,52 @@ sz_sampler_create(struct sz_screen *screen,
    const bool compare = templ->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
    const float max_anisotropy = MAX2(templ->max_anisotropy, 1u);
 
+   /* A rectangle texture addresses in texel units, which GL spells as
+    * pipe_sampler_state::unnormalized_coords and Vulkan as
+    * VkSamplerCreateInfo::unnormalizedCoordinates. The two are the same feature,
+    * so this is a pass-through -- but Vulkan attaches conditions to it that a
+    * normalised sampler is free of, and a violation is a validation error rather
+    * than a slower path. Rather than reject the sampler, the conditions are
+    * imposed: they are exactly what GL requires of a rectangle texture anyway
+    * (clamp addressing, no mipmaps), so nothing a conformant application can
+    * observe changes.
+    *
+    * The one case that cannot be expressed is a rect *shadow* sampler: Vulkan
+    * forbids compareEnable together with unnormalizedCoordinates. That stays a
+    * warning, because silently dropping the comparison would read the wrong
+    * channel. */
+   const bool unnormalized =
+      templ->unnormalized_coords && !compare;
+
+   if (templ->unnormalized_coords && compare)
+      sz_warn_once("a shadow sampler with unnormalised coordinates is not "
+                   "implementable in Vulkan");
+
    const VkSamplerCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
       .magFilter = sz_tex_filter(templ->mag_img_filter),
-      .minFilter = sz_tex_filter(templ->min_img_filter),
-      .mipmapMode = sz_mipmap_mode(templ->min_mip_filter),
-      .addressModeU = sz_address_mode(templ->wrap_s),
-      .addressModeV = sz_address_mode(templ->wrap_t),
-      .addressModeW = sz_address_mode(templ->wrap_r),
-      .mipLodBias = templ->lod_bias,
-      .anisotropyEnable = max_anisotropy > 1.0f &&
+      .minFilter = unnormalized ? sz_tex_filter(templ->mag_img_filter)
+                                : sz_tex_filter(templ->min_img_filter),
+      .mipmapMode = unnormalized ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                                 : sz_mipmap_mode(templ->min_mip_filter),
+      .addressModeU = unnormalized ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                                   : sz_address_mode(templ->wrap_s),
+      .addressModeV = unnormalized ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                                   : sz_address_mode(templ->wrap_t),
+      .addressModeW = unnormalized ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                                   : sz_address_mode(templ->wrap_r),
+      .mipLodBias = unnormalized ? 0.0f : templ->lod_bias,
+      .anisotropyEnable = !unnormalized && max_anisotropy > 1.0f &&
                           screen->caps.core_features.samplerAnisotropy,
       .maxAnisotropy = max_anisotropy,
       .compareEnable = compare,
       .compareOp = compare ? sz_compare_op(templ->compare_func)
                            : VK_COMPARE_OP_NEVER,
-      .minLod = templ->min_lod,
-      .maxLod = templ->max_lod,
+      .minLod = unnormalized ? 0.0f : templ->min_lod,
+      .maxLod = unnormalized ? 0.0f : templ->max_lod,
       .borderColor = sz_border_color(&templ->border_color),
-      /* GL samplers address in normalised coordinates; unnormalised ones are
-       * a TexGen-era feature Vulkan spells as a device feature, so the honest
-       * answer is a warning rather than a sampler that reads the wrong texels. */
-      .unnormalizedCoordinates = VK_FALSE,
+      .unnormalizedCoordinates = unnormalized,
    };
-
-   if (templ->unnormalized_coords)
-      sz_warn_once("unnormalised texture coordinates are not supported");
 
    VkSampler sampler = VK_NULL_HANDLE;
    VkResult result = screen->vk.CreateSampler(screen->dev, &ci, NULL, &sampler);
