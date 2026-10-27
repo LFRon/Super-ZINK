@@ -52,6 +52,15 @@ uint32_t sz_spv_type_float(struct sz_spv_module *m, unsigned bits);
 uint32_t sz_spv_type_int(struct sz_spv_module *m, unsigned bits, bool is_signed);
 uint32_t sz_spv_type_vec(struct sz_spv_module *m, uint32_t component,
                          unsigned count);
+/* Structs are never cached: their identity is the whole member list, which does
+ * not fit the type cache's three-word key. Each is declared once per module. */
+uint32_t sz_spv_type_struct(struct sz_spv_module *m, const uint32_t *members,
+                            unsigned count);
+uint32_t sz_spv_type_runtime_array(struct sz_spv_module *m, uint32_t element);
+/* Fixed-length array. The length is materialised as a constant, so it shares the
+ * module's constant pool with every other use of the same number. */
+uint32_t sz_spv_type_array(struct sz_spv_module *m, uint32_t element,
+                           unsigned count);
 uint32_t sz_spv_type_ptr(struct sz_spv_module *m, SpvStorageClass storage,
                          uint32_t pointee);
 uint32_t sz_spv_type_function(struct sz_spv_module *m, uint32_t result,
@@ -83,6 +92,11 @@ void sz_spv_decorate(struct sz_spv_module *m, uint32_t target,
                      SpvDecoration decoration, uint32_t value);
 void sz_spv_decorate_builtin(struct sz_spv_module *m, uint32_t target,
                              SpvBuiltIn builtin);
+
+/* Decoration on one member of a struct type, such as Block's Offset. */
+void sz_spv_member_decorate(struct sz_spv_module *m, uint32_t type,
+                            unsigned member, SpvDecoration decoration,
+                            uint32_t value);
 
 /* A decoration that takes no extra operand, such as Flat. */
 void sz_spv_decorate_bare(struct sz_spv_module *m, uint32_t target,

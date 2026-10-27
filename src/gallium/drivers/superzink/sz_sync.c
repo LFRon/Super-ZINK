@@ -86,6 +86,15 @@ sz_sync_state_for(enum sz_access access)
          .layout = VK_IMAGE_LAYOUT_UNDEFINED,
       };
 
+   case SZ_ACCESS_UNIFORM_BUFFER:
+      return (struct sz_sync_state) {
+         .stages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+         .access = VK_ACCESS_2_UNIFORM_READ_BIT,
+         .layout = VK_IMAGE_LAYOUT_UNDEFINED,
+      };
+
    case SZ_ACCESS_PRESENT:
       return (struct sz_sync_state) {
          .stages = VK_PIPELINE_STAGE_2_NONE,

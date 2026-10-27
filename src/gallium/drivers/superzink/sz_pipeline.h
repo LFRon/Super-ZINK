@@ -37,13 +37,20 @@ struct sz_gfx_pipeline {
       unsigned color_count;
       VkFormat depth;
       VkPrimitiveTopology topology;
-      unsigned vertex_element_count;
-      unsigned stride;
-      /* The format of the attribute the bootstrap shader reads. Same stride and
-       * count with a different format is a different pipeline, and reusing the
-       * old one reads the vertices as the wrong type without any Vulkan error. */
-      VkFormat vertex_format;
+      /* The full vertex fetch layout. Buffers, strides, formats and offsets all
+       * have to match: reusing a pipeline whose second attribute reads a
+       * different buffer produces garbage positions with no Vulkan error. */
+      unsigned vertex_binding_count;
+      VkVertexInputBindingDescription vertex_bindings[PIPE_MAX_ATTRIBS];
+      unsigned vertex_attribute_count;
+      VkVertexInputAttributeDescription vertex_attributes[PIPE_MAX_ATTRIBS];
       VkSampleCountFlagBits samples;
+      /* The pipe state objects the depth, cull, front-face and blend fields were
+       * derived from. Identity, not contents: the state tracker builds a new
+       * object whenever any of them changes. */
+      const void *blend;
+      const void *rasterizer;
+      const void *dsa;
       /* Which shaders the pipeline was built from. Two programs with the same
        * layout are still different pipelines. */
       const void *vs;
@@ -51,12 +58,19 @@ struct sz_gfx_pipeline {
    } key;
 };
 
+/* Frees the retired pipelines whose submission has completed. Called before a
+ * pipeline is replaced and on context teardown. */
+void sz_pipeline_reclaim(struct sz_context *ctx);
+
+/* Timestamps the pipelines retired while the batch that just went out was being
+ * recorded. Called right after the context submits, before anything can look at
+ * sz_pipeline_reclaim() again. */
+void sz_pipeline_note_submit(struct sz_context *ctx);
+
 /* Returns a pipeline usable for the current state, or NULL. Rebuilds when the
  * recorded state no longer matches. */
 struct sz_gfx_pipeline *sz_pipeline_get(struct sz_context *ctx,
-                                        VkPrimitiveTopology topology,
-                                        unsigned vertex_element_count,
-                                        unsigned stride);
+                                        VkPrimitiveTopology topology);
 
 void sz_pipeline_finish(struct sz_context *ctx);
 

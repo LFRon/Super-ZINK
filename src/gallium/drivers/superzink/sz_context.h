@@ -15,6 +15,7 @@
 #ifndef SZ_CONTEXT_H
 #define SZ_CONTEXT_H
 
+#include "sz_compiler.h"
 #include "sz_sync.h"
 #include "sz_types.h"
 
@@ -75,6 +76,18 @@ struct sz_sampler_view {
 
 struct sz_gfx_pipeline;
 
+/* How many replaced pipelines can wait for their submission to retire before the
+ * context waits for the queue. Two draws per frame with a changing pipeline key
+ * need a couple of slots; the bound only exists so a pathological stream of
+ * state changes cannot grow the list without limit. */
+#define SZ_MAX_RETIRED_PIPELINES 32
+
+/* Placeholder retire value for a pipeline that was replaced while the batch
+ * referencing it was still being recorded. The timeline value that batch will
+ * signal is not known until it is submitted, so the entry waits for
+ * sz_pipeline_note_submit() to fill the real one in. Zero is never signalled. */
+#define SZ_RETIRE_PENDING 0
+
 struct sz_context {
    struct pipe_context base;
    struct sz_screen *screen;
@@ -93,6 +106,16 @@ struct sz_context {
 
    struct sz_gfx_pipeline *pipeline;
 
+   /* Pipelines replaced while a command buffer still had them bound. Vulkan
+    * forbids destroying one in that state, so the objects wait here until the
+    * submission that used them has retired; sz_pipeline_reclaim() drops the ones
+    * whose timeline value has passed. */
+   struct {
+      struct sz_gfx_pipeline *pipeline;
+      uint64_t retire_value;
+   } retired[SZ_MAX_RETIRED_PIPELINES];
+   unsigned num_retired;
+
    /* Shadow state. Kept so later phases can diff it and record only what
     * changed, and so the current values are available when a pipeline object is
     * finally created. */
@@ -106,6 +129,12 @@ struct sz_context {
       void *sampler_states[MESA_SHADER_STAGES][PIPE_MAX_SAMPLERS];
       void *sampler_views[MESA_SHADER_STAGES][PIPE_MAX_SAMPLERS];
       void *shaders[MESA_SHADER_STAGES];
+
+      /* Owned: the context holds a reference to every bound buffer, because
+       * the state tracker can delete a constant buffer while it is still the
+       * source of the last recorded draw. */
+      struct pipe_constant_buffer constant_buffers[MESA_SHADER_STAGES]
+                                                  [SZ_MAX_CONST_BUFFERS];
 
       struct pipe_framebuffer_state framebuffer;
       struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];

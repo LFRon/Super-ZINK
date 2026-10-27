@@ -463,6 +463,18 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(GetImageDrmFormatModifierPropertiesEXT,
                vkGetImageDrmFormatModifierPropertiesEXT);
 
+   SZ_DEV_PROC(CreateDescriptorSetLayout, vkCreateDescriptorSetLayout);
+   SZ_DEV_PROC(DestroyDescriptorSetLayout, vkDestroyDescriptorSetLayout);
+   /* vkCmdPushDescriptorSetKHR only resolves if VK_KHR_push_descriptor was
+    * enabled, and a 1.4 device needs no extension at all: there the command is
+    * core as vkCmdPushDescriptorSet, which kept the same signature (only
+    * vkCmdPushDescriptorSet2 takes the VkPushDescriptorSetInfo struct), so the
+    * one function pointer type covers both. Below 1.4 the extension is in the
+    * required capability list and therefore always enabled. */
+   SZ_DEV_PROC(CmdPushDescriptorSetKHR, vkCmdPushDescriptorSetKHR);
+   if (screen->vk.CmdPushDescriptorSetKHR == NULL)
+      SZ_DEV_PROC(CmdPushDescriptorSetKHR, vkCmdPushDescriptorSet);
+
    SZ_DEV_PROC(CreateCommandPool, vkCreateCommandPool);
    SZ_DEV_PROC(DestroyCommandPool, vkDestroyCommandPool);
    SZ_DEV_PROC(AllocateCommandBuffers, vkAllocateCommandBuffers);
@@ -489,6 +501,7 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdEndRendering, vkCmdEndRendering);
    SZ_DEV_PROC(CmdSetViewport, vkCmdSetViewport);
    SZ_DEV_PROC(CmdSetScissor, vkCmdSetScissor);
+   SZ_DEV_PROC(CmdSetBlendConstants, vkCmdSetBlendConstants);
    SZ_DEV_PROC(CmdBindPipeline, vkCmdBindPipeline);
    SZ_DEV_PROC(CmdBindVertexBuffers, vkCmdBindVertexBuffers);
    SZ_DEV_PROC(CmdBindIndexBuffer, vkCmdBindIndexBuffer);

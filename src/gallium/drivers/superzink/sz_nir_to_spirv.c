@@ -23,6 +23,7 @@
  * depends on who reads it).
  */
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +44,10 @@
 #define SZ_LOC_VAR_BASE 16
 
 #define SZ_MAX_VARIABLES 96
+
+/* Gallium's floor for constant buffer slots per stage: the same number the
+ * descriptor set layout declares. */
+#define SZ_MAX_UBOS 16
 
 enum sz_base {
    SZ_BASE_FLOAT,
@@ -73,6 +78,18 @@ struct sz_translate {
       uint32_t pointee;
    } vars[SZ_MAX_VARIABLES];
    unsigned num_vars;
+
+   /* Uniform blocks are declared on first use rather than in the variable walk,
+    * because the load is what carries the binding: after
+    * nir_lower_uniforms_to_ubo() there is no nir_var_uniform deref left, only
+    * load_ubo with an index that names a gallium constant buffer slot. */
+   struct {
+      unsigned index;
+      /* Pointer to the block's runtime array of 32-bit words, one access chain
+       * away from a typed scalar. */
+      uint32_t array_ptr;
+   } ubos[SZ_MAX_UBOS];
+   unsigned num_ubos;
 
    uint32_t *interfaces;
    unsigned num_interfaces;
@@ -203,21 +220,36 @@ sz_dtype_from_glsl(struct sz_translate *t, const struct glsl_type *glsl,
    return true;
 }
 
-/* NIR does not record a base type on defs, so instructions that do not carry one
- * -- load_const, undef -- are typed by looking at their uses. GLSL's default
- * for an otherwise ambiguous constant is float, and that is also what the
- * frontend produces for the cases this driver can reach, so it is the fallback. */
-static void
-sz_guess_def_type(struct sz_translate *t, nir_def *def, struct sz_dtype *out)
+/* vecN, mov and bcsel are polymorphic: their tables declare nir_type_uint as a
+ * placeholder, so reading it would type every load they touch as unsigned. The
+ * type has to be looked for one step further, at the instruction that consumes
+ * their result. */
+static bool
+sz_alu_is_passthrough(nir_op op)
 {
-   out->base = SZ_BASE_FLOAT;
-   out->bits = def->bit_size;
-   out->ncomp = def->num_components;
-
-   if (def->bit_size == 1) {
-      out->base = SZ_BASE_BOOL;
-      return;
+   switch (op) {
+   case nir_op_mov:
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+   case nir_op_vec8:
+   case nir_op_vec16:
+   case nir_op_bcsel:
+      return true;
+   default:
+      return false;
    }
+}
+
+/* Walks the uses of `def` until it finds an instruction that states a base type.
+ * The depth limit keeps a use cycle (a loop feeding its own induction value)
+ * from turning into infinite recursion; nothing this driver compiles needs more
+ * than a couple of hops. */
+static bool
+sz_infer_def_base(nir_def *def, unsigned depth, enum sz_base *out)
+{
+   if (depth > 4)
+      return false;
 
    nir_foreach_use (src, def) {
       nir_instr *parent = nir_src_use_instr(src);
@@ -226,13 +258,19 @@ sz_guess_def_type(struct sz_translate *t, nir_def *def, struct sz_dtype *out)
          nir_alu_instr *alu = nir_instr_as_alu(parent);
          const nir_op_info *info = &nir_op_infos[alu->op];
 
+         if (sz_alu_is_passthrough(alu->op)) {
+            if (sz_infer_def_base(&alu->def, depth + 1, out))
+               return true;
+            continue;
+         }
+
          for (unsigned i = 0; i < info->num_inputs; i++) {
             if (&alu->src[i].src != src)
                continue;
             enum sz_base base;
             if (sz_base_from_alu_type(info->input_types[i], &base)) {
-               out->base = base;
-               return;
+               *out = base;
+               return true;
             }
          }
       } else if (parent->type == nir_instr_type_intrinsic) {
@@ -248,11 +286,35 @@ sz_guess_def_type(struct sz_translate *t, nir_def *def, struct sz_dtype *out)
 
          enum sz_base base;
          if (sz_base_from_glsl(glsl_get_base_type(var->type), &base)) {
-            out->base = base;
-            return;
+            *out = base;
+            return true;
          }
       }
    }
+
+   return false;
+}
+
+/* NIR does not record a base type on defs, so instructions that do not carry one
+ * -- load_const, undef, and both untyped uniform-buffer loads -- are typed by
+ * looking at their uses. GLSL's default for an otherwise ambiguous constant is
+ * float, and that is also what the frontend produces for the cases this driver
+ * can reach, so it is the fallback. */
+static void
+sz_guess_def_type(struct sz_translate *t, nir_def *def, struct sz_dtype *out)
+{
+   out->base = SZ_BASE_FLOAT;
+   out->bits = def->bit_size;
+   out->ncomp = def->num_components;
+
+   if (def->bit_size == 1) {
+      out->base = SZ_BASE_BOOL;
+      return;
+   }
+
+   enum sz_base base;
+   if (sz_infer_def_base(def, 0, &base))
+      out->base = base;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -269,13 +331,19 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
 
    if (var->data.mode == nir_var_shader_in) {
       if (!frag) {
-         if (slot < VERT_ATTRIB_GENERIC0) {
-            sz_fail(t, "vertex attribute `%s` uses the legacy slot %d, which "
-                        "only the fixed-function paths need",
-                    var->name, slot);
-            return false;
+         /* Vertex elements are packed in slot order, so the element index of an
+          * attribute is its rank among the attributes the shader reads, not the
+          * slot itself: st_atom_array.cpp places elements with
+          * util_bitcount(inputs_read & BITFIELD_MASK(slot)). Fixed-function
+          * attributes (VERT_ATTRIB_POS and friends) sit below
+          * VERT_ATTRIB_GENERIC0 and still take part in that ranking. */
+         unsigned rank = 0;
+         nir_foreach_shader_in_variable (other, t->nir) {
+            if (other == var || other->data.location >= slot)
+               continue;
+            rank++;
          }
-         *location = slot - VERT_ATTRIB_GENERIC0;
+         *location = rank;
          return true;
       }
 
@@ -378,11 +446,15 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
       sz_spv_decorate(t->m, id, SpvDecorationLocation, location);
 
    /* Integer varyings have to be flat: the Vulkan rule is unconditional, and a
-    * missing decoration is a validation error rather than a performance hint. */
-   if ((storage == SpvStorageClassInput || storage == SpvStorageClassOutput) &&
-       type.base != SZ_BASE_FLOAT && type.base != SZ_BASE_BOOL)
+    * missing decoration is a validation error rather than a performance hint.
+    * Flat is only meaningful -- and only legal -- on fragment stage inputs and
+    * on outputs, so a vertex input never gets it. */
+   const bool flat_stage = storage == SpvStorageClassOutput ||
+      (storage == SpvStorageClassInput &&
+       t->nir->info.stage == MESA_SHADER_FRAGMENT);
+   if (flat_stage && type.base != SZ_BASE_FLOAT && type.base != SZ_BASE_BOOL)
       sz_spv_decorate_bare(t->m, id, SpvDecorationFlat);
-   else if (storage == SpvStorageClassInput &&
+   else if (flat_stage && storage == SpvStorageClassInput &&
             var->data.interpolation == INTERP_MODE_FLAT)
       sz_spv_decorate_bare(t->m, id, SpvDecorationFlat);
 
@@ -484,12 +556,8 @@ static const struct sz_alu_map sz_alu_maps[] = {
    { nir_op_fneo, SpvOpFOrdNotEqual },
    { nir_op_ieq, SpvOpIEqual },
    { nir_op_ine, SpvOpINotEqual },
-   { nir_op_seq, SpvOpIEqual },
-   { nir_op_sne, SpvOpINotEqual },
    { nir_op_ilt, SpvOpSLessThan },
-   { nir_op_slt, SpvOpSLessThan },
    { nir_op_ige, SpvOpSGreaterThanEqual },
-   { nir_op_sge, SpvOpSGreaterThanEqual },
    { nir_op_ult, SpvOpULessThan },
    { nir_op_uge, SpvOpUGreaterThanEqual },
    { nir_op_i2f32, SpvOpConvertSToF },
@@ -540,6 +608,10 @@ static uint32_t
 sz_alu_source(struct sz_translate *t, const nir_alu_src *src, unsigned ncomp)
 {
    const nir_def *def = src->src.ssa;
+   if (def == NULL) {
+      sz_fail(t, "ALU source has no defining instruction");
+      return 0;
+   }
    const uint32_t base = sz_scalar_type(t, t->def_types[def->index].base,
                                         t->def_types[def->index].bits);
    const unsigned n = def->num_components;
@@ -607,15 +679,15 @@ sz_emit_b2x(struct sz_translate *t, const struct sz_dtype *dst,
       ones[i] = one;
    }
 
+   if (dst->ncomp == 1) {
+      const uint32_t ops[] = { condition, one, zero };
+      return sz_spv_alu(t->m, SpvOpSelect, sz_dtype_type(t, dst), ops, 3);
+   }
+
    const uint32_t z = sz_spv_composite_construct(
       t->m, sz_dtype_type(t, dst), zeros, dst->ncomp);
    const uint32_t o = sz_spv_composite_construct(
       t->m, sz_dtype_type(t, dst), ones, dst->ncomp);
-
-   if (dst->ncomp == 1) {
-      const uint32_t ops[] = { condition, o, z };
-      return sz_spv_alu(t->m, SpvOpSelect, sz_dtype_type(t, dst), ops, 3);
-   }
 
    const uint32_t bool_vec = sz_spv_type_vec(
       t->m, sz_spv_type_bool(t->m), dst->ncomp);
@@ -633,12 +705,18 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
    dst.bits = alu->def.bit_size;
    dst.ncomp = alu->def.num_components;
 
-   enum sz_base out_base;
-   if (!sz_base_from_alu_type(nir_op_infos[op].output_type, &out_base)) {
+   /* A polymorphic op's type is its operand's, not the one the opcode table
+    * names: mov, vecN and bcsel all record nir_type_uint as a placeholder, so
+    * reading the table types a float move as unsigned -- and then a store of that
+    * value into a float variable is invalid SPIR-V, which is a crash inside
+    * RADV's parser rather than a validation error. */
+   if (sz_alu_is_passthrough(op)) {
+      const nir_def *typed = alu->src[op == nir_op_bcsel ? 1 : 0].src.ssa;
+      dst.base = typed ? t->def_types[typed->index].base : SZ_BASE_FLOAT;
+   } else if (!sz_base_from_alu_type(nir_op_infos[op].output_type, &dst.base)) {
       sz_fail(t, "NIR op `%s` has no SPIR-V mapping", nir_op_infos[op].name);
       return;
    }
-   dst.base = out_base;
 
    /* Pure aliases. */
    if (op == nir_op_mov) {
@@ -651,9 +729,6 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
    if (op == nir_op_vec2 || op == nir_op_vec3 || op == nir_op_vec4 ||
        op == nir_op_vec8 || op == nir_op_vec16) {
       uint32_t comps[16];
-      const struct sz_dtype *first = &t->def_types[alu->src[0].src.ssa->index];
-      dst.base = first->base;
-      dst.bits = first->bits;
 
       for (unsigned i = 0; i < dst.ncomp; i++)
          comps[i] = sz_alu_source(t, &alu->src[i], 1);
@@ -683,6 +758,42 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       return;
    }
 
+   /* slt/sge/seq/sne are the "soft bool" comparisons the frontend emits when the
+    * driver has no native integers: they take floats and return 1.0f or 0.0f
+    * rather than a bool, so the translation is the SPIR-V float comparison
+    * followed by the same select the other bool-to-number paths use. */
+   {
+      static const struct {
+         nir_op op;
+         SpvOp spirv;
+      } soft_cmps[] = {
+         { nir_op_slt, SpvOpFOrdLessThan },
+         { nir_op_sge, SpvOpFOrdGreaterThanEqual },
+         { nir_op_seq, SpvOpFOrdEqual },
+         { nir_op_sne, SpvOpFOrdNotEqual },
+      };
+
+      for (unsigned i = 0; i < ARRAY_SIZE(soft_cmps); i++) {
+         if (soft_cmps[i].op != op)
+            continue;
+
+         const uint32_t ops[] = {
+            sz_alu_source(t, &alu->src[0], dst.ncomp),
+            sz_alu_source(t, &alu->src[1], dst.ncomp),
+         };
+         const struct sz_dtype cmp = {
+            .base = SZ_BASE_BOOL,
+            .bits = 1,
+            .ncomp = dst.ncomp,
+         };
+         const uint32_t cond = sz_spv_alu(t->m, soft_cmps[i].spirv,
+                                          sz_dtype_type(t, &cmp), ops, 2);
+         t->defs_id[alu->def.index] = sz_emit_b2x(t, &dst, cond);
+         t->def_types[alu->def.index] = dst;
+         return;
+      }
+   }
+
    if (op == nir_op_fsat) {
       const uint32_t src = sz_alu_source(t, &alu->src[0], dst.ncomp);
       const uint32_t zero = sz_spv_const_float32(t->m, 0.0f);
@@ -697,25 +808,24 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       if (sz_alu_maps[i].op != op)
          continue;
 
-      const uint32_t a = sz_alu_source(t, &alu->src[0], dst.ncomp);
-      const uint32_t ops[] = {
-         a,
-         sz_alu_source(t, &alu->src[1], dst.ncomp),
-         sz_alu_source(t, &alu->src[2], dst.ncomp),
-      };
+      /* Only the sources the op declares exist: the rest of nir_alu_src[] is
+       * uninitialised, and reading it dereferences a NULL nir_def. */
+      const unsigned nsrcs = MIN2(nir_op_infos[op].num_inputs, 3);
+      uint32_t ops[3];
+      for (unsigned j = 0; j < nsrcs; j++)
+         ops[j] = sz_alu_source(t, &alu->src[j], dst.ncomp);
 
       if (op == nir_op_f2i1 || op == nir_op_i2i1) {
          /* "not equal to zero": a comparison, so the operand list is (a, 0). */
          const uint32_t zero = sz_spv_const_bits(
-            t->m, sz_scalar_type(t, out_base, dst.bits), 0);
-         const uint32_t cmp[] = { a, zero };
+            t->m, sz_scalar_type(t, dst.base, dst.bits), 0);
+         const uint32_t cmp[] = { ops[0], zero };
          t->defs_id[alu->def.index] =
             sz_spv_alu(t->m, sz_alu_maps[i].spirv, sz_dtype_type(t, &dst), cmp,
                        2);
       } else {
          t->defs_id[alu->def.index] = sz_spv_alu(
-            t->m, sz_alu_maps[i].spirv, sz_dtype_type(t, &dst), ops,
-            MIN2(nir_op_infos[op].num_inputs, 3));
+            t->m, sz_alu_maps[i].spirv, sz_dtype_type(t, &dst), ops, nsrcs);
       }
       t->def_types[alu->def.index] = dst;
       return;
@@ -725,18 +835,15 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       if (sz_glsl_maps[i].op != op)
          continue;
 
-      const uint32_t a = sz_alu_source(t, &alu->src[0], dst.ncomp);
-      const uint32_t ops[] = {
-         a,
-         sz_alu_source(t, &alu->src[1], dst.ncomp),
-         sz_alu_source(t, &alu->src[2], dst.ncomp),
-      };
+      const unsigned nsrcs = MIN2(nir_op_infos[op].num_inputs, 3);
+      uint32_t ops[3];
+      for (unsigned j = 0; j < nsrcs; j++)
+         ops[j] = sz_alu_source(t, &alu->src[j], dst.ncomp);
 
       struct sz_dtype work = dst;
       /* FSqrt and friends are defined on floats; keep the declared type. */
-      t->defs_id[alu->def.index] = sz_emit_ext(
-         t, sz_glsl_maps[i].ext, &work, ops,
-         MIN2(nir_op_infos[op].num_inputs, 3));
+      t->defs_id[alu->def.index] =
+         sz_emit_ext(t, sz_glsl_maps[i].ext, &work, ops, nsrcs);
       t->def_types[alu->def.index] = dst;
       return;
    }
@@ -776,6 +883,194 @@ sz_emit_load_const(struct sz_translate *t, nir_load_const_instr *lconst)
    t->def_types[lconst->def.index] = type;
 }
 
+/* Declares (once) the uniform block for a gallium constant buffer slot and
+ * returns a pointer to its word array.
+ *
+ * The block is deliberately untyped -- one runtime array of uint -- because
+ * load_ubo addresses it by byte offset, not by member. Typing it as the NIR
+ * variable's struct would mean reproducing std140 member offsets here, and the
+ * load would still have to be lowered to per-component reads. */
+static uint32_t
+sz_ubo_array_ptr(struct sz_translate *t, unsigned index)
+{
+   for (unsigned i = 0; i < t->num_ubos; i++) {
+      if (t->ubos[i].index == index)
+         return t->ubos[i].array_ptr;
+   }
+
+   if (t->num_ubos == SZ_MAX_UBOS) {
+      sz_fail(t, "more than %d uniform buffers in one shader", SZ_MAX_UBOS);
+      return 0;
+   }
+
+   const uint32_t uint_type = sz_spv_type_uint32(t->m);
+   const uint32_t array_type =
+      sz_spv_type_array(t->m, uint_type, SZ_MAX_CONSTBUF_WORDS);
+   /* Every load below works in 32-bit words, so the stride is the scalar size
+    * rather than anything derived from the block's GLSL type. */
+   sz_spv_decorate(t->m, array_type, SpvDecorationArrayStride, 4);
+
+   const uint32_t block_type = sz_spv_type_struct(t->m, &array_type, 1);
+   sz_spv_decorate_bare(t->m, block_type, SpvDecorationBlock);
+   sz_spv_member_decorate(t->m, block_type, 0, SpvDecorationOffset, 0);
+
+   const uint32_t block_ptr =
+      sz_spv_type_ptr(t->m, SpvStorageClassUniform, block_type);
+   const uint32_t var = sz_spv_variable(t->m, block_ptr, SpvStorageClassUniform);
+
+   sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet, SZ_DESCRIPTOR_SET);
+   sz_spv_decorate(t->m, var, SpvDecorationBinding,
+                   sz_descriptor_binding(t->nir->info.stage, index));
+
+   /* Member 0 of the block, then the array itself: OpAccessChain cannot skip
+    * the struct level, because the first index into a struct pointer selects a
+    * member rather than an element. */
+   const uint32_t member0 = sz_spv_const_uint32(t->m, 0);
+   const uint32_t array_ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassUniform, array_type);
+   const uint32_t array_ptr =
+      sz_spv_access_chain(t->m, array_ptr_type, var, &member0, 1);
+
+   t->ubos[t->num_ubos].index = index;
+   t->ubos[t->num_ubos].array_ptr = array_ptr;
+   t->num_ubos++;
+
+   /* SPIR-V 1.4 and later want every global the entry point reaches in its
+    * interface list, uniform blocks included. */
+   t->interfaces[t->num_interfaces++] = var;
+
+   return array_ptr;
+}
+
+/* Reinterprets a loaded 32-bit word as the load's destination type. The block is
+ * untyped, so the type is applied here instead of by the load. */
+static uint32_t
+sz_word_as_type(struct sz_translate *t, uint32_t word, enum sz_base base)
+{
+   const uint32_t uint_type = sz_spv_type_uint32(t->m);
+
+   switch (base) {
+   case SZ_BASE_UINT:
+      return word;
+   case SZ_BASE_INT: {
+      const uint32_t int_type = sz_spv_type_int32(t->m);
+      return sz_spv_alu(t->m, SpvOpBitcast, int_type, &word, 1);
+   }
+   case SZ_BASE_FLOAT: {
+      const uint32_t float_type = sz_spv_type_float32(t->m);
+      return sz_spv_alu(t->m, SpvOpBitcast, float_type, &word, 1);
+   }
+   case SZ_BASE_BOOL: {
+      const uint32_t zero = sz_spv_const_uint32(t->m, 0);
+      const uint32_t ops[] = { word, zero };
+      return sz_spv_alu(t->m, SpvOpINotEqual, sz_spv_type_bool(t->m), ops, 2);
+   }
+   }
+   return 0;
+}
+
+/* `in_vec4_units` selects between the two addressing modes NIR has for uniform
+ * buffers: load_ubo counts bytes, load_ubo_vec4 counts vec4s. Both are supported
+ * because the frontend picks one or the other from the shader's GLSL version
+ * (nir_lower_uniforms_to_ubo's load_vec4 argument comes from
+ * NativeIntegers, which needs GLSL 1.30), so the choice is not ours to make. */
+static void
+sz_emit_load_ubo(struct sz_translate *t, nir_intrinsic_instr *intrin,
+                 bool in_vec4_units)
+{
+   const nir_def *def = &intrin->def;
+   const unsigned ncomp = def->num_components;
+   const unsigned unit_bytes = in_vec4_units ? 16 : 1;
+
+   if (def->bit_size != 32) {
+      sz_fail(t, "uniform load of %u-bit values is not supported",
+              def->bit_size);
+      return;
+   }
+
+   /* A dynamic descriptor index would mean an array of uniform buffers bound at
+    * one binding; GL binds each one separately, so the index is always the
+    * constant slot st chose. */
+   const nir_const_value *index_value = nir_src_as_const_value(intrin->src[0]);
+   if (!index_value) {
+      sz_fail(t, "indirect uniform buffer selection is not supported");
+      return;
+   }
+
+   const unsigned ubo = index_value[0].u32;
+   const uint32_t array_ptr = sz_ubo_array_ptr(t, ubo);
+   if (!array_ptr)
+      return;
+
+   /* nir_lower_uniforms_to_ubo() puts the whole byte offset in src[1] and leaves
+    * base at zero, but base is part of the intrinsic's contract, so both are
+    * added rather than one being assumed empty. */
+   const unsigned base = nir_intrinsic_base(intrin);
+
+   const uint32_t uint_type = sz_spv_type_uint32(t->m);
+   const uint32_t word_ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassUniform, uint_type);
+
+   uint32_t first_word = 0;
+   const nir_const_value *offset_value = nir_src_as_const_value(intrin->src[1]);
+   if (offset_value) {
+      const uint64_t bytes = (base + (uint64_t)offset_value[0].u32) * unit_bytes;
+      if (bytes % 4) {
+         sz_fail(t, "uniform load at byte offset %" PRIu64 " is not word "
+                    "aligned", bytes);
+         return;
+      }
+      first_word = sz_spv_const_uint32(t->m, (uint32_t)(bytes / 4));
+   } else {
+      /* std140 keeps every member 4-byte aligned and the vec4 mode is 16-byte
+       * aligned by construction, so a shift is exact in both directions. */
+      const uint32_t dynamic = t->defs_id[intrin->src[1].ssa->index];
+      const uint32_t base_id = sz_spv_const_uint32(t->m, base);
+      const uint32_t two = sz_spv_const_uint32(t->m, 2);
+      const uint32_t sum_ops[] = { dynamic, base_id };
+      const uint32_t sum = sz_spv_alu(t->m, SpvOpIAdd, uint_type, sum_ops, 2);
+      const uint32_t shift_ops[] = { sum, two };
+      first_word = sz_spv_alu(t->m,
+                              in_vec4_units ? SpvOpShiftLeftLogical
+                                            : SpvOpShiftRightLogical,
+                              uint_type, shift_ops, 2);
+   }
+
+   struct sz_dtype type = {
+      .base = SZ_BASE_FLOAT,
+      .bits = def->bit_size,
+      .ncomp = ncomp,
+   };
+   /* load_ubo carries the type it wants the bytes read as, which is the only
+    * reliable source here: the block itself is untyped. */
+   if (!sz_base_from_alu_type(nir_intrinsic_instr_dest_type(intrin),
+                              &type.base))
+      sz_guess_def_type(t, def, &type);
+
+   uint32_t comps[4];
+   const bool constant_index = offset_value != NULL;
+
+   for (unsigned i = 0; i < ncomp; i++) {
+      uint32_t word_index = first_word;
+      if (i > 0 || !constant_index) {
+         const uint32_t add = sz_spv_const_uint32(t->m, i);
+         const uint32_t ops[] = { first_word, add };
+         word_index = sz_spv_alu(t->m, SpvOpIAdd, uint_type, ops, 2);
+      }
+
+      const uint32_t elem =
+         sz_spv_access_chain(t->m, word_ptr_type, array_ptr, &word_index, 1);
+      const uint32_t word = sz_spv_load(t->m, uint_type, elem);
+      comps[i] = sz_word_as_type(t, word, type.base);
+   }
+
+   t->def_types[def->index] = type;
+   t->defs_id[def->index] =
+      ncomp == 1 ? comps[0]
+                 : sz_spv_composite_construct(t->m, sz_dtype_type(t, &type),
+                                              comps, ncomp);
+}
+
 static void
 sz_emit_load_deref(struct sz_translate *t, nir_intrinsic_instr *intrin)
 {
@@ -796,6 +1091,22 @@ sz_emit_load_deref(struct sz_translate *t, nir_intrinsic_instr *intrin)
    const uint32_t loaded = sz_spv_load(t->m, sz_dtype_type(t, &type), ptr);
    t->defs_id[intrin->def.index] = loaded;
    t->def_types[intrin->def.index] = type;
+}
+
+static const char *
+sz_base_name(enum sz_base base)
+{
+   switch (base) {
+   case SZ_BASE_FLOAT:
+      return "float";
+   case SZ_BASE_INT:
+      return "int";
+   case SZ_BASE_UINT:
+      return "uint";
+   case SZ_BASE_BOOL:
+      return "bool";
+   }
+   return "unknown";
 }
 
 static void
@@ -820,6 +1131,16 @@ sz_emit_store_deref(struct sz_translate *t, nir_intrinsic_instr *intrin)
    const uint32_t value_id = t->defs_id[value->index];
 
    if (ncomp == dst_type.ncomp) {
+      /* SPIR-V requires the stored value's type to match the pointee exactly, and
+       * a mismatch is not a validation error the loader reports: it makes the
+       * driver's SPIR-V parser read the wrong type. Nothing here converts between
+       * bases, so a mismatch is a bug in the translator and is reported as one. */
+      if (t->def_types[value->index].base != dst_type.base) {
+         sz_fail(t, "store_deref of a %s value into a %s variable",
+                 sz_base_name(t->def_types[value->index].base),
+                 sz_base_name(dst_type.base));
+         return;
+      }
       sz_spv_store(t->m, ptr, value_id);
       return;
    }
@@ -891,6 +1212,17 @@ static bool
 sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
 {
    switch (intrin->intrinsic) {
+   case nir_intrinsic_load_ubo:
+      sz_emit_load_ubo(t, intrin, false);
+      return true;
+   case nir_intrinsic_load_ubo_vec4:
+      sz_emit_load_ubo(t, intrin, true);
+      return true;
+   case nir_intrinsic_load_uniform:
+      /* The state tracker is supposed to have lowered these away; reaching here
+       * means nir_options went back to leaving the default block as derefs. */
+      sz_fail(t, "load_uniform survived nir_lower_uniforms_to_ubo");
+      return false;
    case nir_intrinsic_load_deref:
       sz_emit_load_deref(t, intrin);
       return true;
@@ -1073,19 +1405,32 @@ sz_nir_to_spirv(struct nir_shader *nir, uint32_t **words, size_t *word_count,
    sz_glsl450 = sz_spv_ext_inst_import(t.m, "GLSL.std.450");
 
    nir_foreach_variable_in_shader (var, nir) {
+      /* Only inputs and outputs are declared from the NIR variable list. Blocks
+       * are descriptors: they are declared on first access instead, which is
+       * what lets the load decide the layout, and their variables stay in the
+       * NIR after being lowered away and are simply unused. */
+      if (var->data.mode != nir_var_shader_in &&
+          var->data.mode != nir_var_shader_out)
+         continue;
+
       if (!sz_declare_variable(&t, var))
          goto fail;
       t.interfaces[t.num_interfaces++] = t.vars[t.num_vars - 1].id;
    }
 
    const uint32_t function = sz_spv_id(t.m);
-   sz_spv_entry_point(t.m, model, function, "main", t.interfaces,
-                      t.num_interfaces);
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       sz_spv_execution_mode(t.m, function, SpvExecutionModeOriginUpperLeft);
 
    if (!sz_emit_shader(&t, function))
       goto fail;
+
+   /* Emitted last because SPIR-V 1.4 and later require every global variable the
+    * entry point touches to be listed here, including the uniform blocks that
+    * are only declared once a load asks for one. The module reorders its
+    * sections, so the instruction still lands before the functions. */
+   sz_spv_entry_point(t.m, model, function, "main", t.interfaces,
+                      t.num_interfaces);
 
    size_t bytes = 0;
    const uint32_t *module = sz_spv_finalize(t.m, &bytes);

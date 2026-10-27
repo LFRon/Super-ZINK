@@ -18,6 +18,7 @@
 #include "sz_caps.h"
 #include "sz_compiler.h"
 #include "sz_context.h"
+#include "sz_descriptor.h"
 #include "sz_device.h"
 #include "sz_dmabuf.h"
 #include "sz_format.h"
@@ -30,6 +31,7 @@
 #include "util/u_memory.h"
 #include "util/u_screen.h"
 #include "util/os_file.h"
+#include "util/os_time.h"
 
 #include "util/log.h"
 
@@ -54,6 +56,15 @@
 
 #define SZ_INSTANCE_EXTENSIONS \
    VK_EXT_DEBUG_UTILS_EXTENSION_NAME
+
+/* VK_KHR_surface is not used for anything -- presentation goes through the
+ * winsys -- but VK_KHR_swapchain names it as a dependency, and swapchain is only
+ * enabled because VK_KHR_present_wait needs it (see sz_ext_deps). A device
+ * extension list that names a dependent extension without its dependency is a
+ * validation error (VUID 01387), so it is enabled here. It is asked for rather
+ * than assumed: a headless setup can legitimately lack it, and instance creation
+ * would fail with VK_ERROR_EXTENSION_NOT_PRESENT instead of falling back. */
+#define SZ_SURFACE_EXTENSION VK_KHR_SURFACE_EXTENSION_NAME
 
 /* ── Vulkan loader bootstrap ─────────────────────────────────────────────── */
 
@@ -106,6 +117,12 @@ sz_load_global_entrypoints(struct sz_screen *screen)
       (PFN_vkEnumerateInstanceVersion)
          screen->vk_GetInstanceProcAddr(VK_NULL_HANDLE,
                                         "vkEnumerateInstanceVersion");
+   /* Optional: only used to decide whether an optional instance extension may be
+    * asked for. A loader that does not export it answers "not available". */
+   screen->vk.EnumerateInstanceExtensionProperties =
+      (PFN_vkEnumerateInstanceExtensionProperties)
+         screen->vk_GetInstanceProcAddr(VK_NULL_HANDLE,
+                                        "vkEnumerateInstanceExtensionProperties");
    return true;
 }
 
@@ -137,10 +154,44 @@ sz_load_instance_entrypoints(struct sz_screen *screen)
 #undef SZ_LOAD_GLOBAL_PROC
 #undef SZ_LOAD_PROC_IMPL
 
+/* True when the loader advertises `name` as an instance extension. */
+static bool
+sz_instance_extension_available(struct sz_screen *screen, const char *name)
+{
+   if (!screen->vk.EnumerateInstanceExtensionProperties)
+      return false;
+
+   uint32_t count = 0;
+   if (screen->vk.EnumerateInstanceExtensionProperties(NULL, &count, NULL) !=
+           VK_SUCCESS ||
+       count == 0)
+      return false;
+
+   VkExtensionProperties *props = CALLOC(count, sizeof(*props));
+   if (!props)
+      return false;
+
+   bool found = false;
+   if (screen->vk.EnumerateInstanceExtensionProperties(NULL, &count, props) ==
+       VK_SUCCESS) {
+      for (uint32_t i = 0; i < count; i++) {
+         if (strcmp(props[i].extensionName, name) == 0) {
+            found = true;
+            break;
+         }
+      }
+   }
+   FREE(props);
+   return found;
+}
+
 static VkResult
 sz_create_instance(struct sz_screen *screen)
 {
-   const char *exts[] = { SZ_INSTANCE_EXTENSIONS };
+   const char *exts[2] = { SZ_INSTANCE_EXTENSIONS };
+   unsigned num_exts = 1;
+   if (sz_instance_extension_available(screen, SZ_SURFACE_EXTENSION))
+      exts[num_exts++] = SZ_SURFACE_EXTENSION;
 
    /* Ask for the highest version the loader offers, capped by our headers.
     * Requesting only the floor would pin every 1.4 driver to the extension
@@ -176,7 +227,7 @@ sz_create_instance(struct sz_screen *screen)
    VkInstanceCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
       .pApplicationInfo = &app,
-      .enabledExtensionCount = ARRAY_SIZE(exts),
+      .enabledExtensionCount = num_exts,
       .ppEnabledExtensionNames = exts,
    };
 
@@ -315,6 +366,12 @@ sz_screen_get_vendor(struct pipe_screen *pscreen)
    return "Super-ZINK";
 }
 
+static uint64_t
+sz_screen_get_timestamp(struct pipe_screen *pscreen)
+{
+   return os_time_get_nano();
+}
+
 static const char *
 sz_screen_get_device_vendor(struct pipe_screen *pscreen)
 {
@@ -385,6 +442,10 @@ sz_screen_destroy(struct pipe_screen *pscreen)
    struct sz_screen *screen = sz_screen(pscreen);
 
    sz_queue_state_finish(&screen->batch_state);
+   /* The context destroyed the queue idle, so nothing can be reading a retired
+    * resource any more. Tear them down while the device is still alive. */
+   sz_resource_reclaim_all(screen);
+   sz_descriptor_screen_finish(screen);
    sz_bo_finish(screen);
    sz_device_finish(screen);
 
@@ -451,6 +512,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
    sz_resource_screen_init(screen);
    sz_screen_fence_init(screen);
 
+   /* Descriptor set layouts are screen-owned: they are immutable once created,
+    * every pipeline references them, and a per-context copy would only add ways
+    * for the two to disagree with the shaders' bindings. */
+   if (!sz_descriptor_screen_init(screen, screen->caps.max_push_descriptors))
+      goto fail;
+
    if (!sz_queue_state_init(&screen->batch_state, screen,
                             screen->queues[SZ_QUEUE_GRAPHICS].family)) {
       mesa_loge("SZ: could not create the command submission state");
@@ -465,6 +532,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
    screen->base.is_format_supported = sz_screen_is_format_supported;
    screen->base.query_memory_info = sz_screen_query_memory_info;
    screen->base.context_create = sz_screen_context_create;
+   /* GL_TIMESTAMP and GL_TIMESTAMP queries ask here first and fall back to the
+    * per-context hook only if the screen declines. With neither set, the
+    * fallback calls a NULL pointer. The CPU clock is not the GPU clock, but it is
+    * monotonic and it answers the only question a GL app asks with it. */
+   screen->base.get_timestamp = sz_screen_get_timestamp;
 
    u_init_pipe_screen_caps(&screen->base, !screen->is_cpu);
 
@@ -493,7 +565,75 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * and with the restriction on, the only depth configs generated are the
        * ones that match the colour width, so glXChooseVisual finds nothing. */
       caps->mixed_color_depth_bits = true;
+
+      /* The primitives Vulkan can rasterise, which is fewer than GL can emit.
+       * A mode left out of this mask is converted by the primitive converter
+       * reaches the driver, which is the only correct answer for QUADS,
+       * QUAD_STRIP and POLYGON -- there is no VkPrimitiveTopology for them, and
+       * quietly drawing them as triangle lists produces a garbled picture rather
+       * than an error. u_screen defaults the mask to "all", so leaving it alone
+       * means claiming support the driver does not have. */
+      caps->supported_prim_modes =
+         BITFIELD_BIT(MESA_PRIM_POINTS) |
+         BITFIELD_BIT(MESA_PRIM_LINES) |
+         BITFIELD_BIT(MESA_PRIM_LINE_STRIP) |
+         BITFIELD_BIT(MESA_PRIM_TRIANGLES) |
+         BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP) |
+         BITFIELD_BIT(MESA_PRIM_LINES_ADJACENCY) |
+         BITFIELD_BIT(MESA_PRIM_LINE_STRIP_ADJACENCY) |
+         BITFIELD_BIT(MESA_PRIM_TRIANGLES_ADJACENCY) |
+         BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP_ADJACENCY);
+      /* No mode supports a restart index yet: that needs
+       * primitiveRestartEnable and VK_DYNAMIC_STATE_PRIMITIVE_RESTART_INDEX on
+       * the pipeline. An empty mask makes the primitive converter split the
+       * draw at the restart index, which is slower and always right. */
+      caps->supported_prim_modes_with_restart = 0;
+
+      /* Constant buffers arrive as real buffers rather than client memory, so
+       * the driver never has to invent an upload path for them. */
+      caps->prefer_real_buffer_in_constbuf0 = true;
    }
+
+   /* Shader limits. st_extensions.c reads max_instructions == 0 as "this stage
+    * is unsupported" and zeroes every other limit, so a stage that links at all
+    * needs it set. max_const_buffer0_size is what becomes both
+    * GL_MAX_*_UNIFORM_COMPONENTS and GL_MAX_UNIFORM_BLOCK_SIZE, which is why it
+    * is spelled in bytes here and in vec4s there.
+    *
+    * Only the two stages the translator implements are advertised: a non-zero
+    * max_instructions for geometry, tessellation or compute makes the frontend
+    * expose them and makes cso_context call their bind_* entry points, and
+    * there is no compute translation yet. */
+   const mesa_shader_stage supported_stages[] = {MESA_SHADER_VERTEX,
+                                                 MESA_SHADER_FRAGMENT};
+   for (unsigned i = 0; i < ARRAY_SIZE(supported_stages); i++) {
+      /* shader_caps is const in pipe_screen because the state tracker only
+       * reads it; drivers fill it exactly once, here. */
+      struct pipe_shader_caps *sc =
+         (struct pipe_shader_caps *)&screen->base.shader_caps[supported_stages[i]];
+
+      sc->max_instructions = 65535;
+      sc->max_alu_instructions = 65535;
+      sc->max_tex_instructions = 65535;
+      sc->max_tex_indirections = 65535;
+      sc->max_control_flow_depth = 32;
+      sc->max_inputs = 16;
+      sc->max_outputs = 16;
+      sc->max_temps = 64;
+      /* Exactly the size of the array the translator declares inside a uniform
+       * block, so no shader can ask for a block the block type cannot hold. */
+      sc->max_const_buffer0_size = SZ_MAX_CONSTBUF_WORDS * 4;
+      sc->max_const_buffers = SZ_MAX_CONST_BUFFERS;
+      sc->max_texture_samplers = 16;
+      sc->max_sampler_views = 16;
+      sc->max_shader_buffers = 8;
+      sc->max_shader_images = 8;
+      sc->supported_irs = 1u << PIPE_SHADER_IR_NIR;
+      sc->cont_supported = true;
+      sc->indirect_const_addr = true;
+   }
+   ((struct pipe_shader_caps *)&screen->base.shader_caps[MESA_SHADER_FRAGMENT])
+      ->max_inputs = 32;
 
    snprintf(screen->renderer_string, sizeof(screen->renderer_string),
             "Super-ZINK (Vulkan %u.%u.%u, %s)",

@@ -303,6 +303,54 @@ sz_spv_type_vec(struct sz_spv_module *m, uint32_t component, unsigned count)
 }
 
 uint32_t
+sz_spv_type_runtime_array(struct sz_spv_module *m, uint32_t element)
+{
+   uint32_t id = sz_spv_type_lookup(m, SpvOpTypeRuntimeArray, element, 0, 0);
+   if (id)
+      return id;
+
+   id = sz_spv_id(m);
+   const uint32_t ops[] = { id, element };
+   sz_spv_emit_simple(m, SEC_TYPES, SpvOpTypeRuntimeArray, ops, 2);
+   sz_spv_type_record(m, SpvOpTypeRuntimeArray, element, 0, 0, id);
+   return id;
+}
+
+uint32_t
+sz_spv_type_array(struct sz_spv_module *m, uint32_t element, unsigned count)
+{
+   const uint32_t length = sz_spv_const_uint32(m, count);
+   uint32_t id = sz_spv_type_lookup(m, SpvOpTypeArray, element, length, 0);
+   if (id)
+      return id;
+
+   id = sz_spv_id(m);
+   const uint32_t ops[] = { id, element, length };
+   sz_spv_emit_simple(m, SEC_TYPES, SpvOpTypeArray, ops, 3);
+   sz_spv_type_record(m, SpvOpTypeArray, element, length, 0, id);
+   return id;
+}
+
+uint32_t
+sz_spv_type_struct(struct sz_spv_module *m, const uint32_t *members,
+                   unsigned count)
+{
+   const uint32_t id = sz_spv_id(m);
+
+   uint32_t *ops = CALLOC(count + 1, sizeof(*ops));
+   if (!ops)
+      return 0;
+
+   ops[0] = id;
+   for (unsigned i = 0; i < count; i++)
+      ops[i + 1] = members[i];
+
+   sz_spv_emit_simple(m, SEC_TYPES, SpvOpTypeStruct, ops, count + 1);
+   free(ops);
+   return id;
+}
+
+uint32_t
 sz_spv_type_ptr(struct sz_spv_module *m, SpvStorageClass storage,
                 uint32_t pointee)
 {
@@ -589,6 +637,14 @@ void
 sz_spv_return(struct sz_spv_module *m)
 {
    sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpReturn, NULL, 0);
+}
+
+void
+sz_spv_member_decorate(struct sz_spv_module *m, uint32_t type, unsigned member,
+                       SpvDecoration decoration, uint32_t value)
+{
+   const uint32_t ops[] = { type, member, decoration, value };
+   sz_spv_emit_simple(m, SEC_DECORATIONS, SpvOpMemberDecorate, ops, 4);
 }
 
 void

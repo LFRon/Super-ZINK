@@ -198,6 +198,11 @@ struct sz_caps {
     * of asking the driver a second, possibly different, question. */
    VkPhysicalDeviceFeatures core_features;
 
+   /* VkPhysicalDevicePushDescriptorPropertiesKHR::maxPushDescriptors, i.e. how
+    * many writes one vkCmdPushDescriptorSet call may carry. Zero when the
+    * device does not report the property. */
+   uint32_t max_push_descriptors;
+
    uint32_t instance_api_version;
    uint32_t device_api_version;
 

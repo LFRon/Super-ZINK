@@ -14,6 +14,8 @@
 
 #include "sz_context.h"
 
+#include "sz_descriptor.h"
+
 #include "sz_batch.h"
 #include "sz_compiler.h"
 #include "sz_debug.h"
@@ -28,6 +30,7 @@
 #include "util/log.h"
 #include "util/macros.h"
 #include "util/u_inlines.h"
+#include "util/u_surface.h"
 #include "util/u_upload_mgr.h"
 
 #include <string.h>
@@ -178,7 +181,8 @@ sz_context_submit(struct sz_context *ctx)
    if (!sz_batch_end(batch))
       return;
 
-   sz_batch_submit(batch, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+   if (sz_batch_submit(batch, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT))
+      sz_pipeline_note_submit(ctx);
 }
 
 static void
@@ -198,8 +202,13 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
 
    /* The winsys asks for this before handing a buffer to the display engine.
     * Without it the compositor can sample a surface the GPU is still writing. */
-   if (flags & PIPE_FLUSH_END_OF_FRAME)
+   if (flags & PIPE_FLUSH_END_OF_FRAME) {
       sz_queue_wait_idle(&ctx->screen->batch_state);
+      /* The queue just went idle, so every retired resource whose submission has
+       * completed can be torn down. Doing it here rather than only on the next
+       * destroy keeps the table from filling up during a long run. */
+      sz_resource_reclaim(ctx->screen);
+   }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1025,6 +1034,48 @@ static void
 sz_set_constant_buffer(struct pipe_context *pipe, mesa_shader_stage shader,
                        uint index, const struct pipe_constant_buffer *buf)
 {
+   struct sz_context *ctx = sz_context(pipe);
+
+   if (shader >= MESA_SHADER_STAGES || index >= SZ_MAX_CONST_BUFFERS) {
+      sz_warn_once("SZ: ignoring a constant buffer outside the supported range");
+      return;
+   }
+
+   struct pipe_constant_buffer *dst = &ctx->state.constant_buffers[shader][index];
+
+   if (!buf || (!buf->buffer && !buf->user_buffer)) {
+      pipe_resource_reference(&dst->buffer, NULL);
+      dst->buffer_offset = 0;
+      dst->buffer_size = 0;
+      dst->user_buffer = NULL;
+      return;
+   }
+
+   /* st is asked for real buffers (caps->prefer_real_buffer_in_constbuf0), so a
+    * client-memory pointer here means some other path -- a draw module or a
+    * blit shader -- and copying it would need an uploader this phase does not
+    * have yet. Say so once instead of reading stale descriptors. */
+   if (!buf->buffer) {
+      sz_warn_once("SZ: constant buffers in client memory are not implemented, "
+                   "ignoring");
+      return;
+   }
+
+   pipe_resource_reference(&dst->buffer, buf->buffer);
+   dst->buffer_offset = buf->buffer_offset;
+   dst->buffer_size = buf->buffer_size;
+   dst->user_buffer = NULL;
+}
+
+static void
+sz_set_inlinable_constants(struct pipe_context *pipe, mesa_shader_stage shader,
+                           uint num_values, uint32_t *values)
+{
+   /* Inlinable constants are the ones a driver may bake into a shader variant.
+    * This one always reads uniforms from the buffer, so the values are already
+    * where the shader looks for them and there is nothing to recompile. The
+    * entry point still has to exist: st calls it unconditionally, and leaving it
+    * NULL is a null-dereference in the middle of a draw. */
 }
 
 static void
@@ -1107,11 +1158,18 @@ sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
 {
    const struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
 
+   /* Gallium viewport state is in GL window coordinates: y grows upwards from
+    * the bottom-left corner. Vulkan's framebuffer origin is the top-left corner,
+    * so a positive height with y at `translate - scale` maps NDC +1 to row 0 --
+    * which is where GL puts the top of the window. Keeping the height positive is
+    * what keeps the rendered image the right way up; a negative height (the
+    * alternative, used when the shader does not flip y itself) would mirror the
+    * frame vertically on screen. */
    VkViewport viewport = {
       .x = 0.0f,
-      .y = (float)fb->height,
+      .y = 0.0f,
       .width = (float)fb->width,
-      .height = -(float)fb->height,
+      .height = (float)fb->height,
       .minDepth = 0.0f,
       .maxDepth = 1.0f,
    };
@@ -1119,9 +1177,9 @@ sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
    if (ctx->state.num_viewports > 0) {
       const struct pipe_viewport_state *vp = &ctx->state.viewports[0];
       viewport.x = vp->translate[0] - vp->scale[0];
-      viewport.y = vp->translate[1] + vp->scale[1];
+      viewport.y = vp->translate[1] - vp->scale[1];
       viewport.width = 2.0f * vp->scale[0];
-      viewport.height = -2.0f * vp->scale[1];
+      viewport.height = 2.0f * vp->scale[1];
       viewport.minDepth = vp->translate[2] - vp->scale[2];
       viewport.maxDepth = vp->translate[2] + vp->scale[2];
    }
@@ -1144,6 +1202,15 @@ sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
 
    ctx->screen->vk.CmdSetViewport(cmd, 0, 1, &viewport);
    ctx->screen->vk.CmdSetScissor(cmd, 0, 1, &scissor);
+
+   /* glBlendColor is dynamic in Vulkan, so it is set per draw rather than baked
+    * into the pipeline. */
+   if (ctx->screen->vk.CmdSetBlendConstants) {
+      const struct pipe_blend_color *bc = &ctx->state.blend_color;
+      const float constants[4] = { bc->color[0], bc->color[1], bc->color[2],
+                                   bc->color[3] };
+      ctx->screen->vk.CmdSetBlendConstants(cmd, constants);
+   }
 }
 
 /* Gallium primitive -> Vulkan topology.
@@ -1234,34 +1301,41 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       ctx->screen->vk.CmdBindIndexBuffer(cmd, index->buffer, 0, type);
    }
 
-   const unsigned stride = ve->u.ve.elements[0].src_stride;
    const VkPrimitiveTopology topology = sz_topology(info->mode);
 
-   struct sz_gfx_pipeline *pipeline =
-      sz_pipeline_get(ctx, topology, ve->u.ve.count, stride);
+   struct sz_gfx_pipeline *pipeline = sz_pipeline_get(ctx, topology);
    if (!pipeline)
       return;
 
    ctx->screen->vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     pipeline->pipeline);
 
+   /* Constant buffers are pushed per draw, not per state change: a push goes
+    * into the command stream, so the cost is stream space and the correctness is
+    * trivial -- the descriptors a draw sees are the ones bound when it was
+    * recorded. */
+   sz_descriptor_push(ctx, cmd);
+
    sz_draw_viewport(ctx, cmd);
 
-   /* One binding, matching the bootstrap shader's single input location. */
-   const struct pipe_vertex_buffer *vb = &ctx->state.vertex_buffers[0];
-   if (vb->is_user_buffer || !vb->buffer.resource) {
-      sz_warn_once("SZ: user vertex buffers are not implemented, ignoring");
-      return;
+   /* Every slot the frontend bound, not just slot 0: a shader reading two
+    * attributes has two vertex buffers, and binding only the first leaves the
+    * rest undefined. A slot with no resource behind it is left unbound, which is
+    * legal as long as no shader input reads it. */
+   for (unsigned i = 0; i < ctx->state.num_vertex_buffers; i++) {
+      const struct pipe_vertex_buffer *vb = &ctx->state.vertex_buffers[i];
+      if (vb->is_user_buffer || !vb->buffer.resource)
+         continue;
+
+      struct sz_resource *vres = sz_resource(vb->buffer.resource);
+      if (vres->buffer == VK_NULL_HANDLE)
+         continue;
+
+      sz_resource_access(ctx->screen, cmd, vres, SZ_ACCESS_VERTEX_BUFFER);
+
+      const VkDeviceSize offset = vb->buffer_offset;
+      ctx->screen->vk.CmdBindVertexBuffers(cmd, i, 1, &vres->buffer, &offset);
    }
-
-   struct sz_resource *vres = sz_resource(vb->buffer.resource);
-   if (vres->buffer == VK_NULL_HANDLE)
-      return;
-
-   sz_resource_access(ctx->screen, cmd, vres, SZ_ACCESS_VERTEX_BUFFER);
-
-   const VkDeviceSize offset = vb->buffer_offset;
-   ctx->screen->vk.CmdBindVertexBuffers(cmd, 0, 1, &vres->buffer, &offset);
 
    for (unsigned i = 0; i < num_draws; i++) {
       if (draws[i].count == 0)
@@ -1347,11 +1421,40 @@ sz_clear_texture_entry(struct pipe_context *pipe, struct pipe_resource *res,
    sz_clear_texture(pipe, res, level, box, data);
 }
 
+static void *sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
+                             unsigned level, unsigned usage,
+                             const struct pipe_box *box,
+                             struct pipe_transfer **transfer);
+static void sz_transfer_unmap(struct pipe_context *pipe,
+                              struct pipe_transfer *transfer);
+
+/* Sub-data updates go through the transfer path rather than being special
+ * cased: a host-visible resource is written in place, anything else is staged
+ * and copied. Leaving them empty is the kind of hole that costs days -- a
+ * glBufferSubData silently does nothing, the draw still runs, and the result is
+ * a black screen with no error anywhere. */
 static void
 sz_texture_subdata(struct pipe_context *pipe, struct pipe_resource *res,
                    unsigned level, unsigned usage, const struct pipe_box *box,
                    const void *data, unsigned stride, uintptr_t layer_stride)
 {
+   struct pipe_transfer *transfer = NULL;
+   void *map = sz_transfer_map(pipe, res, level, usage | PIPE_MAP_WRITE, box,
+                               &transfer);
+   if (!map)
+      return;
+
+   const struct util_format_description *desc = util_format_description(res->format);
+   const unsigned bw = desc ? desc->block.width : 1;
+   const unsigned bh = desc ? desc->block.height : 1;
+
+   util_copy_box((uint8_t *)map, res->format, transfer->stride,
+                 transfer->layer_stride, 0, 0, 0,
+                 DIV_ROUND_UP(box->width, bw), DIV_ROUND_UP(box->height, bh),
+                 box->depth, (const uint8_t *)data, stride, layer_stride,
+                 box->x / bw, box->y / bh, box->z);
+
+   sz_transfer_unmap(pipe, transfer);
 }
 
 static void
@@ -1359,6 +1462,21 @@ sz_buffer_subdata(struct pipe_context *pipe, struct pipe_resource *res,
                   unsigned usage, unsigned offset, unsigned size,
                   const void *data)
 {
+   if (size == 0)
+      return;
+
+   const struct pipe_box box = {
+      .x = offset,
+      .width = size,
+   };
+   struct pipe_transfer *transfer = NULL;
+   void *map = sz_transfer_map(pipe, res, 0, usage | PIPE_MAP_WRITE, &box,
+                               &transfer);
+   if (!map)
+      return;
+
+   memcpy(map, data, size);
+   sz_transfer_unmap(pipe, transfer);
 }
 
 /* Transfers.
@@ -1650,6 +1768,41 @@ sz_texture_barrier(struct pipe_context *pipe, unsigned flags)
 {
 }
 
+static void
+sz_resource_release(struct pipe_context *pipe, struct pipe_resource *res)
+{
+   /* The frontend is done with `res`; the driver owns whatever is left. Dropping
+    * the last reference is the entire contract (see u_default_resource_release),
+    * and sz_screen_resource_destroy() defers the Vulkan teardown if a submission
+    * may still read it. Without this hook st_add_releasebuf() -- which the
+    * constant uploader calls whenever it reallocates, once every ~800 frames of
+    * glxgears -- jumps through a NULL function pointer. */
+   pipe_resource_reference(&res, NULL);
+}
+
+static void
+sz_context_memory_barrier(struct pipe_context *pipe, unsigned flags)
+{
+   struct sz_context *ctx = sz_context(pipe);
+
+   /* glMemoryBarrier, and the state tracker's own "shader wrote this, now read
+    * it back" paths. There is no finer information to act on than "make every
+    * earlier write visible", which is exactly one whole-command-buffer barrier.
+    * The heavier cost of getting this wrong (stale pixels) is why it is not a
+    * no-op. */
+   if (flags == 0)
+      return;
+
+   VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
+   if (cmd == VK_NULL_HANDLE)
+      return;
+
+   sz_memory_barrier(ctx->screen, cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                     VK_ACCESS_2_MEMORY_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                     VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+}
+
 static enum pipe_reset_status
 sz_get_device_reset_status(struct pipe_context *pipe)
 {
@@ -1673,6 +1826,14 @@ sz_context_destroy(struct pipe_context *pipe)
    sz_queue_wait_idle(&ctx->screen->batch_state);
 
    sz_pipeline_finish(ctx);
+
+   /* The constant buffers are the one piece of shadow state the context owns a
+    * reference to, so they are the one piece it has to drop. */
+   for (unsigned sh = 0; sh < MESA_SHADER_STAGES; sh++) {
+      for (unsigned i = 0; i < SZ_MAX_CONST_BUFFERS; i++)
+         pipe_resource_reference(&ctx->state.constant_buffers[sh][i].buffer,
+                                 NULL);
+   }
 
    u_upload_destroy(ctx->base.const_uploader);
    u_upload_destroy(ctx->base.stream_uploader);
@@ -2180,6 +2341,7 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->set_scissor_states = sz_set_scissor_states;
    pipe->set_sampler_views = sz_set_sampler_views;
    pipe->set_constant_buffer = sz_set_constant_buffer;
+   pipe->set_inlinable_constants = sz_set_inlinable_constants;
    pipe->set_vertex_buffers = sz_set_vertex_buffers;
    pipe->set_shader_buffers = sz_set_shader_buffers;
    pipe->set_shader_images = sz_set_shader_images;
@@ -2213,6 +2375,8 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->texture_unmap = sz_texture_unmap;
    pipe->transfer_flush_region = sz_transfer_flush_region;
    pipe->texture_barrier = sz_texture_barrier;
+   pipe->memory_barrier = sz_context_memory_barrier;
+   pipe->resource_release = sz_resource_release;
 
    /* Sampler views. */
    pipe->create_sampler_view = sz_create_sampler_view;

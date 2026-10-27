@@ -68,6 +68,12 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
 
    VkRenderingAttachmentInfo depth = { 0 };
    bool has_depth = fb->zsbuf.texture != NULL;
+   /* A depth-only format is not a stencil attachment: naming it as one is a
+    * validation error, and the format has to agree with what the pipeline
+    * declared. */
+   const bool has_stencil =
+      has_depth &&
+      util_format_has_stencil(util_format_description(fb->zsbuf.format));
 
    if (has_depth) {
       struct sz_resource *res = sz_resource(fb->zsbuf.texture);
@@ -95,7 +101,7 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
       .colorAttachmentCount = color_count,
       .pColorAttachments = color_count ? color : NULL,
       .pDepthAttachment = has_depth ? &depth : NULL,
-      .pStencilAttachment = has_depth ? &depth : NULL,
+      .pStencilAttachment = has_stencil ? &depth : NULL,
    };
 
    screen->vk.CmdBeginRendering(cmd, &info);

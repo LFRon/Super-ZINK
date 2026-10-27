@@ -25,6 +25,59 @@
 
 #include "compiler/nir/nir.h"
 
+/* Number of constant buffer slots a stage can bind, which is also how many
+ * uniform buffer bindings that stage owns in the descriptor set layout. */
+#define SZ_MAX_CONST_BUFFERS 16
+
+/* Size of the array the translator declares inside a uniform block, in 32-bit
+ * words. The block has no declared member types -- the load applies one -- so
+ * the array exists only to give SPIR-V a type with an ArrayStride. It cannot be
+ * a runtime array: that needs VK_EXT_shader_uniform_buffer_unsized_array, which
+ * Turnip does not advertise. 64 KiB is both what shader_caps reports as
+ * max_const_buffer0_size and the GLSL maximum block size, and every Vulkan
+ * device allows at least a quarter of it. */
+#define SZ_MAX_CONSTBUF_WORDS 16384
+
+/* One push descriptor set holds every stage's resources. The spec allows at
+ * most one push descriptor set per pipeline layout (VUID 00293), so a set per
+ * stage -- the obvious mapping -- is not legal. Each stage therefore owns a
+ * disjoint range of bindings inside the single set, and the binding number a
+ * shader decorates is stage_base + gallium constant buffer slot.
+ *
+ * The layout may not declare more than maxPushDescriptors bindings in total
+ * (VUID 00281), and the spec's minimum for that limit is 32 -- a limit a
+ * conformant device is allowed to report. Two stages times SZ_MAX_CONST_BUFFERS
+ * is exactly 32, so only the two stages that can actually be compiled fit:
+ * vertex and fragment. A stage registered beyond these gets a binding number
+ * outside the layout, which is why sz_descriptor_push() asserts on it. */
+#define SZ_DESCRIPTOR_SET 0
+#define SZ_DESCRIPTOR_STAGES 2
+#define SZ_DESCRIPTOR_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_CONST_BUFFERS)
+
+/* VK_KHR_push_descriptor's own floor for maxPushDescriptors. A device that
+ * reports less is out of spec, but the decode is cheap and the alternative is
+ * creating a layout the driver is allowed to reject. */
+#define SZ_MIN_PUSH_DESCRIPTORS 32
+
+static inline unsigned
+sz_descriptor_stage_base(mesa_shader_stage stage)
+{
+   switch (stage) {
+   case MESA_SHADER_VERTEX:
+      return 0;
+   case MESA_SHADER_FRAGMENT:
+      return SZ_MAX_CONST_BUFFERS;
+   default:
+      return SZ_DESCRIPTOR_BINDINGS;
+   }
+}
+
+static inline unsigned
+sz_descriptor_binding(mesa_shader_stage stage, unsigned slot)
+{
+   return sz_descriptor_stage_base(stage) + slot;
+}
+
 /* The options for one shader stage. The returned pointer stays valid for the
  * lifetime of the process. */
 const struct nir_shader_compiler_options *sz_nir_options(mesa_shader_stage stage);

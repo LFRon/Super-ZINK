@@ -222,6 +222,21 @@ sz_caps_init(struct sz_caps *caps,
    const bool cap_local_read_multisampled =
       vk14 && q.props14.dynamicRenderingLocalReadMultisampledAttachments;
 
+   /* maxPushDescriptors is a property rather than a feature, so it comes from its
+    * own chained query. It bounds how many uniform buffers one push can carry:
+    * sz_descriptor_screen_init() refuses to start when it is too small. */
+   if (get_props2) {
+      VkPhysicalDevicePushDescriptorPropertiesKHR push = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR,
+      };
+      VkPhysicalDeviceProperties2 query = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+         .pNext = &push,
+      };
+      get_props2(pdev, &query);
+      caps->max_push_descriptors = push.maxPushDescriptors;
+   }
+
    /* ── resolve every listed capability ───────────────────────────────────── */
 #define SZ_CAP_RESOLVE(field, name, ext, core, expr)                           \
    caps->field = (expr) &&                                                     \

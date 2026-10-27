@@ -62,6 +62,13 @@ static const struct nir_shader_compiler_options sz_nir_options_default = {
     * because the SPIR-V consumer scalarises anyway. */
    .lower_to_scalar = true,
 
+   /* The default uniform block becomes a UBO, so the translator only ever sees
+    * load_ubo and never a nir_var_uniform deref. The frontend also shifts the
+    * bindings of real UBOs up by one, which makes the NIR index equal the
+    * gallium constant buffer slot: slot 0 is the default block, slot i+1 is
+    * uniform block i. */
+   .lower_uniforms_to_ubo = true,
+
    /* GLSL has real subtraction instructions and SPIR-V has OpFSub/OpISub. */
    .has_fsub = true,
    .has_isub = true,
@@ -110,6 +117,32 @@ sz_lower_nir(struct nir_shader *nir)
     * emitter has no reason to track them. Doing it here keeps the translator free
     * of a whole class of deref. */
    nir_lower_vars_to_ssa(nir);
+
+   /* GL clip space has z in [-1, 1] and Vulkan's viewport expects [0, 1]. The Y
+    * axis is handled by the viewport's negative height, but z has no viewport
+    * equivalent, so the last pre-rasterisation stage rescales it: z' = (z + w) /
+    * 2, which is exactly what this pass emits. Without it everything behind z = 0
+    * is clipped away, so half the scene disappears and the depth values of what
+    * remains are squeezed into the far half of the depth buffer.
+    *
+    * This is the same trade ANGLE makes in its Vulkan backend, and for the same
+    * reason: a shader-side transform cannot be forgotten by a state object.
+    *
+    * glClipControl(GL_ZERO_TO_ONE) -- reported as pipe_rasterizer_state::
+    * clip_halfz -- asks for Vulkan's own convention, and a shader lowered here
+    * would end up with its depth in [0.5, 1]. Honouring it needs a second shader
+    * variant per program, which is the shader-cache work of a later phase; until
+    * then the pipeline layer says so once instead of rendering a subtly wrong
+    * depth range in silence. */
+   switch (nir->info.stage) {
+   case MESA_SHADER_VERTEX:
+   case MESA_SHADER_TESS_EVAL:
+   case MESA_SHADER_GEOMETRY:
+      nir_lower_clip_halfz(nir);
+      break;
+   default:
+      break;
+   }
 
    /* Only a leftover local is a problem; the pass returning false just means it
     * found nothing to do, which is the common case. */
