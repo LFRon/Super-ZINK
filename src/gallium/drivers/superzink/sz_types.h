@@ -83,6 +83,7 @@ struct sz_vk_entrypoints {
    PFN_vkCmdClearColorImage CmdClearColorImage;
    PFN_vkCmdClearDepthStencilImage CmdClearDepthStencilImage;
    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
+   PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
    PFN_vkCmdCopyImage CmdCopyImage;
    PFN_vkCmdCopyBuffer CmdCopyBuffer;
    PFN_vkCmdFillBuffer CmdFillBuffer;

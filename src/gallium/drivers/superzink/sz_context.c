@@ -26,6 +26,7 @@
 #include "util/log.h"
 #include "util/macros.h"
 #include "util/u_inlines.h"
+#include "util/u_upload_mgr.h"
 
 #include <string.h>
 
@@ -1315,17 +1316,266 @@ sz_buffer_subdata(struct pipe_context *pipe, struct pipe_resource *res,
 {
 }
 
+/* Transfers.
+ *
+ * A resource the CPU can already address is handed out directly; everything else
+ * goes through a host-visible staging buffer that is copied on map and back on
+ * unmap. The copy is a full submit-and-wait, which is what makes a map a
+ * synchronisation point -- correct, and the thing to optimise once profiling
+ * says it matters.
+ *
+ * The staging buffer is per transfer rather than pooled. A pooled one would need
+ * a lifetime rule that outlives unmap (the GPU may still be reading it while the
+ * next map overwrites it), and getting that wrong shows up as textures that are
+ * occasionally one frame stale. */
+struct sz_transfer {
+   struct pipe_transfer base;
+
+   /* Non-NULL when the resource is not directly addressable, in which case
+    * `staging` holds the mapped bytes. */
+   struct pipe_resource *staging;
+
+   /* Bytes per row in `staging`. Handed to the caller as base.stride, and used as
+    * the copy's bufferRowLength. */
+   unsigned row_pitch;
+};
+
+static struct pipe_resource *
+sz_transfer_staging_create(struct sz_screen *screen, unsigned size)
+{
+   const struct pipe_resource tmpl = {
+      .target = PIPE_BUFFER,
+      .format = PIPE_FORMAT_R8_UNORM,
+      .bind = 0,
+      .usage = PIPE_USAGE_STAGING,
+      .width0 = size,
+      .height0 = 1,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 0,
+   };
+
+   return screen->base.resource_create(&screen->base, &tmpl);
+}
+
+/* One recorded transfer, in a shape that can be handed to sz_oneshot(). */
+struct sz_copy_job {
+   struct sz_resource *res;
+   struct sz_resource *staging;
+   struct pipe_box box;
+   unsigned level;
+   bool to_staging;
+   unsigned row_pitch;
+};
+
+static void
+sz_copy_job_record(struct sz_context *ctx, VkCommandBuffer cmd, void *user)
+{
+   struct sz_copy_job *job = user;
+   struct sz_screen *screen = ctx->screen;
+   const unsigned bs = util_format_get_blocksize(job->res->base.format);
+
+   if (job->res->image == VK_NULL_HANDLE) {
+      /* Buffer to buffer: the region is a plain byte range. */
+      sz_resource_access(screen, cmd, job->staging,
+                         job->to_staging ? SZ_ACCESS_TRANSFER_DST
+                                         : SZ_ACCESS_TRANSFER_SRC);
+      sz_resource_access(screen, cmd, job->res,
+                         job->to_staging ? SZ_ACCESS_TRANSFER_SRC
+                                         : SZ_ACCESS_TRANSFER_DST);
+
+      const VkBufferCopy region = {
+         .srcOffset = job->to_staging ? job->box.x : 0,
+         .dstOffset = job->to_staging ? 0 : job->box.x,
+         .size = job->box.width,
+      };
+
+      if (job->to_staging)
+         screen->vk.CmdCopyBuffer(cmd, job->res->buffer, job->staging->buffer,
+                                  1, &region);
+      else
+         screen->vk.CmdCopyBuffer(cmd, job->staging->buffer, job->res->buffer,
+                                  1, &region);
+      return;
+   }
+
+   const VkImageLayout layout =
+      sz_resource_access(screen, cmd, job->res,
+                         job->to_staging ? SZ_ACCESS_TRANSFER_SRC
+                                         : SZ_ACCESS_TRANSFER_DST);
+   sz_resource_access(screen, cmd, job->staging,
+                      job->to_staging ? SZ_ACCESS_TRANSFER_DST
+                                      : SZ_ACCESS_TRANSFER_SRC);
+
+   const bool is_3d = job->res->base.target == PIPE_TEXTURE_3D;
+
+   VkBufferImageCopy region = {
+      .bufferOffset = 0,
+      /* In texels, not bytes; zero would mean "tightly packed", which is not the
+       * pitch the caller sees. */
+      .bufferRowLength = job->row_pitch / bs,
+      .bufferImageHeight = 0,
+      .imageSubresource = {
+         .aspectMask = sz_format_aspect(job->res->base.format),
+         .mipLevel = job->level,
+         .baseArrayLayer = is_3d ? 0 : job->box.z,
+         .layerCount = is_3d ? 1 : job->box.depth,
+      },
+      .imageOffset = {
+         job->box.x,
+         job->box.y,
+         is_3d ? job->box.z : 0,
+      },
+      .imageExtent = {
+         job->box.width,
+         job->box.height,
+         job->box.depth,
+      },
+   };
+
+   if (job->to_staging)
+      screen->vk.CmdCopyImageToBuffer(cmd, job->res->image, layout,
+                                      job->staging->buffer, 1, &region);
+   else
+      screen->vk.CmdCopyBufferToImage(cmd, job->staging->buffer, job->res->image,
+                                      layout, 1, &region);
+}
+
+/* Runs one recorded job to completion.
+ *
+ * Whatever the context has recorded so far is submitted first: the job needs its
+ * own command buffer, and the resource it touches may already be referenced by
+ * the pending one. */
+static bool
+sz_oneshot(struct sz_context *ctx, struct sz_copy_job *job)
+{
+   sz_context_submit(ctx);
+
+   struct sz_batch *batch = sz_batch_begin(&ctx->screen->batch_state);
+   if (!batch)
+      return false;
+
+   sz_copy_job_record(ctx, batch->cmd, job);
+
+   if (!sz_batch_end(batch))
+      return false;
+   if (!sz_batch_submit(batch, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT))
+      return false;
+
+   sz_queue_wait_idle(&ctx->screen->batch_state);
+   return true;
+}
+
+static void *
+sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
+                unsigned level, unsigned usage, const struct pipe_box *box,
+                struct pipe_transfer **transfer)
+{
+   struct sz_context *ctx = sz_context(pipe);
+   struct sz_screen *screen = ctx->screen;
+   struct sz_resource *r = sz_resource(res);
+
+   struct sz_transfer *t = CALLOC_STRUCT(sz_transfer);
+   if (!t)
+      return NULL;
+
+   t->base.resource = res;
+   t->base.level = level;
+   t->base.usage = usage;
+   t->base.box = *box;
+
+   void *direct = sz_resource_map(r);
+   if (direct) {
+      t->base.stride = box->width;
+      t->base.layer_stride = 0;
+      *transfer = &t->base;
+      return (char *)direct + box->x;
+   }
+
+   const unsigned bs = util_format_get_blocksize(res->format);
+   const unsigned row_pitch =
+      res->target == PIPE_BUFFER
+         ? 0
+         : (unsigned)sz_resource_linear_pitch(screen, box->width, bs);
+   const uint64_t size =
+      res->target == PIPE_BUFFER
+         ? box->width
+         : (uint64_t)row_pitch * box->height * box->depth;
+
+   t->staging = sz_transfer_staging_create(screen, (unsigned)size);
+   if (!t->staging) {
+      free(t);
+      return NULL;
+   }
+
+   t->row_pitch = row_pitch;
+
+   if (usage & PIPE_MAP_READ) {
+      struct sz_copy_job job = {
+         .res = r,
+         .staging = sz_resource(t->staging),
+         .box = *box,
+         .level = level,
+         .to_staging = true,
+         .row_pitch = row_pitch,
+      };
+
+      if (!sz_oneshot(ctx, &job)) {
+         pipe_resource_reference(&t->staging, NULL);
+         free(t);
+         return NULL;
+      }
+
+      sz_bo_invalidate(sz_resource(t->staging)->bo, 0, size);
+   }
+
+   t->base.stride = res->target == PIPE_BUFFER ? box->width : row_pitch;
+   t->base.layer_stride = res->target == PIPE_BUFFER ? 0 : row_pitch * box->height;
+
+   *transfer = &t->base;
+   return sz_resource_map(sz_resource(t->staging));
+}
+
+static void
+sz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
+{
+   struct sz_transfer *t = (struct sz_transfer *)transfer;
+
+   if (t->staging && (t->base.usage & PIPE_MAP_WRITE)) {
+      struct sz_context *ctx = sz_context(pipe);
+      struct sz_resource *staging = sz_resource(t->staging);
+      const uint64_t size = sz_bo_size(staging->bo);
+
+      sz_bo_flush(staging->bo, 0, size);
+
+      struct sz_copy_job job = {
+         .res = sz_resource(t->base.resource),
+         .staging = staging,
+         .box = t->base.box,
+         .level = t->base.level,
+         .to_staging = false,
+         .row_pitch = t->row_pitch,
+      };
+
+      sz_oneshot(ctx, &job);
+   }
+
+   pipe_resource_reference(&t->staging, NULL);
+   free(t);
+}
+
 static void *
 sz_buffer_map(struct pipe_context *pipe, struct pipe_resource *res,
               unsigned level, unsigned usage, const struct pipe_box *box,
               struct pipe_transfer **transfer)
 {
-   return NULL;
+   return sz_transfer_map(pipe, res, level, usage, box, transfer);
 }
 
 static void
 sz_buffer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
 {
+   sz_transfer_unmap(pipe, transfer);
 }
 
 static void *
@@ -1333,12 +1583,13 @@ sz_texture_map(struct pipe_context *pipe, struct pipe_resource *res,
                unsigned level, unsigned usage, const struct pipe_box *box,
                struct pipe_transfer **transfer)
 {
-   return NULL;
+   return sz_transfer_map(pipe, res, level, usage, box, transfer);
 }
 
 static void
 sz_texture_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
 {
+   sz_transfer_unmap(pipe, transfer);
 }
 
 static void
@@ -1346,6 +1597,7 @@ sz_transfer_flush_region(struct pipe_context *pipe,
                          struct pipe_transfer *transfer,
                          const struct pipe_box *box)
 {
+   /* The whole box is copied at unmap, so there is nothing to flush early. */
 }
 
 static void
@@ -1376,6 +1628,9 @@ sz_context_destroy(struct pipe_context *pipe)
    sz_queue_wait_idle(&ctx->screen->batch_state);
 
    sz_pipeline_finish(ctx);
+
+   u_upload_destroy(ctx->base.const_uploader);
+   u_upload_destroy(ctx->base.stream_uploader);
 
    /* Nothing in ctx->state is owned here: every object was created by a create_*
     * entry point and is destroyed by its matching delete_* entry point, which the
@@ -1920,6 +2175,23 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->sampler_view_release = sz_sampler_view_release;
 
    pipe->get_device_reset_status = sz_get_device_reset_status;
+
+   /* Stream and constant uploads. Every driver creates a pair: u_vbuf, u_upload
+    * users in st and the clear paths all dereference them unconditionally, and a
+    * NULL here shows up as a crash inside upload code rather than as an error. */
+   pipe->stream_uploader = u_upload_create_default(pipe);
+   if (!pipe->stream_uploader) {
+      mesa_loge("SZ: could not create the stream uploader");
+      free(ctx);
+      return NULL;
+   }
+   pipe->const_uploader = u_upload_create_default(pipe);
+   if (!pipe->const_uploader) {
+      mesa_loge("SZ: could not create the constant uploader");
+      u_upload_destroy(pipe->stream_uploader);
+      free(ctx);
+      return NULL;
+   }
 
    (void)flags;
 

@@ -454,6 +454,7 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdClearColorImage, vkCmdClearColorImage);
    SZ_DEV_PROC(CmdClearDepthStencilImage, vkCmdClearDepthStencilImage);
    SZ_DEV_PROC(CmdCopyImageToBuffer, vkCmdCopyImageToBuffer);
+   SZ_DEV_PROC(CmdCopyBufferToImage, vkCmdCopyBufferToImage);
    SZ_DEV_PROC(CmdCopyImage, vkCmdCopyImage);
    SZ_DEV_PROC(CmdCopyBuffer, vkCmdCopyBuffer);
    SZ_DEV_PROC(CmdFillBuffer, vkCmdFillBuffer);
