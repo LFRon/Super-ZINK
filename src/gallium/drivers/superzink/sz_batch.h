@@ -70,6 +70,11 @@ struct sz_queue_state {
    unsigned next_slot;
 };
 
+/* Refreshes completed_value from the timeline without blocking. A caller that
+ * wants to recycle something an in-flight submission may still be reading has to
+ * do this first, or it will treat work the GPU finished long ago as pending. */
+void sz_queue_poll(struct sz_queue_state *qs);
+
 /* Creates the pool, the ring's command buffers and the timeline semaphore. */
 bool sz_queue_state_init(struct sz_queue_state *qs, struct sz_screen *screen,
                          uint32_t family);

@@ -473,6 +473,14 @@ sz_load_device_entrypoints(struct sz_screen *screen)
 
    SZ_DEV_PROC(CreateDescriptorSetLayout, vkCreateDescriptorSetLayout);
    SZ_DEV_PROC(DestroyDescriptorSetLayout, vkDestroyDescriptorSetLayout);
+   /* The sampler set is an ordinary descriptor set: it is not a push set (a
+    * pipeline layout may hold only one of those), so it is allocated from a pool
+    * and bound with vkCmdBindDescriptorSets. */
+   SZ_DEV_PROC(CreateDescriptorPool, vkCreateDescriptorPool);
+   SZ_DEV_PROC(DestroyDescriptorPool, vkDestroyDescriptorPool);
+   SZ_DEV_PROC(AllocateDescriptorSets, vkAllocateDescriptorSets);
+   SZ_DEV_PROC(UpdateDescriptorSets, vkUpdateDescriptorSets);
+   SZ_DEV_PROC(CmdBindDescriptorSets, vkCmdBindDescriptorSets);
    /* vkCmdPushDescriptorSetKHR only resolves if VK_KHR_push_descriptor was
     * enabled, and a 1.4 device needs no extension at all: there the command is
     * core as vkCmdPushDescriptorSet, which kept the same signature (only

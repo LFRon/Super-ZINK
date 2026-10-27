@@ -43,6 +43,14 @@ sz_timeline_value(struct sz_screen *screen, struct sz_queue_state *qs)
    return value;
 }
 
+/* Public form of the non-blocking poll above, for callers outside the batch
+ * layer that need an up-to-date completed_value without waiting. */
+void
+sz_queue_poll(struct sz_queue_state *qs)
+{
+   sz_timeline_value(qs->screen, qs);
+}
+
 /* Blocks until `value` is signalled. A value of zero is always satisfied,
  * which is how a never-submitted slot passes this. */
 static bool

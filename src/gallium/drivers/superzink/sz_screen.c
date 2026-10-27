@@ -562,8 +562,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * look like a driver bug rather than a missing feature. */
    {
       struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
-      caps->glsl_feature_level = 130;
-      caps->glsl_feature_level_compatibility = 130;
+      caps->glsl_feature_level = 140;
+      caps->glsl_feature_level_compatibility = 140;
       caps->max_texture_2d_size = 16384;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
@@ -661,6 +661,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * ARB_base_instance, and there the shader subtracts it (see
        * sz_draw_append). */
       caps->vs_instanceid = true;
+
+      /* GL_ARB_uniform_buffer_object is derived from this: st_extensions treats
+       * a maximum uniform block below 16 KiB as "no uniform buffers at all", and
+       * zero is what an unset cap reads as. The translator's block type holds
+       * exactly SZ_MAX_CONSTBUF_WORDS 32-bit words, so the two must agree. */
+      caps->max_constant_buffer_size = SZ_MAX_CONSTBUF_WORDS * 4;
 
       /* Occlusion queries map straight onto VK_QUERY_TYPE_OCCLUSION.
        * Conditional rendering is evaluated on the CPU when

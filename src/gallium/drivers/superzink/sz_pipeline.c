@@ -1111,8 +1111,9 @@ sz_hash_bytes(uint64_t hash, const void *data, size_t size)
 bool
 sz_pipeline_screen_init(struct sz_screen *screen)
 {
-   const VkDescriptorSetLayout set_layouts[] = {
-      screen->descriptor_set_layout,
+   const VkDescriptorSetLayout set_layouts[SZ_DESCRIPTOR_SET_COUNT] = {
+      screen->descriptor_set_layout[0],
+      screen->descriptor_set_layout[1],
    };
 
    /* No VkPipelineLayoutCreateFlagBits is needed: the push-descriptor bit lives

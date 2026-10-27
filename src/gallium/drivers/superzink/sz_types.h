@@ -18,6 +18,7 @@
 
 #include "sz_batch.h"
 #include "sz_caps.h"
+#include "sz_compiler.h"
 #include "sz_debug.h"
 #include "sz_public.h"
 
@@ -80,6 +81,11 @@ struct sz_vk_entrypoints {
     * the whole descriptor surface: a layout to push against and the push. */
    PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout;
    PFN_vkDestroyDescriptorSetLayout DestroyDescriptorSetLayout;
+   PFN_vkCreateDescriptorPool CreateDescriptorPool;
+   PFN_vkDestroyDescriptorPool DestroyDescriptorPool;
+   PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
+   PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
+   PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
    PFN_vkCmdPushDescriptorSetKHR CmdPushDescriptorSetKHR;
 
    /* Command submission (sz_batch / sz_sync). */
@@ -229,7 +235,40 @@ struct sz_screen {
    struct sz_bo_state *bo;
 
    /* One descriptor set layout per stage, indexed by descriptor set. */
-   VkDescriptorSetLayout descriptor_set_layout;
+   VkDescriptorSetLayout descriptor_set_layout[SZ_DESCRIPTOR_SET_COUNT];
+   /* The sampler set is not a push set, so it needs a pool to be allocated
+    * from. Sets are cached by content; a slot is only reused once the
+    * submission that last bound it has completed. */
+   VkDescriptorPool descriptor_pool;
+   struct sz_sampler_set_cache_entry {
+      VkDescriptorSet set;
+      uint64_t hash;
+      /* Timeline value of the submission that last bound this set. */
+      uint64_t used_value;
+      /* Per binding: the view and sampler the cached set was written with, in
+       * the same canonical (binding-indexed) order as the lookup key. */
+      VkImageView views[SZ_DESCRIPTOR_SAMPLER_BINDINGS];
+      VkSampler samplers[SZ_DESCRIPTOR_SAMPLER_BINDINGS];
+   } sampler_sets[SZ_SAMPLER_SET_POOL];
+   /* The set bound by the last draw, so an unchanged configuration does not
+    * re-issue the bind. */
+   VkDescriptorSet bound_sampler_set;
+
+   /* A 1x1 opaque black texture, written into every sampler binding that has no
+    * view and sampler of its own.
+    *
+    * GL says sampling an unbound texture unit yields black, but Vulkan has no
+    * such rule: a descriptor naming a destroyed image view is undefined, and on
+    * RADV it ends in a GPU hang. Writing this placeholder keeps every binding
+    * defined without depending on what the slot held before, which is what makes
+    * it safe to rewrite a cached set in place. */
+   struct {
+      VkImage image;
+      struct sz_bo *bo;
+      VkImageView view;
+      VkSampler sampler;
+      bool ready;
+   } dummy_sampler;
 
    /* Screen-owned objects every pipeline shares. The layout is immutable and
     * depends only on the descriptor set layout, so a per-pipeline copy would be

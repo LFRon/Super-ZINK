@@ -26,14 +26,21 @@
 #include "compiler/nir/nir.h"
 
 /* Number of constant buffer slots a stage can bind, which is also how many
- * uniform buffer bindings that stage owns in the descriptor set layout. */
-#define SZ_MAX_CONST_BUFFERS 8
+ * uniform buffer bindings that stage owns in the descriptor set layout.
+ *
+ * 14 rather than a rounder number because st_init_limits() withdraws
+ * GL_ARB_uniform_buffer_object -- and with it the whole of GL 3.1 -- from any
+ * driver whose per-stage uniform block count is below 12, and the count it
+ * reads is this minus the first slot, which holds the default uniform block.
+ * With the samplers moved to their own descriptor set, two stages of 14 still
+ * fit inside the 32 push descriptors a conformant device guarantees. */
+#define SZ_MAX_CONST_BUFFERS 14
 
 /* Combined image samplers per stage, i.e. GL's texture image units after the
  * driver had its say. The binding budget below is what fixes this number: a
  * conformant device may push as few as 32 descriptors, and every slot of every
  * stage has to fit in that. */
-#define SZ_MAX_SAMPLERS 8
+#define SZ_MAX_SAMPLERS 16
 
 /* Size of the array the translator declares inside a uniform block, in 32-bit
  * words. The block has no declared member types -- the load applies one -- so
@@ -44,27 +51,32 @@
  * device allows at least a quarter of it. */
 #define SZ_MAX_CONSTBUF_WORDS 16384
 
-/* One push descriptor set holds every stage's resources. The spec allows at
- * most one push descriptor set per pipeline layout (VUID 00293), so a set per
- * stage -- the obvious mapping -- is not legal. Each stage therefore owns a
- * disjoint range of bindings inside the single set, and the binding number a
- * shader decorates is stage_base + gallium constant buffer slot.
+/* Two descriptor sets, because a pipeline layout may contain at most one push
+ * descriptor set (VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293) and one
+ * push set cannot hold both kinds: SZ_MAX_CONST_BUFFERS + SZ_MAX_SAMPLERS per
+ * stage, times two stages, is more than the 32 bindings maxPushDescriptors is
+ * guaranteed to allow.
  *
- * The layout may not declare more than maxPushDescriptors bindings in total
- * (VUID 00281), and the spec's minimum for that limit is 32 -- a limit a
- * conformant device is allowed to report. Each stage owns SZ_DESCRIPTOR_SLOTS
- * of them (constant buffers first, then samplers), and two stages fill the 32
- * exactly, which is also why only vertex and fragment are compiled: a stage
- * registered beyond these gets a binding number outside the layout, which is
- * why sz_descriptor_push() asserts on it.
+ * Set 0 is the push set and holds every stage's uniform buffers: it is rewritten
+ * per state change, which is the hot path and what push descriptors are for.
+ * Set 1 is a plain descriptor set and holds the combined image samplers, which
+ * are updated and bound only when the sampler state itself changes.
  *
- * Wanting more of either is a signal to move to VK_EXT_descriptor_buffer,
- * where descriptors live in a plain buffer and the count is bounded by memory
- * rather than by a per-device limit. */
-#define SZ_DESCRIPTOR_SET 0
+ * A third kind (shader buffers or images) takes a third set; more than 32 of one
+ * kind is where VK_EXT_descriptor_buffer becomes the answer. */
+#define SZ_DESCRIPTOR_SET_UBO 0
+#define SZ_DESCRIPTOR_SET_SAMPLERS 1
+#define SZ_DESCRIPTOR_SET_COUNT 2
 #define SZ_DESCRIPTOR_STAGES 2
-#define SZ_DESCRIPTOR_SLOTS (SZ_MAX_CONST_BUFFERS + SZ_MAX_SAMPLERS)
-#define SZ_DESCRIPTOR_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_DESCRIPTOR_SLOTS)
+#define SZ_DESCRIPTOR_UBO_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_CONST_BUFFERS)
+#define SZ_DESCRIPTOR_SAMPLER_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
+
+/* How many distinct sampler-set contents to cache. Every draw that rebinds the
+ * same textures and samplers hits an existing entry, so this is the number of
+ * *different* combinations an application uses, not the number of draws. Running
+ * out only costs an eviction of the least recently used entry whose submission
+ * has completed. */
+#define SZ_SAMPLER_SET_POOL 1024
 
 /* VK_KHR_push_descriptor's own floor for maxPushDescriptors. A device that
  * reports less is out of spec, but the decode is cheap and the alternative is
@@ -72,15 +84,15 @@
 #define SZ_MIN_PUSH_DESCRIPTORS 32
 
 static inline unsigned
-sz_descriptor_stage_base(mesa_shader_stage stage)
+sz_descriptor_stage_index(mesa_shader_stage stage)
 {
    switch (stage) {
    case MESA_SHADER_VERTEX:
       return 0;
    case MESA_SHADER_FRAGMENT:
-      return SZ_DESCRIPTOR_SLOTS;
+      return 1;
    default:
-      return SZ_DESCRIPTOR_BINDINGS;
+      return SZ_DESCRIPTOR_STAGES;
    }
 }
 
@@ -88,7 +100,7 @@ sz_descriptor_stage_base(mesa_shader_stage stage)
 static inline unsigned
 sz_descriptor_binding(mesa_shader_stage stage, unsigned slot)
 {
-   return sz_descriptor_stage_base(stage) + slot;
+   return sz_descriptor_stage_index(stage) * SZ_MAX_CONST_BUFFERS + slot;
 }
 
 /* Binding of texture unit `slot` for `stage`: the samplers of a stage follow its
@@ -96,7 +108,7 @@ sz_descriptor_binding(mesa_shader_stage stage, unsigned slot)
 static inline unsigned
 sz_sampler_binding(mesa_shader_stage stage, unsigned slot)
 {
-   return sz_descriptor_stage_base(stage) + SZ_MAX_CONST_BUFFERS + slot;
+   return sz_descriptor_stage_index(stage) * SZ_MAX_SAMPLERS + slot;
 }
 
 /* The options for one shader stage. The returned pointer stays valid for the

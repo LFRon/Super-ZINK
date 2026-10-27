@@ -1180,7 +1180,8 @@ sz_ubo_array_ptr(struct sz_translate *t, unsigned index)
       sz_spv_type_ptr(t->m, SpvStorageClassUniform, block_type);
    const uint32_t var = sz_spv_variable(t->m, block_ptr, SpvStorageClassUniform);
 
-   sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet, SZ_DESCRIPTOR_SET);
+   sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet,
+                   SZ_DESCRIPTOR_SET_UBO);
    sz_spv_decorate(t->m, var, SpvDecorationBinding,
                    sz_descriptor_binding(t->nir->info.stage, index));
 
@@ -1626,7 +1627,8 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
    const uint32_t var =
       sz_spv_variable(t->m, ptr_type, SpvStorageClassUniformConstant);
 
-   sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet, SZ_DESCRIPTOR_SET);
+   sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet,
+                   SZ_DESCRIPTOR_SET_SAMPLERS);
    sz_spv_decorate(t->m, var, SpvDecorationBinding,
                    sz_sampler_binding(t->nir->info.stage, index));
 

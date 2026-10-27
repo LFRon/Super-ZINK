@@ -151,6 +151,9 @@ sz_context_cmd(struct sz_context *ctx)
        * the only place where the dirty mask is set wholesale. */
       ctx->dirty = SZ_DIRTY_ALL;
       ctx->pipeline = NULL;
+      /* Descriptor set bindings are per command buffer, so the "already bound"
+       * memo has to be cleared with the rest of the inherited state. */
+      ctx->screen->bound_sampler_set = VK_NULL_HANDLE;
    }
    return ctx->batch->cmd;
 }
