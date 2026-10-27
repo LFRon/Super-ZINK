@@ -39,6 +39,13 @@ enum sz_state_kind {
 struct sz_state {
    enum sz_state_kind kind;
    mesa_shader_stage stage;
+
+   /* Unique for the lifetime of the process. The pipeline cache keys on this
+    * rather than on the address: delete_* frees the object, and malloc happily
+    * hands the same address to the next state, which would make a cached
+    * pipeline for the old state match the new one. */
+   uint64_t id;
+
    union {
       struct pipe_blend_state blend;
       struct {
@@ -101,6 +108,40 @@ struct sz_gfx_pipeline;
  * sz_pipeline_note_submit() to fill the real one in. Zero is never signalled. */
 #define SZ_RETIRE_PENDING 0
 
+/* How many pipelines one context keeps alive. Alternating between two states
+ * (the shape of every state-churn workload) needs two; the rest is headroom for
+ * a frame that touches a dozen material variants. */
+#define SZ_MAX_CACHED_PIPELINES 24
+
+/* Defined here rather than in sz_pipeline.h because the context embeds it by
+ * value and sz_pipeline.h already includes this header. */
+struct sz_pipeline_cache {
+   struct sz_gfx_pipeline *entries[SZ_MAX_CACHED_PIPELINES];
+   unsigned count;
+   uint64_t clock;
+};
+
+/* How many draws may be accumulated before one vkCmdDrawMulti* call. Bounded by
+ * VkPhysicalDeviceMultiDrawPropertiesEXT::maxMultiDrawCount at run time; the
+ * compile-time value only sizes the array. */
+#define SZ_MAX_BATCHED_DRAWS 64
+
+/* What has to be re-emitted before the next batch of draws. A state setter marks
+ * its bit and flushes the pending batch first, so the shadow state and the
+ * recorded commands can never disagree about which state a draw saw. */
+enum sz_dirty_bits {
+   SZ_DIRTY_PIPELINE       = 1u << 0,
+   SZ_DIRTY_VERTEX_BUFFERS = 1u << 1,
+   SZ_DIRTY_INDEX_BUFFER   = 1u << 2,
+   SZ_DIRTY_DESCRIPTORS    = 1u << 3,
+   SZ_DIRTY_VIEWPORT       = 1u << 4,
+   SZ_DIRTY_SCISSOR        = 1u << 5,
+   SZ_DIRTY_BLEND_CONST    = 1u << 6,
+   SZ_DIRTY_STENCIL_REF    = 1u << 7,
+};
+
+#define SZ_DIRTY_ALL 0xffu
+
 struct sz_context {
    struct pipe_context base;
    struct sz_screen *screen;
@@ -117,7 +158,40 @@ struct sz_context {
    VkFormat render_color_formats[PIPE_MAX_COLOR_BUFS];
    unsigned render_color_count;
 
+   /* The pipeline bound in the command buffer being recorded. NULL means "no
+    * binding recorded yet", which is also what a fresh command buffer reports. */
    struct sz_gfx_pipeline *pipeline;
+
+   /* Pipelines built for this context. A hit costs one hash plus one key
+    * comparison; a miss builds and evicts the least recently used entry that is
+    * not the bound one. */
+   struct sz_pipeline_cache pipelines;
+
+   /* Emitted-command dirty bits. Zero means the state a draw needs is already in
+    * the command buffer. */
+   unsigned dirty;
+
+   /* Draw stream: draws accumulate here and leave as one vkCmdDrawMulti* call.
+    *
+    * The invariant that makes this correct is that every state setter flushes
+    * the pending batch before it changes the shadow state, so nothing is
+    * recorded between the appends and the flush. */
+   struct {
+      struct {
+         uint32_t count;
+         uint32_t first;
+         int32_t index_bias;
+      } draws[SZ_MAX_BATCHED_DRAWS];
+      unsigned count;
+      unsigned capacity;
+      bool indexed;
+      int32_t instance_count;
+      uint32_t start_instance;
+      VkPrimitiveTopology topology;
+      struct sz_resource *index_buffer;
+      VkDeviceSize index_offset;
+      VkIndexType index_type;
+   } pending;
 
    /* Set for a draw that samples the very image it renders into. Vulkan leaves
     * that undefined and RADV's compressed surfaces turn it into noise on screen,
@@ -177,6 +251,12 @@ struct sz_context {
       unsigned sample_mask;
    } state;
 };
+
+/* Emits the pending draw batch (and any state it needs) into the current command
+ * buffer. Every state setter, every non-draw command and every submission calls
+ * it first, which is what makes the batching correct: whatever a draw needs is
+ * captured before anything else can change the state. */
+void sz_draw_flush(struct sz_context *ctx);
 
 /* Creates the pipe_context. Returns NULL on failure. */
 struct pipe_context *sz_context_create(struct sz_screen *screen,

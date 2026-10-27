@@ -227,6 +227,7 @@ sz_feature_selection(const struct sz_screen *screen)
       .shader_object = caps->shader_object,
       .fragment_shading_rate = caps->fragment_shading_rate,
       .shader_image_int64 = caps->shader_image_int64_atomics,
+      .multi_draw = caps->multi_draw,
    };
 }
 
@@ -303,6 +304,7 @@ sz_gate_features(const struct sz_screen *screen, struct sz_vk_features *features
 
    features->image_int64.shaderImageInt64Atomics &=
       caps->shader_image_int64_atomics;
+   features->multi_draw.multiDraw &= caps->multi_draw;
 }
 
 /* Post-create self-check. A feature that we asked for but the device did not
@@ -513,6 +515,11 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdDraw, vkCmdDraw);
    SZ_DEV_PROC(CmdDrawIndexed, vkCmdDrawIndexed);
    SZ_DEV_PROC(CmdClearAttachments, vkCmdClearAttachments);
+   /* NULL unless VK_EXT_multi_draw was enabled; the draw stream checks. */
+   SZ_DEV_PROC(CmdDrawMultiEXT, vkCmdDrawMultiEXT);
+   SZ_DEV_PROC(CmdDrawMultiIndexedEXT, vkCmdDrawMultiIndexedEXT);
+   SZ_DEV_PROC(CreatePipelineCache, vkCreatePipelineCache);
+   SZ_DEV_PROC(DestroyPipelineCache, vkDestroyPipelineCache);
 
    SZ_DEV_PROC(CreateShaderModule, vkCreateShaderModule);
    SZ_DEV_PROC(DestroyShaderModule, vkDestroyShaderModule);
@@ -672,6 +679,15 @@ sz_device_init(struct sz_screen *screen)
       sz_device_finish(screen);
       return false;
    }
+
+   /* How many draws one vkCmdDrawMulti* call may carry. Zero means the
+    * extension is unavailable and the draw stream emits one command per draw --
+    * the only difference between the two paths. */
+   screen->max_multi_draw_count =
+      (screen->caps.multi_draw && screen->vk.CmdDrawMultiEXT &&
+       screen->vk.CmdDrawMultiIndexedEXT)
+         ? screen->caps.max_multi_draw_count
+         : 0;
 
    static const VkQueueFlags role_flags[SZ_QUEUE_COUNT] = {
       [SZ_QUEUE_GRAPHICS] = VK_QUEUE_GRAPHICS_BIT,

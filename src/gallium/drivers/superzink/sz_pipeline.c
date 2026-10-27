@@ -64,6 +64,11 @@ sz_pipeline_dump(const uint32_t *words, size_t size, const char *suffix)
 static VkShaderModule
 sz_pipeline_bootstrap_vs(struct sz_screen *screen)
 {
+   /* Created once: the self-tests draw without a program bound, and a module per
+    * such draw would be pure churn. */
+   if (screen->bootstrap_vs != VK_NULL_HANDLE)
+      return screen->bootstrap_vs;
+
    struct sz_spv_module *m = sz_spv_module_create();
    if (!m)
       return VK_NULL_HANDLE;
@@ -117,6 +122,7 @@ sz_pipeline_bootstrap_vs(struct sz_screen *screen)
    }
 
    sz_spv_module_destroy(m);
+   screen->bootstrap_vs = module;
    return module;
 }
 
@@ -128,6 +134,9 @@ sz_pipeline_bootstrap_vs(struct sz_screen *screen)
 static VkShaderModule
 sz_pipeline_bootstrap_fs(struct sz_screen *screen)
 {
+   if (screen->bootstrap_fs != VK_NULL_HANDLE)
+      return screen->bootstrap_fs;
+
    struct sz_spv_module *m = sz_spv_module_create();
    if (!m)
       return VK_NULL_HANDLE;
@@ -182,6 +191,7 @@ sz_pipeline_bootstrap_fs(struct sz_screen *screen)
    }
 
    sz_spv_module_destroy(m);
+   screen->bootstrap_fs = module;
    return module;
 }
 
@@ -194,8 +204,9 @@ sz_pipeline_destroy_objects(struct sz_screen *screen, struct sz_gfx_pipeline *p)
 {
    if (p->pipeline != VK_NULL_HANDLE)
       screen->vk.DestroyPipeline(screen->dev, p->pipeline, NULL);
-   if (p->layout != VK_NULL_HANDLE)
-      screen->vk.DestroyPipelineLayout(screen->dev, p->layout, NULL);
+   /* The pipeline layout is shared by every pipeline on the screen, so it is
+    * destroyed by sz_pipeline_screen_finish(), not here. Modules and the
+    * pipeline itself belong to the one pipeline that was built with them. */
    if (p->vs != VK_NULL_HANDLE)
       screen->vk.DestroyShaderModule(screen->dev, p->vs, NULL);
    if (p->fs != VK_NULL_HANDLE)
@@ -590,28 +601,11 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
    if (p->vs == VK_NULL_HANDLE || p->fs == VK_NULL_HANDLE)
       goto fail;
 
-   /* ADR-008: the pipeline layout is the push-descriptor layout, so a draw
-    * never allocates a set. Every stage's bindings are declared even when a
-    * shader uses none: a layout with extra bindings is legal, a push against an
-    * undeclared binding is not. */
-   const VkDescriptorSetLayout set_layouts[] = {
-      screen->descriptor_set_layout,
-   };
-
-   /* No VkPipelineLayoutCreateFlagBits is needed: the push-descriptor bit lives
-    * on the descriptor set layout, and Vulkan 1.4 removed the pipeline layout
-    * requirement that used to exist in VK_KHR_push_descriptor. */
-   const VkPipelineLayoutCreateInfo layout_ci = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-      .setLayoutCount = ARRAY_SIZE(set_layouts),
-      .pSetLayouts = set_layouts,
-   };
-   VkResult result = screen->vk.CreatePipelineLayout(screen->dev, &layout_ci,
-                                                      NULL, &p->layout);
-   if (result != VK_SUCCESS) {
-      mesa_loge("SZ: vkCreatePipelineLayout failed: %d", result);
-      goto fail;
-   }
+   /* ADR-008/005c: the pipeline layout is the push-descriptor layout and is
+    * created once per screen. It depends only on the descriptor set layout, so
+    * a per-pipeline copy was pure overhead -- and creating one per rebuild was
+    * a measurable part of the cost of a state change. */
+   VkResult result;
 
    const VkPipelineShaderStageCreateInfo stages[] = {
       {
@@ -881,33 +875,19 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
       .pDepthStencilState = &depth_stencil,
       .pColorBlendState = &blend,
       .pDynamicState = &dynamic_state,
-      .layout = p->layout,
+      .layout = screen->pipeline_layout,
    };
 
-   result = screen->vk.CreateGraphicsPipelines(screen->dev, VK_NULL_HANDLE, 1,
+   /* The pipeline cache is what stops RADV from recompiling the shaders for a
+    * state combination it has already seen. It is the single cheapest thing in
+    * this file: a driver-level cache is keyed by the whole create info. */
+   result = screen->vk.CreateGraphicsPipelines(screen->dev,
+                                                screen->pipeline_cache, 1,
                                                 &pipeline_ci, NULL, &p->pipeline);
    if (result != VK_SUCCESS) {
       mesa_loge("SZ: vkCreateGraphicsPipelines failed: %d", result);
       goto fail;
    }
-
-   p->key.topology = topology;
-   p->key.vertex_binding_count = binding_count;
-   memcpy(p->key.vertex_bindings, bindings,
-          binding_count * sizeof(bindings[0]));
-   p->key.vertex_attribute_count = attribute_count;
-   memcpy(p->key.vertex_attributes, attributes,
-          attribute_count * sizeof(attributes[0]));
-   p->key.samples = samples;
-   p->key.blend = ctx->state.blend;
-   p->key.rasterizer = ctx->state.rasterizer;
-   p->key.dsa = ctx->state.depth_stencil_alpha;
-   p->key.vs = ctx->state.shaders[MESA_SHADER_VERTEX];
-   p->key.fs = ctx->state.shaders[MESA_SHADER_FRAGMENT];
-   p->key.color_count = color_count;
-   for (unsigned i = 0; i < color_count; i++)
-      p->key.color[i] = color_formats[i];
-   p->key.depth = rendering.depthAttachmentFormat;
 
    return true;
 
@@ -916,87 +896,130 @@ fail:
    return false;
 }
 
-static bool
-sz_pipeline_key_matches(struct sz_gfx_pipeline *p, struct sz_context *ctx,
-                        VkPrimitiveTopology topology)
+/* Fills `key` from the current state. Called once per state change, never per
+ * draw: that is the whole point of the epoch. */
+static void
+sz_pipeline_key_from_state(struct sz_context *ctx, VkPrimitiveTopology topology,
+                           struct sz_pipeline_key *key)
 {
-   struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
+   const struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
 
-   if (p->pipeline == VK_NULL_HANDLE)
-      return false;
-   if (p->key.topology != topology)
-      return false;
+   memset(key, 0, sizeof(*key));
+   key->topology = topology;
+   /* Ids, not pointers: see struct sz_pipeline_key. A state that is not bound
+    * is id 0, which never collides because ids start at 1. */
+#define SZ_STATE_ID(ptr)                                                       \
+   ((ptr) ? ((const struct sz_state *)(ptr))->id : 0)
+   key->blend = SZ_STATE_ID(ctx->state.blend);
+   key->rasterizer = SZ_STATE_ID(ctx->state.rasterizer);
+   key->dsa = SZ_STATE_ID(ctx->state.depth_stencil_alpha);
+   key->vs = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_VERTEX]);
+   key->fs = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_FRAGMENT]);
+#undef SZ_STATE_ID
 
-   /* Depth, cull, front face and blend are baked into the pipeline object, so a
-    * change to any of them needs a new one. The state tracker allocates a fresh
-    * object per distinct state, which makes identity comparison enough. */
-   if (p->key.blend != ctx->state.blend ||
-       p->key.rasterizer != ctx->state.rasterizer ||
-       p->key.dsa != ctx->state.depth_stencil_alpha)
-      return false;
+   sz_pipeline_vertex_input(ctx, key->vertex_bindings,
+                            &key->vertex_binding_count, key->vertex_attributes,
+                            &key->vertex_attribute_count);
 
-   if (p->key.vs != ctx->state.shaders[MESA_SHADER_VERTEX] ||
-       p->key.fs != ctx->state.shaders[MESA_SHADER_FRAGMENT])
-      return false;
+   key->samples = sz_vk_sample_count(fb->nr_cbufs ? fb->cbufs[0].nr_samples : 0);
+   key->color_count = MIN2(fb->nr_cbufs, PIPE_MAX_COLOR_BUFS);
+   for (unsigned i = 0; i < key->color_count; i++)
+      key->color[i] = sz_vk_format(ctx->screen, fb->cbufs[i].format);
+   key->depth = fb->zsbuf.texture
+                   ? sz_vk_format(ctx->screen, fb->zsbuf.format)
+                   : VK_FORMAT_UNDEFINED;
+}
 
-   /* The whole vertex fetch layout, not just the first attribute: a draw whose
-    * second buffer has a different stride or format needs a different pipeline,
-    * and reusing the old one reads the vertices as the wrong type without any
-    * Vulkan error. */
-   VkVertexInputBindingDescription bindings[PIPE_MAX_ATTRIBS];
-   VkVertexInputAttributeDescription attributes[PIPE_MAX_ATTRIBS];
-   unsigned binding_count = 0, attribute_count = 0;
-   sz_pipeline_vertex_input(ctx, bindings, &binding_count, attributes,
-                            &attribute_count);
-
-   if (p->key.vertex_binding_count != binding_count ||
-       p->key.vertex_attribute_count != attribute_count)
-      return false;
-   if (memcmp(p->key.vertex_bindings, bindings,
-              binding_count * sizeof(bindings[0])) != 0)
-      return false;
-   if (memcmp(p->key.vertex_attributes, attributes,
-              attribute_count * sizeof(attributes[0])) != 0)
-      return false;
-
-   const VkSampleCountFlagBits samples =
-      sz_vk_sample_count(fb->nr_cbufs ? fb->cbufs[0].nr_samples : 0);
-   if (p->key.samples != samples)
-      return false;
-
-   if (p->key.color_count != MIN2(fb->nr_cbufs, PIPE_MAX_COLOR_BUFS))
-      return false;
-
-   for (unsigned i = 0; i < p->key.color_count; i++) {
-      if (p->key.color[i] != sz_vk_format(ctx->screen, fb->cbufs[i].format))
-         return false;
-   }
-
-   const VkFormat depth = fb->zsbuf.texture
-                             ? sz_vk_format(ctx->screen, fb->zsbuf.format)
-                             : VK_FORMAT_UNDEFINED;
-   return p->key.depth == depth;
+/* The hash is only a lookup accelerator; this is the authoritative comparison. */
+static bool
+sz_pipeline_key_equal(const struct sz_pipeline_key *a,
+                      const struct sz_pipeline_key *b)
+{
+   return a->blend == b->blend && a->rasterizer == b->rasterizer &&
+          a->dsa == b->dsa && a->vs == b->vs && a->fs == b->fs &&
+          a->topology == b->topology && a->samples == b->samples &&
+          a->color_count == b->color_count && a->depth == b->depth &&
+          a->vertex_binding_count == b->vertex_binding_count &&
+          a->vertex_attribute_count == b->vertex_attribute_count &&
+          memcmp(a->color, b->color,
+                 b->color_count * sizeof(b->color[0])) == 0 &&
+          memcmp(a->vertex_bindings, b->vertex_bindings,
+                 b->vertex_binding_count * sizeof(b->vertex_bindings[0])) == 0 &&
+          memcmp(a->vertex_attributes, b->vertex_attributes,
+                 b->vertex_attribute_count *
+                    sizeof(b->vertex_attributes[0])) == 0;
 }
 
 struct sz_gfx_pipeline *
 sz_pipeline_get(struct sz_context *ctx, VkPrimitiveTopology topology)
 {
-   if (!ctx->pipeline) {
-      ctx->pipeline = CALLOC_STRUCT(sz_gfx_pipeline);
-      if (!ctx->pipeline)
-         return NULL;
+   struct sz_pipeline_cache *cache = &ctx->pipelines;
+   struct sz_pipeline_key key;
+
+   sz_pipeline_key_from_state(ctx, topology, &key);
+   const uint64_t hash = sz_hash_bytes(0, &key, sizeof(key));
+
+   unsigned free_slot = SZ_MAX_CACHED_PIPELINES;
+   struct sz_gfx_pipeline *victim = NULL;
+   unsigned victim_slot = 0;
+
+   for (unsigned i = 0; i < SZ_MAX_CACHED_PIPELINES; i++) {
+      struct sz_gfx_pipeline *p = cache->entries[i];
+      if (!p) {
+         if (free_slot == SZ_MAX_CACHED_PIPELINES)
+            free_slot = i;
+         continue;
+      }
+
+      if (p->hash == hash && sz_pipeline_key_equal(&p->key, &key)) {
+         p->last_use = ++cache->clock;
+         return p;
+      }
+
+      /* Never evict the pipeline the command buffer has bound. Everything else
+       * is safe to retire: the destroy is deferred until the submission that
+       * may reference it has completed. */
+      if (p != ctx->pipeline && (!victim || p->last_use < victim->last_use)) {
+         victim = p;
+         victim_slot = i;
+      }
    }
 
-   if (sz_pipeline_key_matches(ctx->pipeline, ctx, topology))
-      return ctx->pipeline;
+   if (free_slot != SZ_MAX_CACHED_PIPELINES) {
+      victim = NULL;
+      victim_slot = free_slot;
+   } else if (!victim) {
+      /* Every slot holds the bound pipeline. Cannot happen with a cache larger
+       * than one, but returning NULL beats destroying something in use. */
+      return NULL;
+   }
 
-   sz_pipeline_reclaim(ctx);
-   sz_pipeline_retire(ctx, ctx->pipeline);
+   if (victim) {
+      sz_pipeline_reclaim(ctx);
+      sz_pipeline_retire(ctx, victim);
+      cache->entries[victim_slot] = NULL;
+      cache->count--;
+      free(victim);
+   }
 
-   if (!sz_pipeline_build(ctx, ctx->pipeline, topology))
+   struct sz_gfx_pipeline *p = CALLOC_STRUCT(sz_gfx_pipeline);
+   if (!p)
       return NULL;
 
-   return ctx->pipeline;
+   if (!sz_pipeline_build(ctx, p, topology)) {
+      free(p);
+      return NULL;
+   }
+
+   ctx->screen->stats.pipeline_builds++;
+
+   p->key = key;
+   p->hash = hash;
+   p->last_use = ++cache->clock;
+   cache->entries[victim_slot] = p;
+   cache->count++;
+
+   return p;
 }
 
 void
@@ -1010,10 +1033,101 @@ sz_pipeline_finish(struct sz_context *ctx)
    }
    ctx->num_retired = 0;
 
-   if (!ctx->pipeline)
-      return;
-
-   sz_pipeline_destroy_objects(ctx->screen, ctx->pipeline);
-   free(ctx->pipeline);
+   for (unsigned i = 0; i < SZ_MAX_CACHED_PIPELINES; i++) {
+      struct sz_gfx_pipeline *p = ctx->pipelines.entries[i];
+      if (!p)
+         continue;
+      sz_pipeline_destroy_objects(ctx->screen, p);
+      free(p);
+      ctx->pipelines.entries[i] = NULL;
+   }
+   ctx->pipelines.count = 0;
    ctx->pipeline = NULL;
+}
+
+/* A 64-bit FNV-1a over 64-bit words. Byte-at-a-time would spend ~300 ns on a
+ * pipeline key; the keys are zero-padded by their designated initialisers, so
+ * reading them as words is well defined. */
+uint64_t
+sz_hash_bytes(uint64_t hash, const void *data, size_t size)
+{
+   const uint8_t *bytes = data;
+
+   if (hash == 0)
+      hash = 0xcbf29ce484222325ull;
+
+   while (size >= sizeof(uint64_t)) {
+      uint64_t word;
+      memcpy(&word, bytes, sizeof(word));
+      hash ^= word;
+      hash *= 0x100000001b3ull;
+      bytes += sizeof(word);
+      size -= sizeof(word);
+   }
+
+   while (size--) {
+      hash ^= *bytes++;
+      hash *= 0x100000001b3ull;
+   }
+
+   return hash;
+}
+
+bool
+sz_pipeline_screen_init(struct sz_screen *screen)
+{
+   const VkDescriptorSetLayout set_layouts[] = {
+      screen->descriptor_set_layout,
+   };
+
+   /* No VkPipelineLayoutCreateFlagBits is needed: the push-descriptor bit lives
+    * on the descriptor set layout, and Vulkan 1.4 removed the pipeline layout
+    * requirement that used to exist in VK_KHR_push_descriptor. */
+   const VkPipelineLayoutCreateInfo layout_ci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = ARRAY_SIZE(set_layouts),
+      .pSetLayouts = set_layouts,
+   };
+   VkResult result = screen->vk.CreatePipelineLayout(screen->dev, &layout_ci,
+                                                     NULL,
+                                                     &screen->pipeline_layout);
+   if (result != VK_SUCCESS) {
+      mesa_loge("SZ: vkCreatePipelineLayout failed: %d", result);
+      return false;
+   }
+
+   const VkPipelineCacheCreateInfo cache_ci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+   };
+   result = screen->vk.CreatePipelineCache(screen->dev, &cache_ci, NULL,
+                                           &screen->pipeline_cache);
+   if (result != VK_SUCCESS) {
+      /* Not fatal: a driver may refuse a cache, and Vulkan explicitly allows
+       * VK_NULL_HANDLE to mean "no cache". Every pipeline still works, it just
+       * costs a recompile per unseen state. */
+      mesa_logw("SZ: vkCreatePipelineCache failed: %d; continuing without one",
+                result);
+      screen->pipeline_cache = VK_NULL_HANDLE;
+   }
+
+   return true;
+}
+
+void
+sz_pipeline_screen_finish(struct sz_screen *screen)
+{
+   if (screen->bootstrap_vs != VK_NULL_HANDLE)
+      screen->vk.DestroyShaderModule(screen->dev, screen->bootstrap_vs, NULL);
+   if (screen->bootstrap_fs != VK_NULL_HANDLE)
+      screen->vk.DestroyShaderModule(screen->dev, screen->bootstrap_fs, NULL);
+   if (screen->pipeline_cache != VK_NULL_HANDLE)
+      screen->vk.DestroyPipelineCache(screen->dev, screen->pipeline_cache, NULL);
+   if (screen->pipeline_layout != VK_NULL_HANDLE)
+      screen->vk.DestroyPipelineLayout(screen->dev, screen->pipeline_layout,
+                                       NULL);
+
+   screen->bootstrap_vs = VK_NULL_HANDLE;
+   screen->bootstrap_fs = VK_NULL_HANDLE;
+   screen->pipeline_cache = VK_NULL_HANDLE;
+   screen->pipeline_layout = VK_NULL_HANDLE;
 }

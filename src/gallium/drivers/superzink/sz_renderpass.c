@@ -130,6 +130,9 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
 void
 sz_renderpass_end(struct sz_context *ctx, VkCommandBuffer cmd)
 {
+   /* A render pass cannot be ended with draws still queued for it. */
+   sz_draw_flush(ctx);
+
    if (!ctx->rendering)
       return;
 

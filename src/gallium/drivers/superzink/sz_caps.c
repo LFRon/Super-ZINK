@@ -78,6 +78,8 @@ sz_vk_features_prepare(struct sz_vk_features *f, uint32_t api_version)
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
    f->image_int64.sType =
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT;
+   f->multi_draw.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT;
 
    (void)api_version;
 }
@@ -125,6 +127,8 @@ sz_vk_features_link(struct sz_vk_features *f, uint32_t api_version,
       sz_chain(&head, &tail, &f->fsr);
    if (sel->shader_image_int64)
       sz_chain(&head, &tail, &f->image_int64);
+   if (sel->multi_draw)
+      sz_chain(&head, &tail, &f->multi_draw);
 
    features2->pNext = head;
 }
@@ -192,6 +196,8 @@ sz_caps_init(struct sz_caps *caps,
                                                  VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME),
       .shader_image_int64 = sz_ext_advertised(exts, ext_count,
                                               VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME),
+      .multi_draw = sz_ext_advertised(exts, ext_count,
+                                      VK_EXT_MULTI_DRAW_EXTENSION_NAME),
    };
 
    struct sz_vk_features q;
@@ -233,8 +239,13 @@ sz_caps_init(struct sz_caps *caps,
          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
          .pNext = &push,
       };
+      VkPhysicalDeviceMultiDrawPropertiesEXT multi = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT,
+      };
+      push.pNext = &multi;
       get_props2(pdev, &query);
       caps->max_push_descriptors = push.maxPushDescriptors;
+      caps->max_multi_draw_count = multi.maxMultiDrawCount;
    }
 
    /* ── resolve every listed capability ───────────────────────────────────── */

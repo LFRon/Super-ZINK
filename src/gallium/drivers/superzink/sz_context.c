@@ -29,6 +29,7 @@
 #include "util/format/u_format.h"
 #include "util/log.h"
 #include "util/macros.h"
+#include "util/u_atomic.h"
 #include "util/u_inlines.h"
 #include "util/u_surface.h"
 #include "util/u_upload_mgr.h"
@@ -148,8 +149,23 @@ sz_context_cmd(struct sz_context *ctx)
       ctx->batch = sz_batch_begin(&ctx->screen->batch_state);
       if (!ctx->batch)
          return VK_NULL_HANDLE;
+
+      /* A new command buffer inherits none of the previous one's bindings, so
+       * every piece of state has to be re-emitted before the next draw. This is
+       * the only place where the dirty mask is set wholesale. */
+      ctx->dirty = SZ_DIRTY_ALL;
+      ctx->pipeline = NULL;
    }
    return ctx->batch->cmd;
+}
+
+/* Common prologue of every state setter: close the draw batch recorded under the
+ * old state, mark what has to be re-emitted, and advance the epoch (ADR-005b). */
+static void
+sz_state_changed(struct sz_context *ctx, unsigned dirty)
+{
+   sz_draw_flush(ctx);
+   ctx->dirty |= dirty;
 }
 
 /* For commands Vulkan forbids inside a render pass: clears, copies and
@@ -169,6 +185,10 @@ sz_context_cmd_no_pass(struct sz_context *ctx)
 static void
 sz_context_submit(struct sz_context *ctx)
 {
+   /* Draws are queued, not recorded, so a submission has to drain them even when
+    * no command buffer has been acquired yet. */
+   sz_draw_flush(ctx);
+
    if (!ctx->batch)
       return;
 
@@ -182,8 +202,10 @@ sz_context_submit(struct sz_context *ctx)
    if (!sz_batch_end(batch))
       return;
 
-   if (sz_batch_submit(batch, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT))
+   if (sz_batch_submit(batch, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT)) {
+      ctx->screen->stats.submits++;
       sz_pipeline_note_submit(ctx);
+   }
 }
 
 static void
@@ -205,6 +227,27 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
     * Without it the compositor can sample a surface the GPU is still writing. */
    if (flags & PIPE_FLUSH_END_OF_FRAME) {
       sz_queue_wait_idle(&ctx->screen->batch_state);
+
+      /* SZ_DEBUG=stats: a periodic snapshot, because an app killed with
+       * SIGTERM never reaches context destroy. */
+      if (sz_debug_enabled(SZ_DEBUG_STATS)) {
+         static unsigned frames;
+         if (++frames % 120 == 0) {
+            const struct sz_screen *screen = ctx->screen;
+            mesa_logi("SZ: stats: draws=%" PRIu64 " batches=%" PRIu64
+                      " (multi %" PRIu64 ") pipeline_binds=%" PRIu64
+                      " pipeline_builds=%" PRIu64 " descriptor_pushes=%" PRIu64
+                      " vb_binds=%" PRIu64 " state_sets=%" PRIu64
+                      " submits=%" PRIu64,
+                      screen->stats.draws, screen->stats.batches,
+                      screen->stats.multi_batches, screen->stats.pipeline_binds,
+                      screen->stats.pipeline_builds,
+                      screen->stats.descriptor_pushes,
+                      screen->stats.vertex_buffer_binds,
+                      screen->stats.state_sets, screen->stats.submits);
+         }
+      }
+
       /* The queue just went idle, so every retired resource whose submission has
        * completed can be torn down. Doing it here rather than only on the next
        * destroy keeps the table from filling up during a long run. */
@@ -216,12 +259,16 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
 /* State objects                                                              */
 /* ------------------------------------------------------------------------- */
 
+static uint64_t sz_state_id;
+
 static struct sz_state *
 sz_state_alloc(enum sz_state_kind kind)
 {
    struct sz_state *state = CALLOC_STRUCT(sz_state);
-   if (state)
+   if (state) {
       state->kind = kind;
+      state->id = p_atomic_inc_return(&sz_state_id);
+   }
    return state;
 }
 
@@ -337,6 +384,7 @@ static void
 sz_bind_blend_state(struct pipe_context *pipe, void *opaque)
 {
    struct sz_context *ctx = sz_context(pipe);
+   sz_state_changed(ctx, SZ_DIRTY_PIPELINE);
    if (opaque)
       sz_bind_typed(ctx, opaque);
    else
@@ -347,6 +395,11 @@ static void
 sz_bind_rasterizer_state(struct pipe_context *pipe, void *opaque)
 {
    struct sz_context *ctx = sz_context(pipe);
+   /* The scissor *enable* lives in the rasterizer state, and Vulkan has no way
+    * to disable a scissor rectangle: the last one stays in effect until it is
+    * replaced. Turning GL_SCISSOR_TEST off therefore has to re-emit the full
+    * surface scissor. */
+   sz_state_changed(ctx, SZ_DIRTY_PIPELINE | SZ_DIRTY_SCISSOR);
    if (opaque)
       sz_bind_typed(ctx, opaque);
    else
@@ -357,6 +410,7 @@ static void
 sz_bind_depth_stencil_alpha_state(struct pipe_context *pipe, void *opaque)
 {
    struct sz_context *ctx = sz_context(pipe);
+   sz_state_changed(ctx, SZ_DIRTY_PIPELINE);
    if (opaque)
       sz_bind_typed(ctx, opaque);
    else
@@ -367,6 +421,7 @@ static void
 sz_bind_vertex_elements_state(struct pipe_context *pipe, void *opaque)
 {
    struct sz_context *ctx = sz_context(pipe);
+   sz_state_changed(ctx, SZ_DIRTY_PIPELINE);
    if (opaque)
       sz_bind_typed(ctx, opaque);
    else
@@ -813,6 +868,10 @@ sz_clear_rect(struct sz_context *ctx, unsigned attachment, bool depth_stencil,
               VkImageAspectFlags aspects, const VkClearValue *value,
               unsigned x, unsigned y, unsigned width, unsigned height)
 {
+   /* The clear belongs after everything recorded so far and before everything
+    * that follows, so the queued draws have to be emitted first. */
+   sz_draw_flush(ctx);
+
    VkCommandBuffer cmd = sz_context_cmd(ctx);
    if (cmd == VK_NULL_HANDLE)
       return false;
@@ -1180,19 +1239,25 @@ static void sz_stub_void(void) {}
 static void
 sz_set_blend_color(struct pipe_context *pipe, const struct pipe_blend_color *c)
 {
-   sz_context(pipe)->state.blend_color = *c;
+   struct sz_context *ctx = sz_context(pipe);
+   sz_state_changed(ctx, SZ_DIRTY_BLEND_CONST);
+   ctx->state.blend_color = *c;
 }
 
 static void
 sz_set_stencil_ref(struct pipe_context *pipe, const struct pipe_stencil_ref ref)
 {
-   sz_context(pipe)->state.stencil_ref = ref;
+   struct sz_context *ctx = sz_context(pipe);
+   sz_state_changed(ctx, SZ_DIRTY_STENCIL_REF);
+   ctx->state.stencil_ref = ref;
 }
 
 static void
 sz_set_sample_mask(struct pipe_context *pipe, unsigned mask)
 {
-   sz_context(pipe)->state.sample_mask = mask;
+   struct sz_context *ctx = sz_context(pipe);
+   sz_state_changed(ctx, SZ_DIRTY_PIPELINE);
+   ctx->state.sample_mask = mask;
 }
 
 static void
@@ -1201,6 +1266,9 @@ sz_set_framebuffer_state(struct pipe_context *pipe,
 {
    struct sz_context *ctx = sz_context(pipe);
    const struct pipe_framebuffer_state *cur = &ctx->state.framebuffer;
+
+   /* The pending batch belongs to the old attachments. */
+   sz_draw_flush(ctx);
 
    /* A dynamic rendering instance names concrete views, so it cannot be
     * retargeted: changing the attachments mid-pass has to close it. */
@@ -1220,8 +1288,10 @@ sz_set_framebuffer_state(struct pipe_context *pipe,
    }
 
    /* pipe_framebuffer_state holds the surfaces by value in this Mesa version, so
-    * a struct copy is the whole update. */
+    * a struct copy is the whole update. Formats are part of the pipeline, so the
+    * dirty mask is wholesale. */
    ctx->state.framebuffer = *fb;
+   ctx->dirty |= SZ_DIRTY_ALL;
 }
 
 static void
@@ -1231,6 +1301,7 @@ sz_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
 {
    struct sz_context *ctx = sz_context(pipe);
 
+   sz_state_changed(ctx, SZ_DIRTY_VIEWPORT);
    for (unsigned i = 0; i < num_viewports; i++) {
       const unsigned slot = start_slot + i;
       if (slot >= PIPE_MAX_VIEWPORTS)
@@ -1248,6 +1319,7 @@ sz_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
 {
    struct sz_context *ctx = sz_context(pipe);
 
+   sz_state_changed(ctx, SZ_DIRTY_SCISSOR);
    for (unsigned i = 0; i < num_scissors; i++) {
       const unsigned slot = start_slot + i;
       if (slot >= PIPE_MAX_VIEWPORTS)
@@ -1268,6 +1340,7 @@ sz_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
    if (shader >= MESA_SHADER_STAGES)
       return;
 
+   sz_state_changed(ctx, SZ_DIRTY_DESCRIPTORS);
    for (unsigned i = 0; i < num_views; i++) {
       const unsigned slot = start_slot + i;
       if (slot >= PIPE_MAX_SAMPLERS)
@@ -1285,6 +1358,7 @@ sz_bind_sampler_states(struct pipe_context *pipe, mesa_shader_stage shader,
    if (shader >= MESA_SHADER_STAGES)
       return;
 
+   sz_state_changed(ctx, SZ_DIRTY_DESCRIPTORS);
    for (unsigned i = 0; i < num_samplers; i++) {
       const unsigned slot = start_slot + i;
       if (slot >= PIPE_MAX_SAMPLERS)
@@ -1299,6 +1373,7 @@ sz_bind_shader_state(struct pipe_context *pipe, mesa_shader_stage stage,
                      void *opaque)
 {
    struct sz_context *ctx = sz_context(pipe);
+   sz_state_changed(ctx, SZ_DIRTY_PIPELINE);
    if (stage < MESA_SHADER_STAGES)
       ctx->state.shaders[stage] = opaque;
 }
@@ -1364,6 +1439,8 @@ sz_set_constant_buffer(struct pipe_context *pipe, mesa_shader_stage shader,
 
    struct pipe_constant_buffer *dst = &ctx->state.constant_buffers[shader][index];
 
+   sz_state_changed(ctx, SZ_DIRTY_DESCRIPTORS);
+
    if (!buf || (!buf->buffer && !buf->user_buffer)) {
       pipe_resource_reference(&dst->buffer, NULL);
       dst->buffer_offset = 0;
@@ -1404,6 +1481,8 @@ sz_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
                       const struct pipe_vertex_buffer *buffers)
 {
    struct sz_context *ctx = sz_context(pipe);
+
+   sz_state_changed(ctx, SZ_DIRTY_VERTEX_BUFFERS);
 
    const unsigned n = MIN2(count, PIPE_MAX_ATTRIBS);
    if (n)
@@ -1474,8 +1553,11 @@ sz_set_stream_output_targets(struct pipe_context *pipe, unsigned num_targets,
  *
  * Clamping happens in template: Gallium's viewport z is 0..1 already (GL's
  * glDepthRange is folded in by the state tracker), so no remap is needed. */
+/* The state emitters. Each one is called only when its dirty bit is set, which
+ * is what turns a draw from nine unconditional vkCmd calls into one. */
+
 static void
-sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
+sz_emit_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
 {
    const struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
 
@@ -1505,6 +1587,14 @@ sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
       viewport.maxDepth = vp->translate[2] + vp->scale[2];
    }
 
+   ctx->screen->vk.CmdSetViewport(cmd, 0, 1, &viewport);
+}
+
+static void
+sz_emit_scissor(struct sz_context *ctx, VkCommandBuffer cmd)
+{
+   const struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
+
    VkRect2D scissor = {
       .offset = { 0, 0 },
       .extent = { fb->width, fb->height },
@@ -1513,8 +1603,7 @@ sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
    /* The scissor rects are only meaningful while glScissor's test is on, and the
     * state tracker keeps sending them after it is switched off. Applying the
     * last rect regardless clips every later draw to a stale rectangle, which
-    * renders as "everything after a scissored draw is missing". The enable is
-    * part of the rasterizer state, not of the rects. */
+    * renders as "everything after a scissored draw is missing". */
    const struct sz_state *rast_state = ctx->state.rasterizer;
    const bool scissor_test = rast_state && rast_state->u.rasterizer.scissor;
    if (scissor_test && ctx->state.num_scissors > 0) {
@@ -1525,26 +1614,48 @@ sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
       scissor.extent.height = sc->maxy - sc->miny;
    }
 
+   /* A zero-sized scissor rejects every fragment; Vulkan forbids the extent,
+    * so the draw is simply not recorded. */
    if (scissor.extent.width == 0 || scissor.extent.height == 0)
       return;
 
-   ctx->screen->vk.CmdSetViewport(cmd, 0, 1, &viewport);
    ctx->screen->vk.CmdSetScissor(cmd, 0, 1, &scissor);
+}
 
-   /* glBlendColor is dynamic in Vulkan, so it is set per draw rather than baked
-    * into the pipeline. */
-   if (ctx->screen->vk.CmdSetBlendConstants) {
-      const struct pipe_blend_color *bc = &ctx->state.blend_color;
-      const float constants[4] = { bc->color[0], bc->color[1], bc->color[2],
-                                   bc->color[3] };
-      ctx->screen->vk.CmdSetBlendConstants(cmd, constants);
-   }
+static bool
+sz_scissor_is_empty(const struct sz_context *ctx)
+{
+   const struct sz_state *rast_state = ctx->state.rasterizer;
+   if (!rast_state || !rast_state->u.rasterizer.scissor ||
+       ctx->state.num_scissors == 0)
+      return false;
 
-   /* Same for the stencil reference. Core Vulkan can only set one value for both
-    * faces; Gallium carries two (GL_STENCIL_BACK_REF from glStencilFuncSeparate)
-    * and the driver has no VK_EXT_extended_dynamic_state yet to split them. Two
-    * different values are rare enough that saying so once is better than silently
-    * using the front one. */
+   const struct pipe_scissor_state *sc = &ctx->state.scissors[0];
+   return sc->maxx == sc->minx || sc->maxy == sc->miny;
+}
+
+static void
+sz_emit_blend_const(struct sz_context *ctx, VkCommandBuffer cmd)
+{
+   /* glBlendColor is dynamic in Vulkan, so it is set when it changes rather than
+    * baked into the pipeline. */
+   if (!ctx->screen->vk.CmdSetBlendConstants)
+      return;
+
+   const struct pipe_blend_color *bc = &ctx->state.blend_color;
+   const float constants[4] = { bc->color[0], bc->color[1], bc->color[2],
+                                bc->color[3] };
+   ctx->screen->vk.CmdSetBlendConstants(cmd, constants);
+}
+
+static void
+sz_emit_stencil_ref(struct sz_context *ctx, VkCommandBuffer cmd)
+{
+   /* Core Vulkan can only set one value for both faces; Gallium carries two
+    * (GL_STENCIL_BACK_REF from glStencilFuncSeparate) and the driver has no
+    * VK_EXT_extended_dynamic_state yet to split them. Two different values are
+    * rare enough that saying so once is better than silently using the front
+    * one. */
    const unsigned ref = ctx->state.stencil_ref.ref_value[0];
    if (ctx->state.stencil_ref.ref_value[1] != ref)
       sz_warn_once("per-face stencil reference values need "
@@ -1591,6 +1702,275 @@ sz_topology(enum mesa_prim mode)
    }
 }
 
+/* ── Draw stream ─────────────────────────────────────────────────────────── */
+
+static void
+sz_emit_draws(struct sz_context *ctx, VkCommandBuffer cmd)
+{
+   const unsigned n = ctx->pending.count;
+
+   if (n == 0)
+      return;
+
+   ctx->screen->stats.draws += n;
+   ctx->screen->stats.batches++;
+
+   /* One call for the whole batch. The data is a plain host array: Vulkan copies
+    * it into the command stream while recording, so there is nothing to keep
+    * alive afterwards. */
+   if (n > 1 && ctx->screen->max_multi_draw_count > 0) {
+      ctx->screen->stats.multi_batches++;
+      if (ctx->pending.indexed) {
+         VkMultiDrawIndexedInfoEXT info[SZ_MAX_BATCHED_DRAWS];
+         for (unsigned i = 0; i < n; i++) {
+            info[i].firstIndex = ctx->pending.draws[i].first;
+            info[i].indexCount = ctx->pending.draws[i].count;
+            info[i].vertexOffset = ctx->pending.draws[i].index_bias;
+         }
+         /* (cmd, drawCount, pIndexInfo, instanceCount, firstInstance, stride,
+          * pVertexOffset); a NULL offset means "use vertexOffset from each
+          * VkMultiDrawIndexedInfoEXT". */
+         ctx->screen->vk.CmdDrawMultiIndexedEXT(cmd, n, info,
+                                                ctx->pending.instance_count,
+                                                ctx->pending.start_instance,
+                                                sizeof(info[0]), NULL);
+      } else {
+         VkMultiDrawInfoEXT info[SZ_MAX_BATCHED_DRAWS];
+         for (unsigned i = 0; i < n; i++) {
+            info[i].firstVertex = ctx->pending.draws[i].first;
+            info[i].vertexCount = ctx->pending.draws[i].count;
+         }
+         ctx->screen->vk.CmdDrawMultiEXT(cmd, n, info,
+                                         ctx->pending.instance_count,
+                                         ctx->pending.start_instance,
+                                         sizeof(info[0]));
+      }
+      return;
+   }
+
+   /* No VK_EXT_multi_draw (or a batch of one): one command per draw. */
+   for (unsigned i = 0; i < n; i++) {
+      const uint32_t count = ctx->pending.draws[i].count;
+      const uint32_t first = ctx->pending.draws[i].first;
+      const int32_t index_bias = ctx->pending.draws[i].index_bias;
+
+      if (ctx->pending.indexed)
+         ctx->screen->vk.CmdDrawIndexed(cmd, count,
+                                        ctx->pending.instance_count, first,
+                                        index_bias,
+                                        ctx->pending.start_instance);
+      else
+         ctx->screen->vk.CmdDraw(cmd, count, ctx->pending.instance_count,
+                                 first, ctx->pending.start_instance);
+   }
+}
+
+void
+sz_draw_flush(struct sz_context *ctx)
+{
+   if (ctx->pending.count == 0)
+      return;
+
+   VkCommandBuffer cmd = sz_context_cmd(ctx);
+   if (cmd == VK_NULL_HANDLE) {
+      ctx->pending.count = 0;
+      return;
+   }
+
+   /* A layout transition is illegal inside a render pass, so a batch whose
+    * descriptors changed may have to close it first. */
+   if ((ctx->dirty & SZ_DIRTY_DESCRIPTORS) && ctx->rendering &&
+       sz_descriptor_sampled_needs_transition(ctx)) {
+      ctx->screen->vk.CmdEndRendering(cmd);
+      ctx->rendering = false;
+   }
+
+   if (ctx->dirty & SZ_DIRTY_DESCRIPTORS)
+      sz_descriptor_prepare_sampled(ctx, cmd);
+
+   if (!ctx->rendering && !sz_renderpass_begin(ctx, cmd)) {
+      ctx->pending.count = 0;
+      ctx->dirty = 0;
+      return;
+   }
+
+   if (ctx->dirty & SZ_DIRTY_PIPELINE) {
+      struct sz_gfx_pipeline *p = sz_pipeline_get(ctx, ctx->pending.topology);
+      if (!p) {
+         ctx->pending.count = 0;
+         ctx->dirty = 0;
+         return;
+      }
+      if (p != ctx->pipeline) {
+         ctx->screen->vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                         p->pipeline);
+         ctx->pipeline = p;
+         ctx->screen->stats.pipeline_binds++;
+      }
+      ctx->dirty &= ~SZ_DIRTY_PIPELINE;
+   }
+
+   if (ctx->dirty & SZ_DIRTY_DESCRIPTORS) {
+      sz_descriptor_push(ctx, cmd);
+      ctx->screen->stats.descriptor_pushes++;
+      ctx->dirty &= ~SZ_DIRTY_DESCRIPTORS;
+   }
+
+   /* Barriers are emitted for every batch, not only when a binding changes.
+    *
+    * The uploaders write new data into a buffer that is already bound -- the
+    * binding (resource + offset) can be identical while the contents behind it
+    * were rewritten since the last draw. Emitting the write-to-read barrier only
+    * on a binding change therefore leaves a window in which the GPU reads
+    * vertices that the CPU has already overwritten, which shows up as
+    * intermittent garbage geometry. The loop is a handful of pointer checks per
+    * batch, not per draw. */
+   for (unsigned i = 0; i < ctx->state.num_vertex_buffers; i++) {
+      const struct pipe_vertex_buffer *vb = &ctx->state.vertex_buffers[i];
+      if (vb->is_user_buffer || !vb->buffer.resource)
+         continue;
+      struct sz_resource *vres = sz_resource(vb->buffer.resource);
+      if (vres->buffer == VK_NULL_HANDLE)
+         continue;
+      sz_resource_access(ctx->screen, cmd, vres, SZ_ACCESS_VERTEX_BUFFER);
+   }
+
+   for (unsigned st = 0; st < MESA_SHADER_STAGES; st++) {
+      for (unsigned i = 0; i < SZ_MAX_CONST_BUFFERS; i++) {
+         const struct pipe_constant_buffer *cb =
+            &ctx->state.constant_buffers[st][i];
+         if (!cb->buffer)
+            continue;
+         struct sz_resource *cres = sz_resource(cb->buffer);
+         if (cres->buffer == VK_NULL_HANDLE)
+            continue;
+         sz_resource_access(ctx->screen, cmd, cres, SZ_ACCESS_UNIFORM_BUFFER);
+      }
+   }
+
+   if (ctx->dirty & SZ_DIRTY_VERTEX_BUFFERS) {
+      /* Every slot the frontend bound, not just slot 0: a shader reading two
+       * attributes has two vertex buffers, and binding only the first leaves the
+       * rest undefined. A slot with no resource behind it is left unbound, which
+       * is legal as long as no shader input reads it. */
+      for (unsigned i = 0; i < ctx->state.num_vertex_buffers; i++) {
+         const struct pipe_vertex_buffer *vb = &ctx->state.vertex_buffers[i];
+         if (vb->is_user_buffer || !vb->buffer.resource)
+            continue;
+
+         struct sz_resource *vres = sz_resource(vb->buffer.resource);
+         if (vres->buffer == VK_NULL_HANDLE)
+            continue;
+
+         const VkDeviceSize offset = vb->buffer_offset;
+         ctx->screen->vk.CmdBindVertexBuffers(cmd, i, 1, &vres->buffer, &offset);
+         ctx->screen->stats.vertex_buffer_binds++;
+      }
+      ctx->dirty &= ~SZ_DIRTY_VERTEX_BUFFERS;
+   }
+
+   if (ctx->pending.indexed && ctx->pending.index_buffer)
+      sz_resource_access(ctx->screen, cmd, ctx->pending.index_buffer,
+                         SZ_ACCESS_INDEX_BUFFER);
+
+   if (ctx->dirty & SZ_DIRTY_INDEX_BUFFER) {
+      if (ctx->pending.indexed && ctx->pending.index_buffer) {
+         ctx->screen->vk.CmdBindIndexBuffer(cmd, ctx->pending.index_buffer->buffer,
+                                            ctx->pending.index_offset,
+                                            ctx->pending.index_type);
+      }
+      ctx->dirty &= ~SZ_DIRTY_INDEX_BUFFER;
+   }
+
+   /* A zero-sized scissor rejects every fragment, and Vulkan forbids the extent
+    * itself. The state is still emitted; only the draws are dropped. */
+   const bool scissor_empty = sz_scissor_is_empty(ctx);
+
+   if (ctx->dirty & SZ_DIRTY_VIEWPORT) {
+      sz_emit_viewport(ctx, cmd);
+      ctx->screen->stats.state_sets++;
+   }
+   if (ctx->dirty & SZ_DIRTY_SCISSOR) {
+      sz_emit_scissor(ctx, cmd);
+      ctx->screen->stats.state_sets++;
+   }
+   if (ctx->dirty & SZ_DIRTY_BLEND_CONST) {
+      sz_emit_blend_const(ctx, cmd);
+      ctx->screen->stats.state_sets++;
+   }
+   if (ctx->dirty & SZ_DIRTY_STENCIL_REF) {
+      sz_emit_stencil_ref(ctx, cmd);
+      ctx->screen->stats.state_sets++;
+   }
+
+   if (!scissor_empty)
+      sz_emit_draws(ctx, cmd);
+
+   ctx->dirty = 0;
+   ctx->pending.count = 0;
+}
+
+static bool
+sz_pending_compatible(const struct sz_context *ctx, bool indexed,
+                      VkPrimitiveTopology topology, int32_t instance_count,
+                      uint32_t start_instance, const struct sz_resource *index,
+                      VkIndexType type)
+{
+   if (ctx->pending.count == 0)
+      return true;
+   if (ctx->pending.indexed != indexed || ctx->pending.topology != topology)
+      return false;
+   if (ctx->pending.instance_count != instance_count ||
+       ctx->pending.start_instance != start_instance)
+      return false;
+   if (indexed &&
+       (ctx->pending.index_buffer != index || ctx->pending.index_type != type))
+      return false;
+   return true;
+}
+
+static void
+sz_draw_append(struct sz_context *ctx, const struct pipe_draw_info *info,
+               const struct pipe_draw_start_count_bias *draws, unsigned num_draws,
+               struct sz_resource *index, VkIndexType type)
+{
+   const bool indexed = info->index_size != 0;
+   const VkPrimitiveTopology topology = sz_topology(info->mode);
+
+   if (!sz_pending_compatible(ctx, indexed, topology,
+                              (int32_t)info->instance_count,
+                              info->start_instance, index, type))
+      sz_draw_flush(ctx);
+
+   if (ctx->pending.count == 0) {
+      ctx->pending.indexed = indexed;
+      ctx->pending.instance_count = (int32_t)info->instance_count;
+      ctx->pending.start_instance = info->start_instance;
+      ctx->pending.topology = topology;
+      ctx->pending.index_buffer = index;
+      ctx->pending.index_type = type;
+      ctx->pending.index_offset = 0;
+      /* The index binding is part of the batch, so it is re-emitted whenever a
+       * new batch starts. */
+      ctx->dirty |= SZ_DIRTY_INDEX_BUFFER | SZ_DIRTY_PIPELINE;
+   }
+
+   for (unsigned i = 0; i < num_draws; i++) {
+      if (draws[i].count == 0)
+         continue;
+
+      if (ctx->pending.count == ctx->pending.capacity)
+         sz_draw_flush(ctx);
+
+      /* After a flush the ring is empty and the batch parameters are already
+       * correct: the flush drained exactly this state. */
+      ctx->pending.draws[ctx->pending.count].count = draws[i].count;
+      ctx->pending.draws[ctx->pending.count].first = draws[i].start;
+      ctx->pending.draws[ctx->pending.count].index_bias = draws[i].index_bias;
+      ctx->pending.count++;
+   }
+}
+
 static void
 sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset,
@@ -1615,25 +1995,9 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
    }
 
-   VkCommandBuffer cmd = sz_context_cmd(ctx);
-   if (cmd == VK_NULL_HANDLE)
-      return;
-
-   /* Sampled images have to reach SHADER_READ_ONLY_OPTIMAL before the render pass
-    * opens: a layout transition inside one is illegal, and a texture bound
-    * between two draws is in whatever layout its last user left it. Closing the
-    * pass to do it costs two commands and only happens when a new image appears. */
-   if (ctx->rendering && sz_descriptor_sampled_needs_transition(ctx))
-      sz_renderpass_end(ctx, cmd);
-   sz_descriptor_prepare_sampled(ctx, cmd);
-
-   if (!ctx->rendering && !sz_renderpass_begin(ctx, cmd))
-      return;
-
-   /* The index buffer is part of pipe_draw_info, not context state, so it is
-    * bound per draw. Binding it when it has not changed is what Phase 3's state
-    * tracker removes; Phase 1 correctness first. */
    struct sz_resource *index = NULL;
+   VkIndexType type = VK_INDEX_TYPE_UINT16;
+
    if (info->index_size) {
       if (info->has_user_indices) {
          sz_warn_once("user index buffers are not implemented, ignoring");
@@ -1642,63 +2006,11 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       index = sz_resource(info->index.resource);
       if (!index || index->buffer == VK_NULL_HANDLE)
          return;
-
-      sz_resource_access(ctx->screen, cmd, index, SZ_ACCESS_INDEX_BUFFER);
-
-      const VkIndexType type = info->index_size == 4 ? VK_INDEX_TYPE_UINT32
-                                                     : VK_INDEX_TYPE_UINT16;
-      ctx->screen->vk.CmdBindIndexBuffer(cmd, index->buffer, 0, type);
+      type = info->index_size == 4 ? VK_INDEX_TYPE_UINT32
+                                   : VK_INDEX_TYPE_UINT16;
    }
 
-   const VkPrimitiveTopology topology = sz_topology(info->mode);
-
-   struct sz_gfx_pipeline *pipeline = sz_pipeline_get(ctx, topology);
-   if (!pipeline)
-      return;
-
-   ctx->screen->vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    pipeline->pipeline);
-
-   /* Constant buffers are pushed per draw, not per state change: a push goes
-    * into the command stream, so the cost is stream space and the correctness is
-    * trivial -- the descriptors a draw sees are the ones bound when it was
-    * recorded. */
-   sz_descriptor_push(ctx, cmd);
-
-   sz_draw_viewport(ctx, cmd);
-
-   /* Every slot the frontend bound, not just slot 0: a shader reading two
-    * attributes has two vertex buffers, and binding only the first leaves the
-    * rest undefined. A slot with no resource behind it is left unbound, which is
-    * legal as long as no shader input reads it. */
-   for (unsigned i = 0; i < ctx->state.num_vertex_buffers; i++) {
-      const struct pipe_vertex_buffer *vb = &ctx->state.vertex_buffers[i];
-      if (vb->is_user_buffer || !vb->buffer.resource)
-         continue;
-
-      struct sz_resource *vres = sz_resource(vb->buffer.resource);
-      if (vres->buffer == VK_NULL_HANDLE)
-         continue;
-
-      sz_resource_access(ctx->screen, cmd, vres, SZ_ACCESS_VERTEX_BUFFER);
-
-      const VkDeviceSize offset = vb->buffer_offset;
-      ctx->screen->vk.CmdBindVertexBuffers(cmd, i, 1, &vres->buffer, &offset);
-   }
-
-   for (unsigned i = 0; i < num_draws; i++) {
-      if (draws[i].count == 0)
-         continue;
-
-      if (info->index_size) {
-         ctx->screen->vk.CmdDrawIndexed(cmd, draws[i].count, info->instance_count,
-                                        draws[i].start, (int32_t)draws[i].index_bias,
-                                        info->start_instance);
-      } else {
-         ctx->screen->vk.CmdDraw(cmd, draws[i].count, info->instance_count,
-                                 draws[i].start, info->start_instance);
-      }
-   }
+   sz_draw_append(ctx, info, draws, num_draws, index, type);
 }
 
 static void
@@ -2194,6 +2506,20 @@ sz_context_destroy(struct pipe_context *pipe)
     * state tracker always calls. Freeing them again here was a double free --
     * and the sampler arrays are shared with sampler views, so it was also a
     * type-confused free. */
+   if (sz_debug_enabled(SZ_DEBUG_STATS)) {
+      const struct sz_screen *screen = ctx->screen;
+      mesa_logi("SZ: stats: draws=%" PRIu64 " batches=%" PRIu64
+                " (multi %" PRIu64 ") pipeline_binds=%" PRIu64
+                " pipeline_builds=%" PRIu64 " descriptor_pushes=%" PRIu64
+                " vb_binds=%" PRIu64 " state_sets=%" PRIu64
+                " submits=%" PRIu64,
+                screen->stats.draws, screen->stats.batches,
+                screen->stats.multi_batches, screen->stats.pipeline_binds,
+                screen->stats.pipeline_builds, screen->stats.descriptor_pushes,
+                screen->stats.vertex_buffer_binds, screen->stats.state_sets,
+                screen->stats.submits);
+   }
+
    ctx->screen->context_alive = false;
    free(ctx);
 }
@@ -2630,6 +2956,13 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    struct pipe_context *pipe = &ctx->base;
    pipe->screen = &screen->base;
    ctx->screen = screen;
+
+   /* The draw stream batches at most this many draws into one call. One means
+    * "no VK_EXT_multi_draw", in which case every append flushes immediately and
+    * the emit path falls back to one vkCmdDraw* per draw. */
+   ctx->pending.capacity =
+      MAX2(1u, MIN2((unsigned)SZ_MAX_BATCHED_DRAWS,
+                    screen->max_multi_draw_count));
 
    pipe->destroy = sz_context_destroy;
    pipe->flush = sz_context_flush;

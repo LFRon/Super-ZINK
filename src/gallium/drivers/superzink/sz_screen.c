@@ -19,6 +19,7 @@
 #include "sz_compiler.h"
 #include "sz_context.h"
 #include "sz_descriptor.h"
+#include "sz_pipeline.h"
 #include "sz_device.h"
 #include "sz_dmabuf.h"
 #include "sz_format.h"
@@ -445,6 +446,7 @@ sz_screen_destroy(struct pipe_screen *pscreen)
    /* The context destroyed the queue idle, so nothing can be reading a retired
     * resource any more. Tear them down while the device is still alive. */
    sz_resource_reclaim_all(screen);
+   sz_pipeline_screen_finish(screen);
    sz_descriptor_screen_finish(screen);
    sz_bo_finish(screen);
    sz_device_finish(screen);
@@ -520,6 +522,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * every pipeline references them, and a per-context copy would only add ways
     * for the two to disagree with the shaders' bindings. */
    if (!sz_descriptor_screen_init(screen, screen->caps.max_push_descriptors))
+      goto fail;
+
+   /* The pipeline layout and the VkPipelineCache depend only on the descriptor
+    * set layout, so they live on the screen (ADR-005c). */
+   if (!sz_pipeline_screen_init(screen))
       goto fail;
 
    if (!sz_queue_state_init(&screen->batch_state, screen,

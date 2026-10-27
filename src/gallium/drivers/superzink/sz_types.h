@@ -117,6 +117,11 @@ struct sz_vk_entrypoints {
    PFN_vkCmdDraw CmdDraw;
    PFN_vkCmdDrawIndexed CmdDrawIndexed;
    PFN_vkCmdClearAttachments CmdClearAttachments;
+   /* VK_EXT_multi_draw. NULL when the extension is not enabled, which is the
+    * only thing the draw stream checks before falling back to a loop of
+    * vkCmdDraw/vkCmdDrawIndexed. */
+   PFN_vkCmdDrawMultiEXT CmdDrawMultiEXT;
+   PFN_vkCmdDrawMultiIndexedEXT CmdDrawMultiIndexedEXT;
 
    /* Pipelines and shaders (sz_pipeline). */
    PFN_vkCreateShaderModule CreateShaderModule;
@@ -125,6 +130,8 @@ struct sz_vk_entrypoints {
    PFN_vkDestroyPipelineLayout DestroyPipelineLayout;
    PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines;
    PFN_vkDestroyPipeline DestroyPipeline;
+   PFN_vkCreatePipelineCache CreatePipelineCache;
+   PFN_vkDestroyPipelineCache DestroyPipelineCache;
 };
 
 /* Declared before struct sz_screen because sz_screen embeds them by value. */
@@ -208,6 +215,23 @@ struct sz_screen {
    /* One descriptor set layout per stage, indexed by descriptor set. */
    VkDescriptorSetLayout descriptor_set_layout;
 
+   /* Screen-owned objects every pipeline shares. The layout is immutable and
+    * depends only on the descriptor set layout, so a per-pipeline copy would be
+    * pure overhead -- and creating one per rebuild was most of the cost of a
+    * state change. */
+   VkPipelineLayout pipeline_layout;
+   VkPipelineCache pipeline_cache;
+
+   /* Shaders used when a draw has no program bound (the driver's own self
+    * tests). Created on first use, destroyed with the device. */
+   VkShaderModule bootstrap_vs;
+   VkShaderModule bootstrap_fs;
+
+   /* VK_EXT_multi_draw: how many draws one vkCmdDrawMultiEXT may carry. Zero
+    * means the extension is unavailable and the draw stream emits one command
+    * per draw. */
+   unsigned max_multi_draw_count;
+
    int drm_fd;
 
    /* Built once during screen creation: get_name() must be stable and
@@ -233,6 +257,20 @@ struct sz_screen {
    /* Set by the first dma-buf failure, so a missing capability is reported once
     * instead of on every allocation attempt. */
    bool dmabuf_warned;
+
+   /* SZ_DEBUG=stats counters. Cheap enough to leave enabled in release builds:
+    * each one is a single increment on a path that already does real work. */
+   struct {
+      uint64_t draws;            /* draw commands the app issued */
+      uint64_t batches;          /* draw batches that reached the command buffer */
+      uint64_t multi_batches;    /* batches that used one vkCmdDrawMulti* call */
+      uint64_t pipeline_binds;
+      uint64_t pipeline_builds;
+      uint64_t descriptor_pushes;
+      uint64_t vertex_buffer_binds;
+      uint64_t state_sets;       /* viewport/scissor/blend/stencil emissions */
+      uint64_t submits;
+   } stats;
 };
 
 static inline struct sz_screen *

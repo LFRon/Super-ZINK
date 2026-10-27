@@ -271,8 +271,10 @@ void
 sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd)
 {
    struct sz_screen *screen = ctx->screen;
-   const VkPipelineLayout layout = ctx->pipeline ? ctx->pipeline->layout
-                                                 : VK_NULL_HANDLE;
+   /* One layout for the whole screen (ADR-005c), so the push does not depend on
+    * which pipeline is bound -- only on the descriptor set layout, which never
+    * changes. */
+   const VkPipelineLayout layout = screen->pipeline_layout;
    if (layout == VK_NULL_HANDLE)
       return;
 

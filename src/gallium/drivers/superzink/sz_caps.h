@@ -117,7 +117,10 @@
       q.fsr.attachmentFragmentShadingRate))                                     \
    X(shader_image_int64_atomics,   "shaderImageInt64Atomics",                   \
      "VK_EXT_shader_image_atomic_int64",    SZ_CORE_NONE,                      \
-     q.image_int64.shaderImageInt64Atomics)
+     q.image_int64.shaderImageInt64Atomics)                                      \
+   X(multi_draw,                   "multiDraw",                                  \
+     "VK_EXT_multi_draw",                   SZ_CORE_NONE,                      \
+     q.multi_draw.multiDraw)
 
 /* Every VkPhysicalDevice*Features structure Super-ZINK ever chains, in one
  * place. Querying (sz_caps_init) and enabling (sz_device_create) both go
@@ -148,6 +151,7 @@ struct sz_vk_features {
    VkPhysicalDeviceShaderObjectFeaturesEXT shader_object;
    VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsr;
    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64;
+   VkPhysicalDeviceMultiDrawFeaturesEXT multi_draw;
 
    /* Not a feature: VkPhysicalDeviceVulkan14Properties carries the two
     * local-read attachment bits, and vk.xml gives them no extension-side
@@ -169,6 +173,7 @@ struct sz_vk_feature_selection {
    bool shader_object;
    bool fragment_shading_rate;
    bool shader_image_int64;
+   bool multi_draw;
 };
 
 void sz_vk_features_prepare(struct sz_vk_features *f, uint32_t api_version);
@@ -209,6 +214,10 @@ struct sz_caps {
     * many writes one vkCmdPushDescriptorSet call may carry. Zero when the
     * device does not report the property. */
    uint32_t max_push_descriptors;
+
+   /* VkPhysicalDeviceMultiDrawPropertiesEXT::maxMultiDrawCount, or zero when
+    * the extension is absent. The draw stream never batches more than this. */
+   uint32_t max_multi_draw_count;
 
    uint32_t instance_api_version;
    uint32_t device_api_version;
