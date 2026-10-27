@@ -13,6 +13,29 @@
 
 struct sz_screen;
 
+/* The VkFormat a Gallium format is backed by, with the depth/stencil
+ * substitutions Vulkan makes necessary.
+ *
+ * `vk_format_from_pipe_format()` answers the obvious mapping, but GL's
+ * DEPTH24_STENCIL8 has no guaranteed Vulkan equivalent: RADV reports no features
+ * at all for VK_FORMAT_D24_UNORM_S8_UINT on AMD hardware, and an image that
+ * cannot be created is worse than an image with more depth precision. So D24S8
+ * falls back to D32_SFLOAT_S8_UINT when the former is unavailable -- the same
+ * choice zink makes, and the only way to have stencil at all on such a device.
+ *
+ * A format with no stencil aspect is *not* substituted: the state tracker can
+ * pick a different format itself, and it picks one whose texel layout matches
+ * what the transfer path copies. See sz_vk_format().
+ *
+ * Every path that creates an image, a view, an attachment or a pipeline must go
+ * through this function rather than through vk_format_from_pipe_format(), or the
+ * two will disagree about what a texture actually is. */
+VkFormat sz_vk_format(struct sz_screen *screen, enum pipe_format format);
+
+/* Probes the device for the depth formats sz_vk_format() has to choose between.
+ * Called once, during screen creation. */
+void sz_format_probe(struct sz_screen *screen);
+
 /* Translate Gallium usage bits to the VkImageUsageFlags they require. */
 VkImageUsageFlags sz_image_usage_from_bindings(unsigned bindings,
                                               enum pipe_format format);

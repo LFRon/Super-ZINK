@@ -13,9 +13,14 @@
 
 /* The purpose maps onto (stage, access, layout). The three always travel
  * together: a layout that does not match the access mask is a validation error
- * on strict drivers and a silent performance cliff on all of them. */
+ * on strict drivers and a silent performance cliff on all of them.
+ *
+ * `depth_stencil` asks for the combined depth/stencil layout, which is what a
+ * format carrying a stencil aspect has to be in whenever the stencil aspect is
+ * used as an attachment (VUID-vkCmdBeginRendering-pStencilAttachment-06098).
+ * Using the depth-only layout there is invalid, not merely slower. */
 static struct sz_sync_state
-sz_sync_state_for(enum sz_access access)
+sz_sync_state_for(enum sz_access access, bool depth_stencil)
 {
    switch (access) {
    case SZ_ACCESS_COLOR_ATTACH:
@@ -32,7 +37,8 @@ sz_sync_state_for(enum sz_access access)
                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
          .access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
-         .layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+         .layout = depth_stencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                 : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
       };
 
    case SZ_ACCESS_SAMPLED:
@@ -229,7 +235,14 @@ sz_resource_access(struct sz_screen *screen, VkCommandBuffer cmd,
    if (!res)
       return VK_IMAGE_LAYOUT_UNDEFINED;
 
-   const struct sz_sync_state dst = sz_sync_state_for(access);
+   /* A combined depth/stencil image has to be in DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    * for the render pass to attach its stencil aspect. Depth-only formats keep
+    * the narrower layout, which lets tilers compress it as depth alone. */
+   const bool depth_stencil =
+      access == SZ_ACCESS_DEPTH_ATTACH && res->base.format &&
+      util_format_has_stencil(util_format_description(res->base.format));
+
+   const struct sz_sync_state dst = sz_sync_state_for(access, depth_stencil);
 
    /* Buffers have no layout, so the only thing to synchronise is a pending
     * write. A buffer that was never written needs nothing, which is the common

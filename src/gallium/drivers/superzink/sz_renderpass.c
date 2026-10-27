@@ -6,6 +6,7 @@
 #include "sz_renderpass.h"
 
 #include "sz_debug.h"
+#include "sz_format.h"
 #include "sz_resource.h"
 #include "sz_sync.h"
 
@@ -56,7 +57,7 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
          break;
 
       struct sz_resource *res = sz_resource(fb->cbufs[i].texture);
-      color_formats[color_count] = vk_format_from_pipe_format(fb->cbufs[i].format);
+      color_formats[color_count] = sz_vk_format(screen, fb->cbufs[i].format);
 
       sz_resource_access(screen, cmd, res, SZ_ACCESS_COLOR_ATTACH);
 
@@ -88,7 +89,12 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
       depth = (VkRenderingAttachmentInfo) {
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
          .imageView = res->view,
-         .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+         /* The stencil attachment shares this struct, so the layout has to be
+          * legal for both aspects: DEPTH_ATTACHMENT_OPTIMAL is not
+          * (VUID-vkCmdBeginRendering-pStencilAttachment-06098). */
+         .imageLayout = has_stencil
+                           ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                           : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
          .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
          .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
       };

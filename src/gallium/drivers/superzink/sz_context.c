@@ -734,7 +734,7 @@ sz_create_sampler_view(struct pipe_context *pipe, struct pipe_resource *texture,
    struct sz_screen *screen = ctx->screen;
    struct sz_resource *res = sz_resource(texture);
 
-   const VkFormat format = vk_format_from_pipe_format(templ->format);
+   const VkFormat format = sz_vk_format(screen, templ->format);
    if (format == VK_FORMAT_UNDEFINED) {
       /* A view in a format the device cannot read would be rejected by
        * vkCreateImageView with an error that says nothing about which texture
@@ -1510,7 +1510,14 @@ sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
       .extent = { fb->width, fb->height },
    };
 
-   if (ctx->state.num_scissors > 0) {
+   /* The scissor rects are only meaningful while glScissor's test is on, and the
+    * state tracker keeps sending them after it is switched off. Applying the
+    * last rect regardless clips every later draw to a stale rectangle, which
+    * renders as "everything after a scissored draw is missing". The enable is
+    * part of the rasterizer state, not of the rects. */
+   const struct sz_state *rast_state = ctx->state.rasterizer;
+   const bool scissor_test = rast_state && rast_state->u.rasterizer.scissor;
+   if (scissor_test && ctx->state.num_scissors > 0) {
       const struct pipe_scissor_state *sc = &ctx->state.scissors[0];
       scissor.offset.x = sc->minx;
       scissor.offset.y = sc->miny;
@@ -1532,6 +1539,19 @@ sz_draw_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
                                    bc->color[3] };
       ctx->screen->vk.CmdSetBlendConstants(cmd, constants);
    }
+
+   /* Same for the stencil reference. Core Vulkan can only set one value for both
+    * faces; Gallium carries two (GL_STENCIL_BACK_REF from glStencilFuncSeparate)
+    * and the driver has no VK_EXT_extended_dynamic_state yet to split them. Two
+    * different values are rare enough that saying so once is better than silently
+    * using the front one. */
+   const unsigned ref = ctx->state.stencil_ref.ref_value[0];
+   if (ctx->state.stencil_ref.ref_value[1] != ref)
+      sz_warn_once("per-face stencil reference values need "
+                   "VK_EXT_extended_dynamic_state; using the front value");
+
+   ctx->screen->vk.CmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                          ref);
 }
 
 /* Gallium primitive -> Vulkan topology.

@@ -357,6 +357,31 @@ sz_compare_op(unsigned func)
    }
 }
 
+static VkStencilOp
+sz_stencil_op(unsigned op)
+{
+   switch (op) {
+   case PIPE_STENCIL_OP_KEEP:
+      return VK_STENCIL_OP_KEEP;
+   case PIPE_STENCIL_OP_ZERO:
+      return VK_STENCIL_OP_ZERO;
+   case PIPE_STENCIL_OP_REPLACE:
+      return VK_STENCIL_OP_REPLACE;
+   case PIPE_STENCIL_OP_INCR:
+      return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+   case PIPE_STENCIL_OP_DECR:
+      return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+   case PIPE_STENCIL_OP_INCR_WRAP:
+      return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+   case PIPE_STENCIL_OP_DECR_WRAP:
+      return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+   case PIPE_STENCIL_OP_INVERT:
+      return VK_STENCIL_OP_INVERT;
+   default:
+      return VK_STENCIL_OP_KEEP;
+   }
+}
+
 static VkBlendFactor
 sz_blend_factor(unsigned factor)
 {
@@ -543,7 +568,7 @@ sz_pipeline_vertex_input(struct sz_context *ctx,
       attributes[i] = (VkVertexInputAttributeDescription) {
          .location = i,
          .binding = vb,
-         .format = vk_format_from_pipe_format(elem->src_format),
+         .format = sz_vk_format(ctx->screen, elem->src_format),
          .offset = elem->src_offset,
       };
    }
@@ -686,6 +711,20 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
 
    const bool has_depth = fb->zsbuf.texture != NULL;
 
+   /* The attachment formats belong to the pipeline: dynamic rendering has no
+    * render pass object to take them from. They are computed once, here, because
+    * the stencil decision below needs to know whether a stencil aspect exists at
+    * all before the pipeline is described. */
+   const VkFormat depth_format =
+      has_depth ? sz_vk_format(screen, fb->zsbuf.format) : VK_FORMAT_UNDEFINED;
+   /* A depth format without a stencil aspect has to report UNDEFINED: naming a
+    * stencil-less format makes the pipeline invalid rather than stencil-less. */
+   const VkFormat stencil_format =
+      has_depth &&
+         util_format_has_stencil(util_format_description(fb->zsbuf.format))
+            ? sz_vk_format(screen, fb->zsbuf.format)
+            : VK_FORMAT_UNDEFINED;
+
    /* GL's depth test is off by default; a draw that enables it without a depth
     * attachment is a state-tracker bug, not something to honour.
     *
@@ -696,11 +735,54 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
    const bool depth_enabled = has_depth && dsa && dsa->depth_enabled;
    const bool depth_write = depth_enabled && dsa->depth_writemask;
 
-   /* Stencil is not translated yet. Saying so once is better than silently
-    * dropping it, because a stencil-masked effect renders as if the mask were
-    * always zero. */
-   if (dsa && (dsa->stencil[0].enabled || dsa->stencil[1].enabled))
-      sz_warn_once("stencil testing is not implemented; ignoring it");
+   /* Stencil, both faces.
+    *
+    * Gallium reports the back face in stencil[1] and sets its `enabled` bit only
+    * when two-sided testing is on (GL_EXT_stencil_two_side); a single-sided
+    * state must apply the front face's function and ops to back faces too, which
+    * is what Vulkan's VkPipelineDepthStencilStateCreateInfo.back is for.
+    *
+    * The reference value is not part of the state object -- glStencilFunc
+    * changes it without touching anything else -- so it is dynamic and comes
+    * from vkCmdSetStencilReference per draw. The masks are part of the state
+    * object, and the state tracker already folds them into a new pipe object
+    * when they change, so they travel with the pipeline. */
+   const bool has_stencil_aspect = stencil_format != VK_FORMAT_UNDEFINED;
+   const bool stencil_enabled =
+      has_stencil_aspect && dsa && dsa->stencil[0].enabled;
+   const struct pipe_stencil_state *front_state =
+      dsa ? &dsa->stencil[0] : NULL;
+   const struct pipe_stencil_state *back_state =
+      (dsa && dsa->stencil[1].enabled) ? &dsa->stencil[1] : front_state;
+
+   if (dsa && dsa->stencil[0].enabled && !has_stencil_aspect)
+      sz_warn_once("stencil testing enabled without a stencil attachment; "
+                   "ignoring it");
+
+   const VkStencilOpState stencil_front = {
+      .failOp = sz_stencil_op(front_state ? front_state->fail_op
+                                          : PIPE_STENCIL_OP_KEEP),
+      .passOp = sz_stencil_op(front_state ? front_state->zpass_op
+                                          : PIPE_STENCIL_OP_KEEP),
+      .depthFailOp = sz_stencil_op(front_state ? front_state->zfail_op
+                                               : PIPE_STENCIL_OP_KEEP),
+      .compareOp = sz_compare_op(front_state ? front_state->func
+                                             : PIPE_FUNC_ALWAYS),
+      .compareMask = front_state ? front_state->valuemask : 0xff,
+      .writeMask = front_state ? front_state->writemask : 0xff,
+   };
+   const VkStencilOpState stencil_back = {
+      .failOp = sz_stencil_op(back_state ? back_state->fail_op
+                                          : PIPE_STENCIL_OP_KEEP),
+      .passOp = sz_stencil_op(back_state ? back_state->zpass_op
+                                          : PIPE_STENCIL_OP_KEEP),
+      .depthFailOp = sz_stencil_op(back_state ? back_state->zfail_op
+                                               : PIPE_STENCIL_OP_KEEP),
+      .compareOp = sz_compare_op(back_state ? back_state->func
+                                             : PIPE_FUNC_ALWAYS),
+      .compareMask = back_state ? back_state->valuemask : 0xff,
+      .writeMask = back_state ? back_state->writemask : 0xff,
+   };
 
    const VkPipelineDepthStencilStateCreateInfo depth_stencil = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
@@ -708,7 +790,9 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
       .depthWriteEnable = depth_write,
       .depthCompareOp = dsa ? sz_compare_op(dsa->depth_func)
                             : VK_COMPARE_OP_ALWAYS,
-      .stencilTestEnable = VK_FALSE,
+      .stencilTestEnable = stencil_enabled,
+      .front = stencil_front,
+      .back = stencil_back,
    };
 
    VkPipelineColorBlendAttachmentState blend_attachments[PIPE_MAX_COLOR_BUFS] = { 0 };
@@ -759,6 +843,8 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
       VK_DYNAMIC_STATE_VIEWPORT,
       VK_DYNAMIC_STATE_SCISSOR,
       VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+      /* glStencilFunc's reference value changes without a pipeline rebind. */
+      VK_DYNAMIC_STATE_STENCIL_REFERENCE,
    };
 
    const VkPipelineDynamicStateCreateInfo dynamic_state = {
@@ -772,22 +858,14 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
     * pass cache. */
    VkFormat color_formats[PIPE_MAX_COLOR_BUFS] = { 0 };
    for (unsigned i = 0; i < color_count; i++)
-      color_formats[i] = vk_format_from_pipe_format(fb->cbufs[i].format);
+      color_formats[i] = sz_vk_format(screen, fb->cbufs[i].format);
 
    const VkPipelineRenderingCreateInfo rendering = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
       .colorAttachmentCount = color_count,
       .pColorAttachmentFormats = color_count ? color_formats : NULL,
-      .depthAttachmentFormat =
-         has_depth ? vk_format_from_pipe_format(fb->zsbuf.format)
-                   : VK_FORMAT_UNDEFINED,
-      /* A depth format without a stencil aspect has to report UNDEFINED here:
-       * naming a stencil-less format makes the pipeline invalid rather than
-       * stencil-less. */
-      .stencilAttachmentFormat =
-         has_depth && util_format_has_stencil(util_format_description(fb->zsbuf.format))
-            ? vk_format_from_pipe_format(fb->zsbuf.format)
-            : VK_FORMAT_UNDEFINED,
+      .depthAttachmentFormat = depth_format,
+      .stencilAttachmentFormat = stencil_format,
    };
 
    const VkGraphicsPipelineCreateInfo pipeline_ci = {
@@ -890,12 +968,12 @@ sz_pipeline_key_matches(struct sz_gfx_pipeline *p, struct sz_context *ctx,
       return false;
 
    for (unsigned i = 0; i < p->key.color_count; i++) {
-      if (p->key.color[i] != vk_format_from_pipe_format(fb->cbufs[i].format))
+      if (p->key.color[i] != sz_vk_format(ctx->screen, fb->cbufs[i].format))
          return false;
    }
 
    const VkFormat depth = fb->zsbuf.texture
-                             ? vk_format_from_pipe_format(fb->zsbuf.format)
+                             ? sz_vk_format(ctx->screen, fb->zsbuf.format)
                              : VK_FORMAT_UNDEFINED;
    return p->key.depth == depth;
 }

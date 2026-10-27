@@ -110,6 +110,7 @@ struct sz_vk_entrypoints {
    PFN_vkCmdSetViewport CmdSetViewport;
    PFN_vkCmdSetScissor CmdSetScissor;
    PFN_vkCmdSetBlendConstants CmdSetBlendConstants;
+   PFN_vkCmdSetStencilReference CmdSetStencilReference;
    PFN_vkCmdBindPipeline CmdBindPipeline;
    PFN_vkCmdBindVertexBuffers CmdBindVertexBuffers;
    PFN_vkCmdBindIndexBuffer CmdBindIndexBuffer;
@@ -215,6 +216,19 @@ struct sz_screen {
 
    bool is_cpu;
    bool driver_name_is_inferred;
+
+   /* Depth/stencil format availability, decided once at screen creation.
+    *
+    * Vulkan devices are free not to support D24_UNORM_S8_UINT at all -- RADV on
+    * AMD reports no features for it -- while GL's DEPTH24_STENCIL8 still has to
+    * be backed by something. The closest supported format is used instead, which
+    * is what every other Gallium-on-Vulkan driver does. The probe happens once
+    * because the answer is a device property and sz_vk_format() is called from
+    * hot paths (the pipeline key comparison among them). */
+   bool have_d24_unorm_s8_uint;
+   bool have_x8_d24_unorm_pack32;
+   bool have_d32_sfloat;
+   bool have_d32_sfloat_s8_uint;
 
    /* Set by the first dma-buf failure, so a missing capability is reported once
     * instead of on every allocation attempt. */

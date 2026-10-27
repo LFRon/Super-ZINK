@@ -325,7 +325,7 @@ sz_screen_resource_from_handle(struct pipe_screen *pscreen,
       return NULL;
    }
 
-   const VkFormat format = vk_format_from_pipe_format(tmpl->format);
+   const VkFormat format = sz_vk_format(screen, tmpl->format);
    if (format == VK_FORMAT_UNDEFINED) {
       mesa_loge("SZ: no VkFormat for imported pipe format %s",
                 util_format_name(tmpl->format));

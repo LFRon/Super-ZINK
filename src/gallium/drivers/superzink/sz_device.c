@@ -506,6 +506,7 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdSetViewport, vkCmdSetViewport);
    SZ_DEV_PROC(CmdSetScissor, vkCmdSetScissor);
    SZ_DEV_PROC(CmdSetBlendConstants, vkCmdSetBlendConstants);
+   SZ_DEV_PROC(CmdSetStencilReference, vkCmdSetStencilReference);
    SZ_DEV_PROC(CmdBindPipeline, vkCmdBindPipeline);
    SZ_DEV_PROC(CmdBindVertexBuffers, vkCmdBindVertexBuffers);
    SZ_DEV_PROC(CmdBindIndexBuffer, vkCmdBindIndexBuffer);

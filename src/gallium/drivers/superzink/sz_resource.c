@@ -223,7 +223,7 @@ sz_buffer_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
 static VkImageCreateInfo
 sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
 {
-   const VkFormat format = vk_format_from_pipe_format(tmpl->format);
+   const VkFormat format = sz_vk_format(screen, tmpl->format);
    const VkImageType type = sz_image_type(tmpl->target);
    const bool linear = sz_bindings_require_linear(tmpl->bind);
 
@@ -331,7 +331,7 @@ sz_resource_create_view(struct sz_screen *screen, struct sz_resource *res,
 static struct pipe_resource *
 sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
 {
-   const VkFormat format = vk_format_from_pipe_format(tmpl->format);
+   const VkFormat format = sz_vk_format(screen, tmpl->format);
    if (format == VK_FORMAT_UNDEFINED) {
       mesa_loge("SZ: no VkFormat for pipe format %s",
                 util_format_name(tmpl->format));
@@ -484,7 +484,7 @@ sz_resource_wrap_imported(struct sz_screen *screen,
                           VkImage image, VkDeviceMemory memory,
                           bool drm_modifier)
 {
-   const VkFormat format = vk_format_from_pipe_format(tmpl->format);
+   const VkFormat format = sz_vk_format(screen, tmpl->format);
 
    struct sz_resource *res = sz_resource_alloc(screen, tmpl);
    if (!res)

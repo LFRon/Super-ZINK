@@ -17,6 +17,69 @@
 #include "sz_format.h"
 #include "sz_types.h"
 
+/* Whether a format can be used as a depth/stencil attachment at all. */
+static bool
+sz_format_has_depth_features(struct sz_screen *screen, VkFormat format)
+{
+   VkFormatProperties props;
+   screen->vk.GetPhysicalDeviceFormatProperties(screen->pdev, format, &props);
+   return ((props.linearTilingFeatures | props.optimalTilingFeatures) &
+           VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+}
+
+void
+sz_format_probe(struct sz_screen *screen)
+{
+   screen->have_d24_unorm_s8_uint =
+      sz_format_has_depth_features(screen, VK_FORMAT_D24_UNORM_S8_UINT);
+   screen->have_x8_d24_unorm_pack32 =
+      sz_format_has_depth_features(screen, VK_FORMAT_X8_D24_UNORM_PACK32);
+   screen->have_d32_sfloat =
+      sz_format_has_depth_features(screen, VK_FORMAT_D32_SFLOAT);
+   screen->have_d32_sfloat_s8_uint =
+      sz_format_has_depth_features(screen, VK_FORMAT_D32_SFLOAT_S8_UINT);
+}
+
+VkFormat
+sz_vk_format(struct sz_screen *screen, enum pipe_format format)
+{
+   const VkFormat ret = vk_format_from_pipe_format(format);
+
+   switch (ret) {
+   case VK_FORMAT_D24_UNORM_S8_UINT:
+      /* GL's DEPTH24_STENCIL8. AMD's Vulkan driver has no 24-bit depth at all,
+       * so this has to become D32S8; a device that supports neither cannot back
+       * the format and is answered with UNDEFINED, which is_format_supported()
+       * turns into "no". */
+      if (!screen->have_d24_unorm_s8_uint) {
+         if (screen->have_d32_sfloat_s8_uint)
+            return VK_FORMAT_D32_SFLOAT_S8_UINT;
+         if (screen->have_d32_sfloat)
+            return VK_FORMAT_D32_SFLOAT;
+         return VK_FORMAT_UNDEFINED;
+      }
+      return ret;
+
+   case VK_FORMAT_X8_D24_UNORM_PACK32:
+      /* Unlike the depth/stencil case above this one is deliberately *not*
+       * substituted. A 24-bit depth texture has no stencil aspect to preserve,
+       * so the state tracker can pick another format itself -- and it picks
+       * Z32_FLOAT, whose texel layout matches what the transfer path copies.
+       * Substituting D32_SFLOAT here would make GL_DEPTH_COMPONENT24 images
+       * claim one layout and store another, and every readback of them would
+       * come back as float bits reinterpreted as a 24-bit unorm: exactly the
+       * failure mode the substitution for DEPTH24_STENCIL8 has and that cannot
+       * be avoided there, because dropping *that* one removes stencil support
+       * entirely. */
+      if (!screen->have_x8_d24_unorm_pack32)
+         return VK_FORMAT_UNDEFINED;
+      return ret;
+
+   default:
+      return ret;
+   }
+}
+
 /* Gallium passes sample_count == 0 both for "single sample" and for "don't
  * care". Vulkan wants a concrete count, and 1 satisfies both readings. */
 VkSampleCountFlagBits
@@ -180,7 +243,7 @@ sz_format_supported_buffer(struct sz_screen *screen,
                            enum pipe_format format,
                            unsigned bindings)
 {
-   const VkFormat vkformat = vk_format_from_pipe_format(format);
+   const VkFormat vkformat = sz_vk_format(screen, format);
    if (vkformat == VK_FORMAT_UNDEFINED)
       return false;
 
@@ -200,7 +263,7 @@ sz_format_supported_image(struct sz_screen *screen,
                           unsigned sample_count,
                           unsigned bindings)
 {
-   const VkFormat vkformat = vk_format_from_pipe_format(format);
+   const VkFormat vkformat = sz_vk_format(screen, format);
    if (vkformat == VK_FORMAT_UNDEFINED)
       return false;
 
@@ -298,5 +361,5 @@ sz_format_supported(struct sz_screen *screen,
       return true;
 
    /* No bindings at all: the format merely has to exist. */
-   return vk_format_from_pipe_format(format) != VK_FORMAT_UNDEFINED;
+   return sz_vk_format(screen, format) != VK_FORMAT_UNDEFINED;
 }

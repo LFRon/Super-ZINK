@@ -508,6 +508,10 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
    if (!sz_device_init(screen))
       goto fail;
 
+   /* Which depth/stencil formats the device can actually back, so that the
+    * pipe-format to VkFormat mapping is decided once rather than per image. */
+   sz_format_probe(screen);
+
    sz_bo_init(screen);
    sz_resource_screen_init(screen);
    sz_screen_fence_init(screen);

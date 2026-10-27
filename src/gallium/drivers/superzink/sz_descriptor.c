@@ -183,7 +183,7 @@ sz_sampled_feedback_copy(struct sz_context *ctx, VkCommandBuffer cmd,
                          struct sz_resource *res, VkImageView *view_out)
 {
    struct sz_screen *screen = ctx->screen;
-   const VkFormat format = vk_format_from_pipe_format(res->base.format);
+   const VkFormat format = sz_vk_format(screen, res->base.format);
 
    if (!ctx->sampled_copy || ctx->sampled_copy_format != format ||
        ctx->sampled_copy_extent[0] != res->base.width0 ||
