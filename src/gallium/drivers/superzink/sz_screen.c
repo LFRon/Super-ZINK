@@ -648,6 +648,14 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->fs_coord_origin_upper_left = true;
       caps->fs_coord_pixel_center_half_integer = true;
 
+      /* gl_InstanceID reads Vulkan's InstanceIndex, which the draw path already
+       * feeds with the instance count and the first instance. GL's own
+       * gl_InstanceID is 0-based, so this is exact for every draw whose base
+       * instance is zero -- which is every draw before GL 4.2's
+       * ARB_base_instance, and there the shader subtracts it (see
+       * sz_draw_append). */
+      caps->vs_instanceid = true;
+
       /* Occlusion queries map straight onto VK_QUERY_TYPE_OCCLUSION.
        * Conditional rendering is evaluated on the CPU when
        * glBeginConditionalRender is called, which the GL specification allows

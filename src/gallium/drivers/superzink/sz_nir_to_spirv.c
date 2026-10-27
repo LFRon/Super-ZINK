@@ -124,6 +124,15 @@ struct sz_translate {
    uint32_t *interfaces;
    unsigned num_interfaces;
 
+   /* Scalar integer builtin inputs (gl_VertexID, gl_InstanceID), declared on
+    * first use: a shader that does not read one must not declare it, because an
+    * unused builtin input is still a pipeline interface. */
+   struct {
+      SpvBuiltIn builtin;
+      uint32_t var;
+   } int_builtins[4];
+   unsigned num_int_builtins;
+
    /* Control flow. NIR is already structured, so the emitter walks its if/loop
     * tree directly; these are the pieces of state that walking needs. Block
     * labels are assigned up front because a phi and a branch both name blocks
@@ -2057,6 +2066,40 @@ sz_emit_derivative(struct sz_translate *t, nir_intrinsic_instr *intrin)
    t->def_types[intrin->def.index] = dst;
 }
 
+/* Loads a scalar integer builtin input, declaring it on first use.
+ *
+ * gl_VertexID and gl_InstanceID are the two GL builtins that need no state at
+ * all: Vulkan's VertexIndex already carries firstVertex and a vertexOffset, and
+ * InstanceIndex carries firstInstance, which is what the instanced attribute
+ * fetch uses in GL too. */
+static uint32_t
+sz_load_builtin_int(struct sz_translate *t, SpvBuiltIn builtin)
+{
+   const uint32_t int_type = sz_spv_type_int32(t->m);
+
+   for (unsigned i = 0; i < t->num_int_builtins; i++) {
+      if (t->int_builtins[i].builtin == builtin)
+         return sz_spv_load(t->m, int_type, t->int_builtins[i].var);
+   }
+
+   if (t->num_int_builtins == ARRAY_SIZE(t->int_builtins)) {
+      sz_fail(t, "too many integer builtins in one shader");
+      return 0;
+   }
+
+   const uint32_t ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassInput, int_type);
+   const uint32_t var = sz_spv_variable(t->m, ptr_type, SpvStorageClassInput);
+   sz_spv_decorate(t->m, var, SpvDecorationBuiltIn, builtin);
+
+   t->interfaces[t->num_interfaces++] = var;
+   t->int_builtins[t->num_int_builtins].builtin = builtin;
+   t->int_builtins[t->num_int_builtins].var = var;
+   t->num_int_builtins++;
+
+   return sz_spv_load(t->m, int_type, var);
+}
+
 static bool
 sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
 {
@@ -2069,6 +2112,18 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
    case nir_intrinsic_ddy_coarse:
       sz_emit_derivative(t, intrin);
       return true;
+   case nir_intrinsic_load_vertex_id:
+   case nir_intrinsic_load_instance_id: {
+      const SpvBuiltIn builtin = intrin->intrinsic == nir_intrinsic_load_vertex_id
+                                    ? SpvBuiltInVertexIndex
+                                    : SpvBuiltInInstanceIndex;
+      const uint32_t value = sz_load_builtin_int(t, builtin);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_INT, 32, 1 };
+      return true;
+   }
    case nir_intrinsic_load_ubo:
       sz_emit_load_ubo(t, intrin, false);
       return true;
