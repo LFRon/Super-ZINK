@@ -392,8 +392,9 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
 {
    const VkFormat format = sz_vk_format(screen, tmpl->format);
    if (format == VK_FORMAT_UNDEFINED) {
-      mesa_loge("SZ: no VkFormat for pipe format %s",
-                util_format_name(tmpl->format));
+      mesa_loge("SZ: no VkFormat for pipe format %s (%ux%u target %d bind 0x%x "
+                "usage 0x%x)", util_format_name(tmpl->format), tmpl->width0,
+                tmpl->height0, (int)tmpl->target, tmpl->bind, tmpl->usage);
       return NULL;
    }
 

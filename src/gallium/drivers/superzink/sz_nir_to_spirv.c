@@ -1366,6 +1366,29 @@ sz_base_name(enum sz_base base)
    return "unknown";
 }
 
+/* Reinterprets a value as another base type of the same width.
+ *
+ * NIR values carry no type: a def's recorded base is inferred from its uses, and
+ * the same bits are legitimately stored into a float variable here and compared
+ * as an int there. SPIR-V is typed and wants the pointee and the value to agree,
+ * so a same-width difference becomes an OpBitcast instead of a refusal --
+ * refusing would reject shaders every other driver compiles, and the bits are
+ * exactly what GL means anyway. Bool is excluded: it has no defined bit pattern
+ * in a 32-bit register, so a mismatch involving one is a translator bug. */
+static uint32_t
+sz_bitcast_to(struct sz_translate *t, uint32_t id, const struct sz_dtype *from,
+              const struct sz_dtype *to)
+{
+   if (from->base == to->base)
+      return id;
+
+   if (from->base == SZ_BASE_BOOL || to->base == SZ_BASE_BOOL ||
+       from->bits != to->bits || from->ncomp != to->ncomp)
+      return 0;
+
+   return sz_spv_alu(t->m, SpvOpBitcast, sz_dtype_type(t, to), &id, 1);
+}
+
 static void
 sz_emit_store_deref(struct sz_translate *t, nir_intrinsic_instr *intrin)
 {
@@ -1393,9 +1416,15 @@ sz_emit_store_deref(struct sz_translate *t, nir_intrinsic_instr *intrin)
        * driver's SPIR-V parser read the wrong type. Nothing here converts between
        * bases, so a mismatch is a bug in the translator and is reported as one. */
       if (t->def_types[value->index].base != dst_type.base) {
-         sz_fail(t, "store_deref of a %s value into a %s variable",
-                 sz_base_name(t->def_types[value->index].base),
-                 sz_base_name(dst_type.base));
+         const uint32_t cast =
+            sz_bitcast_to(t, value_id, &t->def_types[value->index], &dst_type);
+         if (!cast) {
+            sz_fail(t, "store_deref of a %s value into a %s variable",
+                    sz_base_name(t->def_types[value->index].base),
+                    sz_base_name(dst_type.base));
+            return;
+         }
+         sz_spv_store(t->m, ptr, cast);
          return;
       }
       sz_spv_store(t->m, ptr, value_id);
@@ -1645,6 +1674,34 @@ sz_emit_projector(struct sz_translate *t, uint32_t coord, unsigned ncomp,
    return sz_spv_composite_construct(t->m, vec_type, comps, ncomp);
 }
 
+/* The integer texel offset of a textureOffset/texelFetchOffset instruction.
+ *
+ * SPIR-V takes it as an ImageOperands operand rather than as part of the
+ * coordinate: a constant one becomes ConstOffset, which every implementation
+ * folds into the addressing, and a computed one becomes Offset. The value has to
+ * be an integer vector, and a constant here carries no type of its own, so it is
+ * materialised with the one the operand needs. */
+static uint32_t
+sz_tex_offset_value(struct sz_translate *t, const nir_def *offset,
+                    bool *is_constant)
+{
+   struct sz_dtype want = {
+      .base = SZ_BASE_INT,
+      .bits = 32,
+      .ncomp = offset->num_components,
+   };
+
+   const nir_load_const_instr *lconst = t->consts[offset->index];
+   if (lconst) {
+      *is_constant = true;
+      return sz_const_as(t, lconst, &want);
+   }
+
+   *is_constant = false;
+   const struct sz_dtype *have = &t->def_types[offset->index];
+   return sz_bitcast_to(t, t->defs_id[offset->index], have, &want);
+}
+
 static void
 sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
 {
@@ -1655,6 +1712,7 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
 
    const nir_def *coord = NULL, *bias = NULL, *lod = NULL, *dref = NULL;
    const nir_def *ddx = NULL, *ddy = NULL, *projector = NULL;
+   const nir_def *offset = NULL, *ms_index = NULL;
 
    for (unsigned i = 0; i < tex->num_srcs; i++) {
       const nir_tex_src *src = &tex->src[i];
@@ -1680,20 +1738,20 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
       case nir_tex_src_projector:
          projector = src->src.ssa;
          break;
+      case nir_tex_src_offset:
+         offset = src->src.ssa;
+         break;
+      case nir_tex_src_ms_index:
+         ms_index = src->src.ssa;
+         break;
       default:
          /* Sampler arrays arrive as an offset added to sampler_index, which the
           * descriptor layout cannot express: a dynamic index would need
-          * VK_EXT_descriptor_indexing. GLSL 1.20 has no sampler arrays, so this
-          * is a shader this driver should not have accepted. */
+          * VK_EXT_descriptor_indexing. */
          sz_fail(t, "texture source type %d is not supported yet",
                  (int)src->src_type);
          return;
       }
-   }
-
-   if (coord == NULL) {
-      sz_fail(t, "texture instruction has no coordinate");
-      return;
    }
 
    SpvDim dim;
@@ -1717,8 +1775,7 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
    const bool needs_sampler =
       tex->op != nir_texop_txs && tex->op != nir_texop_query_levels &&
       tex->op != nir_texop_texture_samples;
-   const uint32_t sampled_image =
-      sz_sampler_get(t, tex, dim);
+   const uint32_t sampled_image = sz_sampler_get(t, tex, dim);
    if (sampled_image == 0)
       return;
 
@@ -1728,100 +1785,59 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
          break;
    const uint32_t image_type = t->samplers[slot].image_type;
 
-   uint32_t coord_value = sz_def_value(t, coord);
-   if (coord_value == 0)
-      return;
+   const uint32_t image =
+      sz_spv_alu(t->m, SpvOpImage, image_type, &sampled_image, 1);
 
-   if (projector != NULL) {
-      const uint32_t projector_value = sz_def_value(t, projector);
-      if (projector_value == 0)
+   /* Everything that is not a query needs a coordinate; the queries are the
+    * reason this check cannot be at the top. */
+   uint32_t coord_value = 0;
+   if (coord != NULL) {
+      coord_value = sz_def_value(t, coord);
+      if (coord_value == 0)
          return;
-      coord_value = sz_emit_projector(t, coord_value, tex->coord_components,
-                                      tex->is_array, projector_value);
-   }
 
-   /* Extra operands after the coordinate: for the sampled ops these are the
-    * ImageOperands mask followed by one value per bit, in bit order. */
-   uint32_t image_operands[3];
-   unsigned extra = 0;
-
-   SpvOp opcode;
-   switch (tex->op) {
-   case nir_texop_tex:
-   case nir_texop_txb:
-      /* A bias is part of implicit-LOD sampling: GL's texture2D's optional bias
-       * argument and texture2DProj's, plus implicit-LOD texture2D in a fragment
-       * shader that asked for it. */
-      opcode = tex->is_shadow ? SpvOpImageSampleDrefImplicitLod
-                              : SpvOpImageSampleImplicitLod;
-      if (bias != NULL) {
-         const uint32_t value = sz_def_value(t, bias);
-         if (value == 0)
+      if (projector != NULL) {
+         const uint32_t projector_value = sz_def_value(t, projector);
+         if (projector_value == 0)
             return;
-         image_operands[extra++] = SpvImageOperandsBiasMask;
-         image_operands[extra++] = value;
+         coord_value = sz_emit_projector(t, coord_value, tex->coord_components,
+                                         tex->is_array, projector_value);
       }
-      break;
-   case nir_texop_txl:
-      opcode = tex->is_shadow ? SpvOpImageSampleDrefExplicitLod
-                              : SpvOpImageSampleExplicitLod;
-      if (lod == NULL) {
-         sz_fail(t, "explicit-LOD sample has no LOD");
-         return;
-      }
-      image_operands[extra++] = SpvImageOperandsLodMask;
-      image_operands[extra++] = sz_def_value(t, lod);
-      break;
-   case nir_texop_txd:
-      opcode = tex->is_shadow ? SpvOpImageSampleDrefExplicitLod
-                              : SpvOpImageSampleExplicitLod;
-      if (ddx == NULL || ddy == NULL) {
-         sz_fail(t, "gradient sample has no gradients");
-         return;
-      }
-      image_operands[extra++] = SpvImageOperandsGradMask;
-      image_operands[extra++] = sz_def_value(t, ddx);
-      image_operands[extra++] = sz_def_value(t, ddy);
-      break;
-   case nir_texop_txf:
-   case nir_texop_txf_ms: {
-      /* Fetch takes a bare image rather than a sampled one: the sampler state is
-       * not consulted at all, so the combined sampler is unwrapped. */
-      const uint32_t image = sz_spv_alu(t->m, SpvOpImage, image_type,
-                                        &sampled_image, 1);
-      uint32_t ops[4];
-      unsigned n = 0;
-      ops[n++] = image;
-      ops[n++] = coord_value;
-      if (tex->is_array) {
-         /* The array index of a fetch is an integer operand, not part of the
-          * coordinate vector. */
-         sz_fail(t, "arrayed texel fetches are not supported yet");
-         return;
-      }
-      const uint32_t value =
-         sz_spv_alu(t->m, SpvOpImageFetch, type, ops, n);
-      t->defs_id[tex->def.index] = value;
-      t->def_types[tex->def.index] = result_type;
-      return;
    }
+
+   uint32_t offset_value = 0;
+   bool offset_constant = false;
+   if (offset != NULL) {
+      offset_value = sz_tex_offset_value(t, offset, &offset_constant);
+      if (offset_value == 0)
+         return;
+   }
+
+   /* The image operands: a bit mask followed by one value per set bit, in the
+    * order the bits are numbered (Bias, Lod, Grad, ConstOffset, Offset, Sample).
+    * Building them in that order is what keeps a sample with both a bias and an
+    * offset legal -- the operand list is positional, not named. */
+   uint32_t mask = 0;
+   uint32_t values[6];
+   unsigned num_values = 0;
+
+   switch (tex->op) {
    case nir_texop_txs: {
-      const uint32_t image = needs_sampler
-         ? sz_spv_alu(t->m, SpvOpImage, image_type, &sampled_image, 1)
-         : sampled_image;
-      const uint32_t zero = sz_spv_const_int32(t->m, 0);
-      const uint32_t ops[] = { image, zero };
+      const uint32_t level = lod ? sz_def_value(t, lod)
+                                 : sz_spv_const_int32(t->m, 0);
+      if (level == 0)
+         return;
+      const uint32_t ops[] = { image, level };
       const uint32_t value =
-         sz_spv_alu(t->m, dim == SpvDimBuffer ? SpvOpImageQuerySize
-                                              : SpvOpImageQuerySizeLod,
+         sz_spv_alu(t->m,
+                    dim == SpvDimBuffer ? SpvOpImageQuerySize
+                                        : SpvOpImageQuerySizeLod,
                     type, ops, dim == SpvDimBuffer ? 1 : 2);
       t->defs_id[tex->def.index] = value;
       t->def_types[tex->def.index] = result_type;
       return;
    }
    case nir_texop_query_levels: {
-      const uint32_t image = sz_spv_alu(t->m, SpvOpImage, image_type,
-                                        &sampled_image, 1);
       const uint32_t value =
          sz_spv_alu(t->m, SpvOpImageQueryLevels, type, &image, 1);
       t->defs_id[tex->def.index] = value;
@@ -1829,26 +1845,8 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
       return;
    }
    case nir_texop_texture_samples: {
-      const uint32_t image = sz_spv_alu(t->m, SpvOpImage, image_type,
-                                        &sampled_image, 1);
       const uint32_t value =
          sz_spv_alu(t->m, SpvOpImageQuerySamples, type, &image, 1);
-      t->defs_id[tex->def.index] = value;
-      t->def_types[tex->def.index] = result_type;
-      return;
-   }
-   case nir_texop_tg4: {
-      const uint32_t image = sz_spv_alu(t->m, SpvOpImage, image_type,
-                                        &sampled_image, 1);
-      const uint32_t component = sz_spv_const_int32(t->m, tex->component);
-      uint32_t ops[3];
-      unsigned n = 0;
-      ops[n++] = image;
-      ops[n++] = coord_value;
-      ops[n++] = component;
-      const uint32_t value = sz_spv_alu(
-         t->m, tex->is_shadow ? SpvOpImageDrefGather : SpvOpImageGather, type,
-         ops, n);
       t->defs_id[tex->def.index] = value;
       t->def_types[tex->def.index] = result_type;
       return;
@@ -1863,23 +1861,143 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
       return;
    }
    default:
+      break;
+   }
+
+   if (coord_value == 0) {
+      sz_fail(t, "texture instruction has no coordinate");
+      return;
+   }
+
+   /* Fetch: a bare image, the coordinate, and the level or sample index as the
+    * image operand. The sampler state is not consulted at all. */
+   if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms) {
+      uint32_t ops[6];
+      unsigned n = 0;
+      ops[n++] = image;
+      ops[n++] = coord_value;
+
+      if (tex->op == nir_texop_txf_ms) {
+         const uint32_t sample = ms_index ? sz_def_value(t, ms_index)
+                                          : sz_spv_const_int32(t->m, 0);
+         if (sample == 0)
+            return;
+         mask |= SpvImageOperandsSampleMask;
+         values[num_values++] = sample;
+      } else if (lod != NULL) {
+         const nir_load_const_instr *lconst = t->consts[lod->index];
+         /* Level zero is what an omitted Lod operand means, so a constant zero
+          * costs nothing to leave out -- and leaving it out keeps the common
+          * texelFetch(tex, coord, 0) down to two operands. */
+         const bool zero_lod = lconst && lconst->value[0].u32 == 0;
+         if (!zero_lod) {
+            const uint32_t value = sz_def_value(t, lod);
+            if (value == 0)
+               return;
+            mask |= SpvImageOperandsLodMask;
+            values[num_values++] = value;
+         }
+      }
+
+      if (offset != NULL) {
+         mask |= offset_constant ? SpvImageOperandsConstOffsetMask
+                                 : SpvImageOperandsOffsetMask;
+         values[num_values++] = offset_value;
+      }
+
+      if (mask != 0)
+         ops[n++] = mask;
+      for (unsigned i = 0; i < num_values; i++)
+         ops[n++] = values[i];
+
+      t->defs_id[tex->def.index] =
+         sz_spv_alu(t->m, SpvOpImageFetch, type, ops, n);
+      t->def_types[tex->def.index] = result_type;
+      return;
+   }
+
+   SpvOp opcode;
+   switch (tex->op) {
+   case nir_texop_tex:
+   case nir_texop_txb:
+      /* A bias is part of implicit-LOD sampling: GL's texture2D's optional bias
+       * argument and texture2DProj's, plus implicit-LOD texture2D in a fragment
+       * shader that asked for it. */
+      opcode = tex->is_shadow ? SpvOpImageSampleDrefImplicitLod
+                              : SpvOpImageSampleImplicitLod;
+      if (bias != NULL) {
+         const uint32_t value = sz_def_value(t, bias);
+         if (value == 0)
+            return;
+         mask |= SpvImageOperandsBiasMask;
+         values[num_values++] = value;
+      }
+      break;
+   case nir_texop_txl: {
+      opcode = tex->is_shadow ? SpvOpImageSampleDrefExplicitLod
+                              : SpvOpImageSampleExplicitLod;
+      if (lod == NULL) {
+         sz_fail(t, "explicit-LOD sample has no LOD");
+         return;
+      }
+      const uint32_t value = sz_def_value(t, lod);
+      if (value == 0)
+         return;
+      mask |= SpvImageOperandsLodMask;
+      values[num_values++] = value;
+      break;
+   }
+   case nir_texop_txd: {
+      opcode = tex->is_shadow ? SpvOpImageSampleDrefExplicitLod
+                              : SpvOpImageSampleExplicitLod;
+      if (ddx == NULL || ddy == NULL) {
+         sz_fail(t, "gradient sample has no gradients");
+         return;
+      }
+      const uint32_t dx = sz_def_value(t, ddx);
+      const uint32_t dy = sz_def_value(t, ddy);
+      if (dx == 0 || dy == 0)
+         return;
+      mask |= SpvImageOperandsGradMask;
+      values[num_values++] = dx;
+      values[num_values++] = dy;
+      break;
+   }
+   case nir_texop_tg4: {
+      opcode = tex->is_shadow ? SpvOpImageDrefGather : SpvOpImageGather;
+      /* The component is the last positional operand of a gather, before the
+       * image operands. */
+      if (tex->is_shadow) {
+         if (dref == NULL) {
+            sz_fail(t, "shadow gather has no comparator");
+            return;
+         }
+      }
+      break;
+   }
+   default:
       sz_fail(t, "texture opcode %d is not supported yet", (int)tex->op);
       return;
    }
 
-   uint32_t ops[5];
+   if (offset != NULL) {
+      mask |= offset_constant ? SpvImageOperandsConstOffsetMask
+                              : SpvImageOperandsOffsetMask;
+      values[num_values++] = offset_value;
+   }
+
+   uint32_t ops[8];
    unsigned n = 0;
    ops[n++] = sampled_image;
    ops[n++] = coord_value;
-   if (tex->is_shadow) {
-      if (dref == NULL) {
-         sz_fail(t, "shadow sample has no comparator");
-         return;
-      }
+   if (tex->is_shadow)
       ops[n++] = sz_def_value(t, dref);
-   }
-   for (unsigned i = 0; i < extra; i++)
-      ops[n++] = image_operands[i];
+   if (tex->op == nir_texop_tg4)
+      ops[n++] = sz_spv_const_int32(t->m, tex->component);
+   if (mask != 0)
+      ops[n++] = mask;
+   for (unsigned i = 0; i < num_values; i++)
+      ops[n++] = values[i];
 
    const uint32_t value = sz_spv_alu(t->m, opcode, type, ops, n);
    t->defs_id[tex->def.index] = value;
