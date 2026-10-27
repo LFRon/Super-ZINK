@@ -562,8 +562,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * look like a driver bug rather than a missing feature. */
    {
       struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
-      caps->glsl_feature_level = 140;
-      caps->glsl_feature_level_compatibility = 140;
+      caps->glsl_feature_level = 150;
+      caps->glsl_feature_level_compatibility = 150;
       caps->max_texture_2d_size = 16384;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
@@ -667,6 +667,15 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * zero is what an unset cap reads as. The translator's block type holds
        * exactly SZ_MAX_CONSTBUF_WORDS 32-bit words, so the two must agree. */
       caps->max_constant_buffer_size = SZ_MAX_CONSTBUF_WORDS * 4;
+
+      /* GL_ARB_texture_multisample: a multisampled image is an ordinary Vulkan
+       * image with samples > 1, and reading one is OpImageFetch with a Sample
+       * operand, which the translator already emits for nir_texop_txf_ms. The
+       * format layer decides per format whether the device can create and
+       * sample at that count, so the cap is a statement about the mechanism,
+       * not about any particular format. */
+      caps->texture_multisample =
+         screen->props.limits.framebufferColorSampleCounts != 0;
 
       /* Occlusion queries map straight onto VK_QUERY_TYPE_OCCLUSION.
        * Conditional rendering is evaluated on the CPU when

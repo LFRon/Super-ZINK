@@ -1679,6 +1679,77 @@ sz_stream_output_target_offset(struct pipe_stream_output_target *target)
    return 0;
 }
 
+/* GL_ARB_texture_multisample's glGetMultisamplefv(GL_SAMPLE_POSITION).
+ *
+ * Vulkan defines one set of standard sample locations and every implementation
+ * uses it, so the answer is not a device query -- there is nothing to ask. The
+ * grid below is the standard one from the Vulkan specification's "Standard
+ * Sample Locations" table, for the counts GL exposes.
+ *
+ * The values are in GL's convention: the origin is the lower-left corner of the
+ * pixel, which is also Vulkan's for this purpose (Vulkan's sample locations are
+ * relative to the upper-left, so y is flipped here to match). */
+static void
+sz_get_sample_position(struct pipe_context *pipe, unsigned sample_count,
+                       unsigned sample_index, float *out_value)
+{
+   (void)pipe;
+
+   static const float locations_2[][2] = {
+      { 0.75f, 0.25f }, { 0.25f, 0.75f },
+   };
+   static const float locations_4[][2] = {
+      { 0.375f, 0.875f }, { 0.875f, 0.375f },
+      { 0.125f, 0.625f }, { 0.625f, 0.125f },
+   };
+   static const float locations_8[][2] = {
+      { 0.5625f, 0.3125f }, { 0.4375f, 0.6875f }, { 0.8125f, 0.5625f },
+      { 0.3125f, 0.1875f }, { 0.1875f, 0.8125f }, { 0.0625f, 0.4375f },
+      { 0.6875f, 0.9375f }, { 0.9375f, 0.0625f },
+   };
+   static const float locations_16[][2] = {
+      { 0.5625f, 0.5625f }, { 0.4375f, 0.3125f }, { 0.3125f, 0.625f },
+      { 0.75f, 0.4375f },   { 0.1875f, 0.375f },  { 0.625f, 0.8125f },
+      { 0.8125f, 0.6875f }, { 0.6875f, 0.1875f }, { 0.375f, 0.875f },
+      { 0.5f, 0.0625f },    { 0.25f, 0.125f },    { 0.125f, 0.75f },
+      { 0.0f, 0.5f },       { 0.9375f, 0.25f },   { 0.875f, 0.9375f },
+      { 0.0625f, 0.0f },
+   };
+
+   const float(*table)[2] = NULL;
+   unsigned count = 0;
+
+   switch (sample_count) {
+   case 2:
+      table = locations_2;
+      count = ARRAY_SIZE(locations_2);
+      break;
+   case 4:
+      table = locations_4;
+      count = ARRAY_SIZE(locations_4);
+      break;
+   case 8:
+      table = locations_8;
+      count = ARRAY_SIZE(locations_8);
+      break;
+   case 16:
+      table = locations_16;
+      count = ARRAY_SIZE(locations_16);
+      break;
+   default:
+      break;
+   }
+
+   if (!table || sample_index >= count) {
+      out_value[0] = 0.5f;
+      out_value[1] = 0.5f;
+      return;
+   }
+
+   out_value[0] = table[sample_index][0];
+   out_value[1] = table[sample_index][1];
+}
+
 void
 sz_set_stream_output_targets(struct pipe_context *pipe, unsigned num_targets,
                              struct pipe_stream_output_target **targets,
@@ -3454,6 +3525,7 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->stream_output_target_offset = sz_stream_output_target_offset;
    pipe->set_stream_output_targets = sz_set_stream_output_targets;
    pipe->flush_resource = sz_flush_resource;
+   pipe->get_sample_position = sz_get_sample_position;
    pipe->texture_subdata = sz_texture_subdata;
    pipe->buffer_subdata = sz_buffer_subdata;
    pipe->buffer_map = sz_buffer_map;

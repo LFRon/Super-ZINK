@@ -113,6 +113,7 @@ struct sz_translate {
       SpvDim dim;
       bool arrayed;
       bool depth;
+      bool ms;
       /* OpTypeImage, kept so OpImageFetch and the query ops can name it. */
       uint32_t image_type;
       /* The value OpLoad produced from the variable, which is what the sampling
@@ -752,6 +753,8 @@ struct sz_glsl_map {
 static const struct sz_glsl_map sz_glsl_maps[] = {
    { nir_op_fabs, GLSLstd450FAbs },
    { nir_op_iabs, GLSLstd450SAbs },
+   /* sign() on integers; the float form is below. */
+   { nir_op_isign, GLSLstd450SSign },
    { nir_op_fmin, GLSLstd450FMin },
    { nir_op_fmax, GLSLstd450FMax },
    { nir_op_imin, GLSLstd450SMin },
@@ -1581,6 +1584,11 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
    const unsigned index = tex->sampler_index;
    const bool arrayed = tex->is_array;
    const bool depth = tex->is_shadow;
+   /* A sample index is only meaningful on a multisampled image, so the presence
+    * of one is what makes the declared OpTypeImage carry MS = 1. Without it the
+    * module is invalid: an ImageOperand of Sample requires the image to be
+    * multisampled (spirv-val rejects the mismatch). */
+   const bool ms = tex->op == nir_texop_txf_ms;
 
    for (unsigned i = 0; i < t->num_samplers; i++) {
       if (t->samplers[i].index != index)
@@ -1591,7 +1599,7 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
        * a SPIR-V variable a single pointee type. GL allows the aliasing, so say
        * so instead of sampling through the wrong declaration. */
       if (t->samplers[i].dim != dim || t->samplers[i].arrayed != arrayed ||
-          t->samplers[i].depth != depth) {
+          t->samplers[i].depth != depth || t->samplers[i].ms != ms) {
          sz_fail(t, "texture unit %u is sampled as two different texture types "
                  "in one shader", index);
          return 0;
@@ -1617,7 +1625,7 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
 
    const uint32_t sampled_type = sz_scalar_type(t, base, 32);
    const uint32_t image_type = sz_spv_type_image(
-      t->m, sampled_type, dim, depth, arrayed, false, true);
+      t->m, sampled_type, dim, depth, arrayed, ms, true);
    const uint32_t sampled_image_type = sz_spv_type_sampled_image(t->m, image_type);
    const uint32_t ptr_type =
       sz_spv_type_ptr(t->m, SpvStorageClassUniformConstant, sampled_image_type);
@@ -1638,6 +1646,7 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
    t->samplers[t->num_samplers].dim = dim;
    t->samplers[t->num_samplers].arrayed = arrayed;
    t->samplers[t->num_samplers].depth = depth;
+   t->samplers[t->num_samplers].ms = ms;
    t->samplers[t->num_samplers].image_type = image_type;
    t->samplers[t->num_samplers].value = value;
    t->num_samplers++;
@@ -1886,10 +1895,25 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
       ops[n++] = coord_value;
 
       if (tex->op == nir_texop_txf_ms) {
-         const uint32_t sample = ms_index ? sz_def_value(t, ms_index)
-                                          : sz_spv_const_int32(t->m, 0);
-         if (sample == 0)
-            return;
+         const struct sz_dtype want = { SZ_BASE_INT, 32, 1 };
+         uint32_t sample;
+
+         if (ms_index) {
+            /* The Sample operand must be a 32-bit *int* scalar. A uniform we
+             * load out of the untyped block carries whatever base the
+             * translator guessed from its uses, so it is reinterpreted here
+             * rather than relied on. */
+            sample = sz_def_value(t, ms_index);
+            if (sample == 0)
+               return;
+            const uint32_t cast =
+               sz_bitcast_to(t, sample, &t->def_types[ms_index->index], &want);
+            if (cast)
+               sample = cast;
+         } else {
+            sample = sz_spv_const_int32(t->m, 0);
+         }
+
          mask |= SpvImageOperandsSampleMask;
          values[num_values++] = sample;
       } else if (lod != NULL) {
