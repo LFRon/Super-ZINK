@@ -615,6 +615,22 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       /* Constant buffers arrive as real buffers rather than client memory, so
        * the driver never has to invent an upload path for them. */
       caps->prefer_real_buffer_in_constbuf0 = true;
+
+      /* Capabilities whose Gallium meaning is already exactly what Vulkan does:
+       *
+       *  - Vulkan never clamps vertex colours, so unclamped is the only mode.
+       *  - Dynamic rendering has no requirement that attachments share a size or
+       *    format, which is the restriction this cap says the driver lacks.
+       *  - Cube map sampling is always seamless.
+       *  - depthClampEnable is translated per pipeline, and it is the bit this
+       *    cap is about.
+       *  - textureLod in a fragment shader lowers to nir_texop_txl, which the
+       *    translator already emits as OpImageSample*ExplicitLod. */
+      caps->vertex_color_unclamped = true;
+      caps->mixed_framebuffer_sizes = true;
+      caps->seamless_cube_map = true;
+      caps->depth_clip_disable = true;
+      caps->fragment_shader_texture_lod = true;
    }
 
    /* Shader limits. st_extensions.c reads max_instructions == 0 as "this stage

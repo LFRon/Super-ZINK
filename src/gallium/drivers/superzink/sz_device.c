@@ -500,6 +500,9 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdCopyImageToBuffer, vkCmdCopyImageToBuffer);
    SZ_DEV_PROC(CmdCopyBufferToImage, vkCmdCopyBufferToImage);
    SZ_DEV_PROC(CmdCopyImage, vkCmdCopyImage);
+   SZ_DEV_PROC(CmdCopyImage2, vkCmdCopyImage2);
+   SZ_DEV_PROC(CmdBlitImage2, vkCmdBlitImage2);
+   SZ_DEV_PROC(CmdResolveImage2, vkCmdResolveImage2);
    SZ_DEV_PROC(CmdCopyBuffer, vkCmdCopyBuffer);
    SZ_DEV_PROC(CmdFillBuffer, vkCmdFillBuffer);
    SZ_DEV_PROC(CmdUpdateBuffer, vkCmdUpdateBuffer);

@@ -114,6 +114,23 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
       .pStencilAttachment = has_stencil ? &depth : NULL,
    };
 
+   if (sz_debug_enabled(SZ_DEBUG_INFO)) {
+      static unsigned last_color = ~0u, last_depth = ~0u;
+      const unsigned color_samples =
+         color_count && fb->cbufs[0].texture
+            ? MAX2(fb->cbufs[0].texture->nr_samples, 1)
+            : 0;
+      const unsigned depth_samples =
+         has_depth ? MAX2(fb->zsbuf.texture->nr_samples, 1) : 0;
+      if (color_samples != last_color || depth_samples != last_depth) {
+         mesa_logi("SZ: framebuffer %ux%u: %u colour buffer(s) at %ux, depth "
+                   "at %ux", fb->width, fb->height, color_count,
+                   MAX2(color_samples, 1), MAX2(depth_samples, 1));
+         last_color = color_samples;
+         last_depth = depth_samples;
+      }
+   }
+
    screen->vk.CmdBeginRendering(cmd, &info);
 
    ctx->rendering = true;

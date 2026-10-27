@@ -57,6 +57,14 @@ struct sz_resource {
    VkPipelineStageFlags2 pending_write_stages;
    VkAccessFlags2 pending_write_access;
 
+   /* A buffer whose contents the CPU wrote through a direct mapping and which
+    * the GPU has not yet been told about. Vulkan makes host writes visible to
+    * the device only after a barrier from HOST/HOST_WRITE, and the uploaders
+    * write vertices and uniforms this way, so the flag is what turns "the
+    * buffer is already bound" into "there is nothing to synchronise" -- which
+    * was wrong and showed up as intermittent garbage geometry. */
+   bool host_written;
+
    /* Set when the resource was created with linear tiling, which forbids
     * VK_IMAGE_TILING_OPTIMAL-only usage and needs explicit cache flushes. */
    bool linear;

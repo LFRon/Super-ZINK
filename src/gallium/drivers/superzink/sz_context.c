@@ -17,6 +17,7 @@
 #include "sz_descriptor.h"
 
 #include "sz_batch.h"
+#include "sz_blit.h"
 #include "sz_compiler.h"
 #include "sz_debug.h"
 #include "sz_format.h"
@@ -36,12 +37,6 @@
 #include "vk_format.h"
 
 #include <string.h>
-
-static inline struct sz_context *
-sz_context(struct pipe_context *pipe)
-{
-   return (struct sz_context *)pipe;
-}
 
 /* Builds a VkClearColorValue from an unpacked texel.
  *
@@ -142,7 +137,7 @@ sz_clear_value_depth_stencil(VkClearDepthStencilValue *out,
 /* Starts recording on first use and returns the live command buffer. Every
  * recorder goes through here, so no call site needs to know whether a batch is
  * already open. */
-static VkCommandBuffer
+VkCommandBuffer
 sz_context_cmd(struct sz_context *ctx)
 {
    if (!ctx->batch) {
@@ -173,7 +168,7 @@ sz_state_changed(struct sz_context *ctx, unsigned dirty)
  * which costs a begin/end pair per clear/copy interleaved with draws, and is the
  * price of not having to prove that a clear never lands between two draws in
  * Phase 1. */
-static VkCommandBuffer
+VkCommandBuffer
 sz_context_cmd_no_pass(struct sz_context *ctx)
 {
    VkCommandBuffer cmd = sz_context_cmd(ctx);
@@ -226,6 +221,7 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
    /* The winsys asks for this before handing a buffer to the display engine.
     * Without it the compositor can sample a surface the GPU is still writing. */
    if (flags & PIPE_FLUSH_END_OF_FRAME) {
+      ctx->screen->stats.end_of_frame++;
       sz_queue_wait_idle(&ctx->screen->batch_state);
 
       /* SZ_DEBUG=stats: a periodic snapshot, because an app killed with
@@ -245,6 +241,10 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
                       screen->stats.descriptor_pushes,
                       screen->stats.vertex_buffer_binds,
                       screen->stats.state_sets, screen->stats.submits);
+            mesa_logi("SZ: stats: blits=%" PRIu64 " (resolves %" PRIu64
+                      ", copies %" PRIu64 ") end_of_frame=%" PRIu64,
+                      screen->stats.blits, screen->stats.resolves,
+                      screen->stats.copies, screen->stats.end_of_frame);
          }
       }
 
@@ -2038,13 +2038,18 @@ sz_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 }
 
 static void
-sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
-{
-}
-
-static void
 sz_flush_resource(struct pipe_context *pipe, struct pipe_resource *res)
 {
+   struct sz_context *ctx = sz_context(pipe);
+
+   /* "Make this resource visible to somebody else." The winsys calls this right
+    * before a dma-buf is exported for the compositor, and the compositor samples
+    * it without a fence of its own -- so the submission that wrote it has to be
+    * complete, not merely queued. Waiting here is cheap (once per presented
+    * resource) and removes the window in which a half-rendered frame could be
+    * sampled. */
+   sz_context_submit(ctx);
+   sz_queue_wait_idle(&ctx->screen->batch_state);
 }
 
 static void
@@ -2310,6 +2315,8 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
 
    void *direct = sz_resource_map(r);
    if (direct) {
+      if (usage & PIPE_MAP_READ)
+         sz_bo_invalidate(r->bo, box->x, box->width);
       t->base.stride = box->width;
       t->base.layer_stride = 0;
       *transfer = &t->base;
@@ -2364,6 +2371,22 @@ static void
 sz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
 {
    struct sz_transfer *t = (struct sz_transfer *)transfer;
+
+   if (!t->staging) {
+      /* A direct mapping wrote straight into device memory. Flushing the range
+       * handles non-coherent memory; the flag makes the next access emit the
+       * HOST -> read barrier that Vulkan requires even for coherent memory. */
+      if (t->base.usage & PIPE_MAP_WRITE) {
+         struct sz_resource *r = sz_resource(t->base.resource);
+         if (r->bo) {
+            sz_bo_flush(r->bo, t->base.box.x, t->base.box.width);
+            if (t->base.resource->target == PIPE_BUFFER)
+               r->host_written = true;
+         }
+      }
+      free(t);
+      return;
+   }
 
    if (t->staging && (t->base.usage & PIPE_MAP_WRITE)) {
       struct sz_context *ctx = sz_context(pipe);

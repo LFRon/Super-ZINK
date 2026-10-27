@@ -248,11 +248,22 @@ sz_resource_access(struct sz_screen *screen, VkCommandBuffer cmd,
     * write. A buffer that was never written needs nothing, which is the common
     * case for a static vertex buffer drawn every frame. */
    if (res->buffer != VK_NULL_HANDLE) {
-      if (res->pending_write_stages != 0) {
+      /* Host writes through a mapped pointer are only visible to the device
+       * after a barrier whose source is HOST/HOST_WRITE. The uploaders write
+       * vertices and uniforms that way, so this is the common case for a
+       * buffer, not an exotic one. */
+      VkPipelineStageFlags2 src_stages = res->pending_write_stages;
+      VkAccessFlags2 src_access = res->pending_write_access;
+      if (res->host_written) {
+         src_stages |= VK_PIPELINE_STAGE_2_HOST_BIT;
+         src_access |= VK_ACCESS_2_HOST_WRITE_BIT;
+      }
+
+      if (src_stages != 0) {
          const VkBufferMemoryBarrier2 barrier = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-            .srcStageMask = res->pending_write_stages,
-            .srcAccessMask = res->pending_write_access,
+            .srcStageMask = src_stages,
+            .srcAccessMask = src_access,
             .dstStageMask = dst.stages,
             .dstAccessMask = dst.access,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -271,6 +282,7 @@ sz_resource_access(struct sz_screen *screen, VkCommandBuffer cmd,
          screen->vk.CmdPipelineBarrier2(cmd, &dep);
          res->pending_write_stages = 0;
          res->pending_write_access = 0;
+         res->host_written = false;
       }
 
       /* Marked before the write is recorded, not after: the caller issues the

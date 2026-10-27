@@ -102,6 +102,9 @@ struct sz_vk_entrypoints {
    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
    PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
    PFN_vkCmdCopyImage CmdCopyImage;
+   PFN_vkCmdCopyImage2 CmdCopyImage2;
+   PFN_vkCmdBlitImage2 CmdBlitImage2;
+   PFN_vkCmdResolveImage2 CmdResolveImage2;
    PFN_vkCmdCopyBuffer CmdCopyBuffer;
    PFN_vkCmdFillBuffer CmdFillBuffer;
    PFN_vkCmdUpdateBuffer CmdUpdateBuffer;
@@ -269,6 +272,10 @@ struct sz_screen {
       uint64_t descriptor_pushes;
       uint64_t vertex_buffer_binds;
       uint64_t state_sets;       /* viewport/scissor/blend/stencil emissions */
+      uint64_t blits;            /* pipe_context::blit calls */
+      uint64_t resolves;         /* of those, MSAA resolves */
+      uint64_t copies;           /* of those, same-size image copies */
+      uint64_t end_of_frame;     /* flushes that carried PIPE_FLUSH_END_OF_FRAME */
       uint64_t submits;
    } stats;
 };

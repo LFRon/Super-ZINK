@@ -3,6 +3,7 @@
 
 files_libsuperzink = files(
   'sz_batch.c',
+  'sz_blit.c',
   'sz_bo.c',
   'sz_caps.c',
   'sz_compiler.c',

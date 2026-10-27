@@ -588,6 +588,36 @@ sz_pipeline_vertex_input(struct sz_context *ctx,
    *out_attribute_count = element_count;
 }
 
+/* Sample count of the framebuffer.
+ *
+ * pipe_surface carries no sample count of its own -- the resource does, and the
+ * "no attachment" framebuffer is the only case that uses fb->samples. Reading
+ * pipe_surface::nr_samples returns 1 for a multisampled renderbuffer surface,
+ * which builds a pipeline for the wrong sample count: Vulkan then either
+ * rejects the draw (VUID-vkCmdDraw-multisampledRenderToSingleSampled-07286) or,
+ * on drivers that do not check, renders into a mismatched attachment.
+ *
+ * All attachments of a framebuffer share one sample count by the GL rules, so
+ * the maximum is the framebuffer's count; a disagreement means the state
+ * tracker built an invalid framebuffer and is reported once. */
+static VkSampleCountFlagBits
+sz_framebuffer_samples(const struct pipe_framebuffer_state *fb)
+{
+   unsigned samples = fb->samples;
+
+   for (unsigned i = 0; i < fb->nr_cbufs; i++) {
+      if (fb->cbufs[i].texture)
+         samples = MAX2(samples, fb->cbufs[i].texture->nr_samples);
+   }
+   if (fb->zsbuf.texture)
+      samples = MAX2(samples, fb->zsbuf.texture->nr_samples);
+
+   if (samples == 0)
+      samples = 1;
+
+   return sz_vk_sample_count(samples);
+}
+
 /* Builds a pipeline for the current framebuffer formats and vertex layout. */
 static bool
 sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
@@ -694,8 +724,7 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
       .lineWidth = 1.0f,
    };
 
-   const VkSampleCountFlagBits samples =
-      sz_vk_sample_count(fb->nr_cbufs ? fb->cbufs[0].nr_samples : 0);
+   const VkSampleCountFlagBits samples = sz_framebuffer_samples(fb);
 
    const VkPipelineMultisampleStateCreateInfo multisample = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
@@ -921,7 +950,7 @@ sz_pipeline_key_from_state(struct sz_context *ctx, VkPrimitiveTopology topology,
                             &key->vertex_binding_count, key->vertex_attributes,
                             &key->vertex_attribute_count);
 
-   key->samples = sz_vk_sample_count(fb->nr_cbufs ? fb->cbufs[0].nr_samples : 0);
+   key->samples = sz_framebuffer_samples(fb);
    key->color_count = MIN2(fb->nr_cbufs, PIPE_MAX_COLOR_BUFS);
    for (unsigned i = 0; i < key->color_count; i++)
       key->color[i] = sz_vk_format(ctx->screen, fb->cbufs[i].format);

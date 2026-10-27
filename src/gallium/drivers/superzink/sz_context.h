@@ -252,11 +252,24 @@ struct sz_context {
    } state;
 };
 
+/* The command buffer being recorded, acquired on first use. The no_pass variant
+ * closes an open render pass first, because blits, clears and barrier-only
+ * commands are illegal inside one. Shared with the blit module. */
+VkCommandBuffer sz_context_cmd(struct sz_context *ctx);
+VkCommandBuffer sz_context_cmd_no_pass(struct sz_context *ctx);
+
 /* Emits the pending draw batch (and any state it needs) into the current command
  * buffer. Every state setter, every non-draw command and every submission calls
  * it first, which is what makes the batching correct: whatever a draw needs is
  * captured before anything else can change the state. */
 void sz_draw_flush(struct sz_context *ctx);
+
+/* pipe_context is the first member, so the cast is the whole accessor. */
+static inline struct sz_context *
+sz_context(struct pipe_context *pipe)
+{
+   return (struct sz_context *)pipe;
+}
 
 /* Creates the pipe_context. Returns NULL on failure. */
 struct pipe_context *sz_context_create(struct sz_screen *screen,
