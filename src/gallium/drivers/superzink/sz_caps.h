@@ -120,7 +120,10 @@
      q.image_int64.shaderImageInt64Atomics)                                      \
    X(multi_draw,                   "multiDraw",                                  \
      "VK_EXT_multi_draw",                   SZ_CORE_NONE,                      \
-     q.multi_draw.multiDraw)
+     q.multi_draw.multiDraw)                                                    \
+   X(transform_feedback,           "transformFeedback",                          \
+     "VK_EXT_transform_feedback",           SZ_CORE_NONE,                      \
+     q.transform_feedback.transformFeedback)
 
 /* Every VkPhysicalDevice*Features structure Super-ZINK ever chains, in one
  * place. Querying (sz_caps_init) and enabling (sz_device_create) both go
@@ -152,6 +155,7 @@ struct sz_vk_features {
    VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsr;
    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64;
    VkPhysicalDeviceMultiDrawFeaturesEXT multi_draw;
+   VkPhysicalDeviceTransformFeedbackFeaturesEXT transform_feedback;
 
    /* Not a feature: VkPhysicalDeviceVulkan14Properties carries the two
     * local-read attachment bits, and vk.xml gives them no extension-side
@@ -174,6 +178,7 @@ struct sz_vk_feature_selection {
    bool fragment_shading_rate;
    bool shader_image_int64;
    bool multi_draw;
+   bool transform_feedback;
 };
 
 void sz_vk_features_prepare(struct sz_vk_features *f, uint32_t api_version);
@@ -218,6 +223,10 @@ struct sz_caps {
    /* VkPhysicalDeviceMultiDrawPropertiesEXT::maxMultiDrawCount, or zero when
     * the extension is absent. The draw stream never batches more than this. */
    uint32_t max_multi_draw_count;
+
+   /* VkPhysicalDeviceTransformFeedbackPropertiesEXT::maxTransformFeedbackBuffers,
+    * or zero when the extension is absent. GL only needs four. */
+   uint32_t max_transform_feedback_buffers;
 
    uint32_t instance_api_version;
    uint32_t device_api_version;

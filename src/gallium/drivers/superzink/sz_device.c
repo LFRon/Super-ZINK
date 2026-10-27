@@ -228,6 +228,7 @@ sz_feature_selection(const struct sz_screen *screen)
       .fragment_shading_rate = caps->fragment_shading_rate,
       .shader_image_int64 = caps->shader_image_int64_atomics,
       .multi_draw = caps->multi_draw,
+      .transform_feedback = caps->transform_feedback,
    };
 }
 
@@ -305,6 +306,7 @@ sz_gate_features(const struct sz_screen *screen, struct sz_vk_features *features
    features->image_int64.shaderImageInt64Atomics &=
       caps->shader_image_int64_atomics;
    features->multi_draw.multiDraw &= caps->multi_draw;
+   features->transform_feedback.transformFeedback &= caps->transform_feedback;
 }
 
 /* Post-create self-check. A feature that we asked for but the device did not
@@ -509,6 +511,9 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdBeginQuery, vkCmdBeginQuery);
    SZ_DEV_PROC(CmdEndQuery, vkCmdEndQuery);
    SZ_DEV_PROC(GetQueryPoolResults, vkGetQueryPoolResults);
+   SZ_DEV_PROC(CmdBindTransformFeedbackBuffersEXT, vkCmdBindTransformFeedbackBuffersEXT);
+   SZ_DEV_PROC(CmdBeginTransformFeedbackEXT, vkCmdBeginTransformFeedbackEXT);
+   SZ_DEV_PROC(CmdEndTransformFeedbackEXT, vkCmdEndTransformFeedbackEXT);
    SZ_DEV_PROC(CmdCopyBuffer, vkCmdCopyBuffer);
    SZ_DEV_PROC(CmdFillBuffer, vkCmdFillBuffer);
    SZ_DEV_PROC(CmdUpdateBuffer, vkCmdUpdateBuffer);

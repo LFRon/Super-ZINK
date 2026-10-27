@@ -29,6 +29,7 @@
 #include <string.h>
 
 #include "compiler/glsl_types.h"
+#include "pipe/p_state.h"
 #include "compiler/nir/nir.h"
 #include "compiler/spirv/GLSL.std.450.h"
 #include "util/log.h"
@@ -67,6 +68,12 @@ struct sz_translate {
    struct nir_shader *nir;
    char **error;
    bool failed;
+
+   /* Vertex transform feedback. Mesa hands the driver a list of captured
+    * outputs whose `register_index` is the *rank* of the varying among
+    * outputs_written, not its location, so the mapping has to be reconstructed
+    * from the shader's own output mask. */
+   const struct pipe_stream_output_info *so;
 
    /* Indexed by nir_def::index. */
    struct sz_dtype *def_types;
@@ -459,6 +466,71 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
    return false;
 }
 
+/* Locates the shader output variable declared at `slot`. */
+static nir_variable *
+sz_find_output(struct sz_translate *t, unsigned slot)
+{
+   nir_foreach_variable_with_modes (var, t->nir, nir_var_shader_out) {
+      if ((unsigned)var->data.location == slot)
+         return var;
+   }
+   return NULL;
+}
+
+/* Rank of `slot` among the shader's written outputs, in ascending slot order.
+ *
+ * st_translate_stream_output_info() builds the same ranking on the Mesa side and
+ * stores it in pipe_stream_output::register_index. One subtlety is carried over:
+ * st appends gl_PointSize to outputs_written when a shader writes it implicitly,
+ * and excludes it from the transform-feedback list. A PointSize the application
+ * did not declare explicitly is therefore not counted here either, or every
+ * output above it would be captured from the wrong variable. */
+static unsigned
+sz_output_rank(struct sz_translate *t, unsigned slot)
+{
+   unsigned rank = 0;
+
+   for (unsigned s = 0; s < slot; s++) {
+      if (!(t->nir->info.outputs_written & BITFIELD64_BIT(s)))
+         continue;
+      if (s == VARYING_SLOT_PSIZ) {
+         nir_variable *var = sz_find_output(t, s);
+         if (!var || !var->data.explicit_location)
+            continue;
+      }
+      rank++;
+   }
+
+   return rank;
+}
+
+/* Decorates one output variable with the transform-feedback placement of every
+ * capture that names it. */
+static void
+sz_decorate_stream_output(struct sz_translate *t, const nir_variable *var,
+                          uint32_t id)
+{
+   if (!t->so || t->so->num_outputs == 0 ||
+       t->nir->info.stage != MESA_SHADER_VERTEX ||
+       var->data.mode != nir_var_shader_out)
+      return;
+
+   const unsigned rank = sz_output_rank(t, (unsigned)var->data.location);
+
+   for (unsigned i = 0; i < t->so->num_outputs; i++) {
+      const struct pipe_stream_output *o = &t->so->output[i];
+      if (o->register_index != rank)
+         continue;
+
+      sz_spv_decorate(t->m, id, SpvDecorationXfbBuffer, o->output_buffer);
+      /* Stride and offset are in dwords on the Gallium side and in bytes in
+       * SPIR-V. */
+      sz_spv_decorate(t->m, id, SpvDecorationXfbStride,
+                      t->so->stride[o->output_buffer] * 4);
+      sz_spv_decorate(t->m, id, SpvDecorationOffset, o->dst_offset * 4);
+   }
+}
+
 static bool
 sz_declare_variable(struct sz_translate *t, nir_variable *var)
 {
@@ -517,10 +589,20 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
    const uint32_t ptr_type = sz_spv_type_ptr(t->m, storage, pointee);
    const uint32_t id = sz_spv_variable(t->m, ptr_type, storage);
 
-   if (has_builtin)
+   if (has_builtin) {
       sz_spv_decorate_builtin(t->m, id, builtin);
-   else
+   } else {
       sz_spv_decorate(t->m, id, SpvDecorationLocation, location);
+      /* The GLSL linker packs several small varyings into one location, each at
+       * its own component (`location_frac`). Without the Component decoration
+       * two variables would claim the same Location, which is invalid SPIR-V on
+       * the output side and reads the wrong channel on the input side. */
+      if (var->data.location_frac != 0)
+         sz_spv_decorate(t->m, id, SpvDecorationComponent,
+                         var->data.location_frac);
+   }
+
+   sz_decorate_stream_output(t, var, id);
 
    /* Integer varyings have to be flat: the Vulkan rule is unconditional, and a
     * missing decoration is a validation error rather than a performance hint.
@@ -2296,11 +2378,13 @@ sz_emit_shader(struct sz_translate *t, uint32_t function)
 }
 
 bool
-sz_nir_to_spirv(struct nir_shader *nir, uint32_t **words, size_t *word_count,
-                char **error)
+sz_nir_to_spirv(struct nir_shader *nir,
+                const struct pipe_stream_output_info *so, uint32_t **words,
+                size_t *word_count, char **error)
 {
    struct sz_translate t = {
       .nir = nir,
+      .so = so,
       .error = error,
    };
 
@@ -2373,6 +2457,15 @@ sz_nir_to_spirv(struct nir_shader *nir, uint32_t **words, size_t *word_count,
    const uint32_t function = sz_spv_id(t.m);
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       sz_spv_execution_mode(t.m, function, SpvExecutionModeOriginUpperLeft);
+   /* Vulkan refuses to begin transform feedback for a pipeline whose last
+    * pre-rasterization stage does not declare the Xfb execution mode
+    * (VUID-vkCmdBeginTransformFeedbackEXT-None-04128). The per-variable
+    * XfbBuffer/XfbStride/Offset decorations alone are not enough. */
+   if (nir->info.stage == MESA_SHADER_VERTEX && t.so && t.so->num_outputs > 0) {
+      /* The Xfb execution mode is only valid with this capability declared. */
+      sz_spv_capability(t.m, SpvCapabilityTransformFeedback);
+      sz_spv_execution_mode(t.m, function, SpvExecutionModeXfb);
+   }
 
    if (!sz_emit_shader(&t, function))
       goto fail;

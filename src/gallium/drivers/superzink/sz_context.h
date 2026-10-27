@@ -75,6 +75,10 @@ struct sz_state {
           * report a link error, while a draw has nowhere to put one. */
          uint32_t *spirv;
          size_t spirv_words;
+
+         /* Copied from pipe_shader_state: the translator needs it to place the
+          * transform-feedback decorations. */
+         struct pipe_stream_output_info stream_output;
       } shader;
    } u;
 };
@@ -179,6 +183,19 @@ struct sz_context {
    bool condition_expected;
    bool condition_passes;
 
+   /* Transform feedback, as set by glBindBufferBase and friends. A non-zero
+    * target count means the draws recorded from now on capture. */
+   unsigned num_so_targets;
+   struct pipe_stream_output_target *so_targets[PIPE_MAX_SO_BUFFERS];
+   unsigned so_offsets[PIPE_MAX_SO_BUFFERS];
+   /* Vulkan only captures through the counter-buffer path: the begin call
+    * loads the initial dword offset from a counter buffer, and a capture with
+    * no counters at all is silently dropped by the driver. One 4-byte slot per
+    * stream output buffer is enough, zeroed before every capture because this
+    * driver keeps track of the target offsets itself. */
+   VkBuffer so_counter_buffer;
+   struct sz_bo *so_counter_bo;
+
    /* Draw stream: draws accumulate here and leave as one vkCmdDrawMulti* call.
     *
     * The invariant that makes this correct is that every state setter flushes
@@ -282,6 +299,19 @@ sz_context(struct pipe_context *pipe)
 {
    return (struct sz_context *)pipe;
 }
+
+/* Transform feedback targets (sz_context.c). */
+struct pipe_stream_output_target *
+sz_create_stream_output_target(struct pipe_context *pipe,
+                               struct pipe_resource *res, unsigned buffer_offset,
+                               unsigned buffer_size);
+void sz_stream_output_target_destroy(struct pipe_context *pipe,
+                                     struct pipe_stream_output_target *target);
+void sz_set_stream_output_targets(struct pipe_context *pipe, unsigned num_targets,
+                                  struct pipe_stream_output_target **targets,
+                                  const unsigned *offsets,
+                                  enum mesa_prim output_prim);
+uint32_t sz_stream_output_target_offset(struct pipe_stream_output_target *target);
 
 /* Query objects (sz_query.c). */
 struct pipe_query *sz_create_query(struct pipe_context *pipe,

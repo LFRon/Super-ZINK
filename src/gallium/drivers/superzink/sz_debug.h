@@ -27,6 +27,7 @@ enum sz_debug_flag {
    SZ_DEBUG_FLUSHSYNC = (1 << 8),
    SZ_DEBUG_QUIET     = (1 << 9),
    SZ_DEBUG_SELFTEST  = (1 << 10),
+   SZ_DEBUG_TRACE     = (1 << 11),
 };
 
 extern uint32_t sz_debug;
@@ -38,6 +39,19 @@ sz_debug_enabled(enum sz_debug_flag flag)
 {
    return (sz_debug & flag) != 0;
 }
+
+extern int sz_trace_budget;
+
+void sz_trace_(const char *fmt, ...) PRINTFLIKE(1, 2);
+
+/* One-shot breadcrumb for the resource life cycle (create -> render -> hand to
+ * the winsys). Only the first callsite budget of events is printed, because the
+ * interesting window is usually the first few frames. */
+#define sz_trace(fmt, ...)                                                     \
+   do {                                                                        \
+      if (sz_debug & SZ_DEBUG_TRACE)                                           \
+         sz_trace_(fmt, ##__VA_ARGS__);                                        \
+   } while (0)
 
 /* Warnings describe a degraded-but-working path, so they are visible by default
  * and silenced by SZ_DEBUG=quiet. Failures use mesa_loge() and are never

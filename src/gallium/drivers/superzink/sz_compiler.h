@@ -114,8 +114,11 @@ void sz_lower_nir(struct nir_shader *nir);
  * subset. Every rejection names the NIR instruction it could not handle: a
  * translator that silently skips an instruction produces a shader that renders
  * the wrong thing, which is far more expensive to debug than a refusal. */
-bool sz_nir_to_spirv(struct nir_shader *nir, uint32_t **out_words,
-                     size_t *out_size, char **error);
+struct pipe_stream_output_info;
+
+bool sz_nir_to_spirv(struct nir_shader *nir,
+                     const struct pipe_stream_output_info *so,
+                     uint32_t **out_words, size_t *out_size, char **error);
 
 /* SZ_DEBUG=spirv: writes a module to dumpNN_<suffix>.spv in the working
  * directory, next to the bootstrap shaders' dumps. */

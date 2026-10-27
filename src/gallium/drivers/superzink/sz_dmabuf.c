@@ -222,6 +222,9 @@ sz_screen_resource_get_handle(struct pipe_screen *pscreen,
    if (!handle || !res)
       return false;
 
+   sz_trace("get_handle res=%p %ux%u fmt=%s type=%u", (void *)pres, pres->width0,
+            pres->height0, util_format_name(pres->format), handle->type);
+
    if (handle->type != WINSYS_HANDLE_TYPE_FD) {
       /* Flink and KMS handles name a GEM object; a Vulkan allocation has none. */
       if (!screen->dmabuf_warned) {

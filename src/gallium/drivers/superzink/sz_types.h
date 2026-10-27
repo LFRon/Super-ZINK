@@ -113,6 +113,11 @@ struct sz_vk_entrypoints {
    PFN_vkCmdBeginQuery CmdBeginQuery;
    PFN_vkCmdEndQuery CmdEndQuery;
    PFN_vkGetQueryPoolResults GetQueryPoolResults;
+
+   /* VK_EXT_transform_feedback (sz_context). NULL when not enabled. */
+   PFN_vkCmdBindTransformFeedbackBuffersEXT CmdBindTransformFeedbackBuffersEXT;
+   PFN_vkCmdBeginTransformFeedbackEXT CmdBeginTransformFeedbackEXT;
+   PFN_vkCmdEndTransformFeedbackEXT CmdEndTransformFeedbackEXT;
    PFN_vkCmdCopyBuffer CmdCopyBuffer;
    PFN_vkCmdFillBuffer CmdFillBuffer;
    PFN_vkCmdUpdateBuffer CmdUpdateBuffer;

@@ -210,14 +210,19 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
 {
    struct sz_context *ctx = sz_context(pipe);
 
-   /* There is no fence type yet. Returning NULL is honest: the batch is handed
-    * to the queue before this returns, so the caller cannot observe it as
-    * "not yet submitted". A real timeline-backed fence arrives in Phase 2,
-    * where something actually needs to wait on GPU completion. */
+   sz_trace("flush flags=0x%x fence=%d", flags, fence != NULL);
+
+   /* There is no fence object yet, so a NULL return has to mean "already
+    * complete" -- and it only does if the submission is waited for here. A
+    * caller that flushes without either flag only asked for the work to reach
+    * the queue, and keeps running. */
    if (fence)
       *fence = NULL;
 
    sz_context_submit(ctx);
+
+   if (flags & PIPE_FLUSH_HINT_FINISH)
+      sz_queue_wait_idle(&ctx->screen->batch_state);
 
    /* The winsys asks for this before handing a buffer to the display engine.
     * Without it the compositor can sample a surface the GPU is still writing. */
@@ -611,6 +616,10 @@ sz_create_shader_state(struct pipe_context *pipe,
 
    state->stage = stage;
    state->u.shader.base = *templ;
+   /* The interpreter of this description lives in the translator: capture
+    * placement has to become SPIR-V decorations, so it is needed at shader
+    * translation time rather than at draw time. */
+   state->u.shader.stream_output = templ->stream_output;
 
    /* The IR belongs to the state tracker, which frees it independently of us, so
     * the driver needs its own copy: a shader object outlives the one call that
@@ -641,7 +650,8 @@ sz_create_shader_state(struct pipe_context *pipe,
    }
 
    char *error = NULL;
-   if (!sz_nir_to_spirv(state->u.shader.nir, &state->u.shader.spirv,
+   if (!sz_nir_to_spirv(state->u.shader.nir, &state->u.shader.stream_output,
+                        &state->u.shader.spirv,
                         &state->u.shader.spirv_words, &error)) {
       /* The caller reads error_message only when it asks for compile errors, and
        * frees it with free(), which is why this is strdup and not ralloc. */
@@ -1573,12 +1583,70 @@ sz_set_patch_vertices(struct pipe_context *pipe, uint8_t patch_vertices)
    sz_context(pipe)->state.patch_vertices = patch_vertices;
 }
 
-static void
+/* The target is a bare wrapper: the buffer, the offset and the size all live in
+ * the Gallium base structure, and the VkBuffer is reached through the resource. */
+struct pipe_stream_output_target *
+sz_create_stream_output_target(struct pipe_context *pipe,
+                               struct pipe_resource *res, unsigned buffer_offset,
+                               unsigned buffer_size)
+{
+   struct pipe_stream_output_target *target = CALLOC_STRUCT(pipe_stream_output_target);
+   if (!target)
+      return NULL;
+
+   /* The caller owns one reference. CALLOC leaves the count at zero, which
+    * makes the first reference_release free the object while the state tracker
+    * still points at it -- the use-after-free shows up in end_transform_feedback
+    * long after the release. */
+   pipe_reference_init(&target->reference, 1);
+
+   target->context = pipe;
+   pipe_resource_reference(&target->buffer, res);
+   target->buffer_offset = buffer_offset;
+   target->buffer_size = buffer_size;
+   return target;
+}
+
+void
+sz_stream_output_target_destroy(struct pipe_context *pipe,
+                                struct pipe_stream_output_target *target)
+{
+   if (!target)
+      return;
+   pipe_resource_reference(&target->buffer, NULL);
+   free(target);
+}
+
+uint32_t
+sz_stream_output_target_offset(struct pipe_stream_output_target *target)
+{
+   /* The number of vertices written is a GL 3.2 (ARB_transform_feedback2) query;
+    * returning zero keeps glGetBufferParameteriv from inventing a number. */
+   (void)target;
+   return 0;
+}
+
+void
 sz_set_stream_output_targets(struct pipe_context *pipe, unsigned num_targets,
                              struct pipe_stream_output_target **targets,
                              const unsigned *offsets,
                              enum mesa_prim output_prim)
 {
+   struct sz_context *ctx = sz_context(pipe);
+
+   /* Draws queued so far belong to the previous capture configuration. */
+   sz_draw_flush(ctx);
+
+   const unsigned n = MIN2(num_targets, PIPE_MAX_SO_BUFFERS);
+   for (unsigned i = 0; i < n; i++) {
+      pipe_so_target_reference(&ctx->so_targets[i], targets[i]);
+      ctx->so_offsets[i] = offsets ? offsets[i] : 0;
+   }
+   for (unsigned i = n; i < PIPE_MAX_SO_BUFFERS; i++)
+      pipe_so_target_reference(&ctx->so_targets[i], NULL);
+
+   ctx->num_so_targets = n;
+   (void)output_prim;
 }
 
 /* Records the viewport and scissor for slot 0.
@@ -1802,6 +1870,48 @@ sz_emit_draws(struct sz_context *ctx, VkCommandBuffer cmd)
    }
 }
 
+/* The counter buffer exists because Vulkan requires one for a capture to
+ * happen at all: vkCmdBeginTransformFeedbackEXT loads the starting dword offset
+ * of every buffer from a counter buffer, and RADV (like the other drivers)
+ * disables the stream when it is called without counters. */
+static bool
+sz_so_counter_ensure(struct sz_context *ctx)
+{
+   if (ctx->so_counter_buffer != VK_NULL_HANDLE)
+      return true;
+
+   struct sz_screen *screen = ctx->screen;
+   const VkBufferCreateInfo ci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = PIPE_MAX_SO_BUFFERS * sizeof(uint32_t),
+      .usage = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT |
+               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   VkBuffer buffer = VK_NULL_HANDLE;
+   if (screen->vk.CreateBuffer(screen->dev, &ci, NULL, &buffer) != VK_SUCCESS) {
+      sz_warn_once("could not create the transform feedback counter buffer");
+      return false;
+   }
+
+   VkMemoryRequirements req;
+   screen->vk.GetBufferMemoryRequirements(screen->dev, buffer, &req);
+   struct sz_bo *bo = sz_bo_alloc(screen, &req, 0);
+   if (!bo ||
+       screen->vk.BindBufferMemory(screen->dev, buffer, sz_bo_memory(bo),
+                                   sz_bo_offset(bo)) != VK_SUCCESS) {
+      sz_warn_once("could not back the transform feedback counter buffer");
+      if (bo)
+         sz_bo_free(bo);
+      screen->vk.DestroyBuffer(screen->dev, buffer, NULL);
+      return false;
+   }
+
+   ctx->so_counter_buffer = buffer;
+   ctx->so_counter_bo = bo;
+   return true;
+}
+
 void
 sz_draw_flush(struct sz_context *ctx)
 {
@@ -1948,8 +2058,84 @@ sz_draw_flush(struct sz_context *ctx)
       ctx->screen->stats.state_sets++;
    }
 
+   /* Transform feedback brackets the batch. Beginning and ending per batch is
+    * what makes the capture follow the state that was in effect when the draws
+    * were queued: set_stream_output_targets() flushes, so a batch never spans
+    * two capture configurations. */
+   const bool tf = ctx->num_so_targets > 0;
+
+   if (tf) {
+      VkBuffer buffers[PIPE_MAX_SO_BUFFERS];
+      VkDeviceSize offsets[PIPE_MAX_SO_BUFFERS];
+      unsigned n = 0;
+
+      for (unsigned i = 0; i < ctx->num_so_targets; i++) {
+         struct pipe_stream_output_target *t = ctx->so_targets[i];
+         if (!t || !t->buffer)
+            continue;
+         struct sz_resource *res = sz_resource(t->buffer);
+         if (res->buffer == VK_NULL_HANDLE)
+            continue;
+         buffers[n] = res->buffer;
+         offsets[n] = t->buffer_offset + ctx->so_offsets[i];
+         n++;
+      }
+
+      if (n > 0 && ctx->screen->vk.CmdBeginTransformFeedbackEXT &&
+          sz_so_counter_ensure(ctx)) {
+         VkDeviceSize sizes[PIPE_MAX_SO_BUFFERS];
+         VkBuffer counters[PIPE_MAX_SO_BUFFERS];
+         VkDeviceSize counter_offsets[PIPE_MAX_SO_BUFFERS];
+
+         /* Zero in the command stream, not on the host: a previously submitted
+          * capture may still be reading the counters. */
+         for (unsigned i = 0; i < n; i++) {
+            struct pipe_stream_output_target *t = ctx->so_targets[i];
+            sizes[i] = t->buffer_size;
+            counters[i] = ctx->so_counter_buffer;
+            counter_offsets[i] = i * sizeof(uint32_t);
+            ctx->screen->vk.CmdFillBuffer(cmd, ctx->so_counter_buffer,
+                                          counter_offsets[i], sizeof(uint32_t),
+                                          0);
+         }
+
+         const VkMemoryBarrier2 fill_barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT,
+            .dstAccessMask =
+               VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT |
+               VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT,
+         };
+         const VkDependencyInfo fill_dep = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &fill_barrier,
+         };
+         ctx->screen->vk.CmdPipelineBarrier2(cmd, &fill_dep);
+
+         ctx->screen->vk.CmdBindTransformFeedbackBuffersEXT(cmd, 0, n, buffers,
+                                                            offsets, sizes);
+         ctx->screen->vk.CmdBeginTransformFeedbackEXT(cmd, 0, n, counters,
+                                                      counter_offsets);
+      }
+   }
+
    if (!scissor_empty)
       sz_emit_draws(ctx, cmd);
+
+   if (tf && ctx->screen->vk.CmdEndTransformFeedbackEXT &&
+       ctx->so_counter_buffer != VK_NULL_HANDLE) {
+      VkBuffer counters[PIPE_MAX_SO_BUFFERS];
+      VkDeviceSize counter_offsets[PIPE_MAX_SO_BUFFERS];
+      for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++) {
+         counters[i] = ctx->so_counter_buffer;
+         counter_offsets[i] = i * sizeof(uint32_t);
+      }
+      ctx->screen->vk.CmdEndTransformFeedbackEXT(cmd, 0, PIPE_MAX_SO_BUFFERS,
+                                                 counters, counter_offsets);
+   }
 
    ctx->dirty = 0;
    ctx->pending.count = 0;
@@ -2093,6 +2279,8 @@ sz_flush_resource(struct pipe_context *pipe, struct pipe_resource *res)
     * complete, not merely queued. Waiting here is cheap (once per presented
     * resource) and removes the window in which a half-rendered frame could be
     * sampled. */
+   sz_trace("flush_resource res=%p %ux%u fmt=%s", (void *)res, res->width0,
+            res->height0, util_format_name(res->format));
    sz_context_submit(ctx);
    sz_queue_wait_idle(&ctx->screen->batch_state);
 }
@@ -2360,8 +2548,14 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
 
    void *direct = sz_resource_map(r);
    if (direct) {
-      if (usage & PIPE_MAP_READ)
+      if (usage & PIPE_MAP_READ) {
+         /* GL reads are synchronous: whatever the GPU was asked to write has
+          * to be there before the pointer is handed out, and a direct map has
+          * no barrier of its own to make that true. */
+         sz_context_submit(ctx);
+         sz_queue_wait_idle(&screen->batch_state);
          sz_bo_invalidate(r->bo, box->x, box->width);
+      }
       t->base.stride = box->width;
       t->base.layer_stride = 0;
       *transfer = &t->base;
@@ -2578,6 +2772,15 @@ sz_context_destroy(struct pipe_context *pipe)
       for (unsigned i = 0; i < SZ_MAX_CONST_BUFFERS; i++)
          pipe_resource_reference(&ctx->state.constant_buffers[sh][i].buffer,
                                  NULL);
+   }
+
+   for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++)
+      pipe_so_target_reference(&ctx->so_targets[i], NULL);
+
+   if (ctx->so_counter_buffer != VK_NULL_HANDLE) {
+      sz_bo_free(ctx->so_counter_bo);
+      ctx->screen->vk.DestroyBuffer(ctx->screen->dev, ctx->so_counter_buffer,
+                                    NULL);
    }
 
    u_upload_destroy(ctx->base.const_uploader);
@@ -3139,6 +3342,10 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->get_query_result = sz_get_query_result;
    pipe->get_query_result_resource = sz_get_query_result_resource;
    pipe->render_condition = sz_render_condition;
+   pipe->create_stream_output_target = sz_create_stream_output_target;
+   pipe->stream_output_target_destroy = sz_stream_output_target_destroy;
+   pipe->stream_output_target_offset = sz_stream_output_target_offset;
+   pipe->set_stream_output_targets = sz_set_stream_output_targets;
    pipe->flush_resource = sz_flush_resource;
    pipe->texture_subdata = sz_texture_subdata;
    pipe->buffer_subdata = sz_buffer_subdata;

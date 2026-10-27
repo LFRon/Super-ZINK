@@ -25,8 +25,10 @@
 
 #include "sz_resource.h"
 
+#include "sz_batch.h"
 #include "sz_dmabuf.h"
 #include "sz_format.h"
+#include "sz_sync.h"
 
 #include "util/log.h"
 #include "util/macros.h"
@@ -71,6 +73,8 @@ sz_buffer_usage_from_bindings(unsigned bindings)
       usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
    if (bindings & PIPE_BIND_QUERY_BUFFER)
       usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+   if (bindings & PIPE_BIND_STREAM_OUTPUT)
+      usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
 
    /* Gallium lets a buffer be bound for a purpose its creation bind flags never
     * mentioned -- the state tracker uploads client vertex arrays into a buffer
@@ -110,7 +114,8 @@ sz_buffer_memory_properties(unsigned bindings, enum pipe_resource_usage usage)
     * uploaded once, indirect args) prefer device-local. */
    if (bindings & (PIPE_BIND_CONSTANT_BUFFER | PIPE_BIND_SHADER_BUFFER |
                    PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE |
-                   PIPE_BIND_QUERY_BUFFER | PIPE_BIND_COMMAND_ARGS_BUFFER))
+                   PIPE_BIND_QUERY_BUFFER | PIPE_BIND_COMMAND_ARGS_BUFFER |
+                   PIPE_BIND_STREAM_OUTPUT))
       return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
@@ -328,6 +333,60 @@ sz_resource_create_view(struct sz_screen *screen, struct sz_resource *res,
    return true;
 }
 
+/* Defines the contents of a scanout image before anybody else can look at it.
+ *
+ * An exported image goes to the winsys as a dma-buf file descriptor, and the X
+ * server starts sampling the imported pixmap as soon as the window is mapped --
+ * on a DRI3 server that happens *before* the client renders its first frame.
+ * The image lives in DEVICE_LOCAL memory, so nothing else has defined its
+ * contents: the compositor would show whatever the allocator handed back, which
+ * for a linear image is the previous tenant's pixel data (the familiar flash of
+ * garbage in the window corner on startup).
+ *
+ * Clearing costs one submission per back buffer at allocation time. GL makes the
+ * contents of a fresh image undefined, so there is no data to preserve -- the
+ * only thing being chosen here is *which* undefined contents, and zeros are the
+ * only ones that are safe to show. */
+static void
+sz_resource_zero_exported(struct sz_screen *screen, struct sz_resource *res)
+{
+   /* Depth/stencil scanout exists but is rare, and the clear needs a
+    * depth-stencil layout rather than a colour one. Leave it alone rather than
+    * clear the wrong aspect. */
+   const struct util_format_description *desc =
+      util_format_description(res->base.format);
+   if (util_format_has_depth(desc) || util_format_has_stencil(desc))
+      return;
+
+   struct sz_batch *batch = sz_batch_begin(&screen->batch_state);
+   if (!batch)
+      return;
+
+   sz_resource_access(screen, batch->cmd, res, SZ_ACCESS_TRANSFER_DST);
+
+   const VkImageSubresourceRange range = {
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .levelCount = 1,
+      .layerCount = 1,
+   };
+   const VkClearColorValue zero = { .float32 = { 0.0f, 0.0f, 0.0f, 0.0f } };
+
+   screen->vk.CmdClearColorImage(batch->cmd, res->image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1,
+                                 &range);
+
+   /* The image stays in TRANSFER_DST_OPTIMAL: the first draw or copy out of it
+    * transitions it again, and the layout tracker now knows what it holds. */
+
+   if (!sz_batch_end(batch) ||
+       !sz_batch_submit(batch, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT))
+      return;
+
+   /* The export that follows has no fence of its own, so the zeros must be in
+    * memory -- not merely queued -- before the file descriptor exists. */
+   sz_queue_wait_idle(&screen->batch_state);
+}
+
 static struct pipe_resource *
 sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
 {
@@ -459,6 +518,9 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
       FREE(res);
       return NULL;
    }
+
+   if (exportable)
+      sz_resource_zero_exported(screen, res);
 
    if (sz_debug_enabled(SZ_DEBUG_INFO)) {
       mesa_logi("SZ: image %ux%ux%u %s, %u level%s, %u sample%s, %s%s -> "

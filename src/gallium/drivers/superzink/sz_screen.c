@@ -638,6 +638,13 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * and which works on devices without VK_EXT_conditional_rendering. */
       caps->occlusion_query = true;
       caps->conditional_render = true;
+
+      /* GL 3.0's GL_EXT_transform_feedback is gated on this cap. Four buffers is
+       * what the extension guarantees and what GL exposes. */
+      caps->max_stream_output_buffers =
+         screen->caps.transform_feedback
+            ? MIN2(4u, screen->caps.max_transform_feedback_buffers)
+            : 0;
    }
 
    /* Shader limits. st_extensions.c reads max_instructions == 0 as "this stage

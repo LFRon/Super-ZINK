@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdarg.h>
+#include <stdio.h>
+
 #include "sz_debug.h"
 
 #include "util/u_debug.h"
@@ -20,12 +23,32 @@ sz_debug_options[] = {
    { "flushsync", SZ_DEBUG_FLUSHSYNC, "Force synchronous submits and presents" },
    { "quiet",     SZ_DEBUG_QUIET,     "Suppress warnings" },
    { "selftest",  SZ_DEBUG_SELFTEST,  "Round-trip buffers and images through the allocator at startup" },
+   { "trace",     SZ_DEBUG_TRACE,     "Print the first resource/present events of the life cycle" },
    DEBUG_NAMED_VALUE_END
 };
 
 DEBUG_GET_ONCE_FLAGS_OPTION(sz_debug, "SZ_DEBUG", sz_debug_options, 0)
 
 uint32_t sz_debug;
+
+int sz_trace_budget = 400;
+
+void
+sz_trace_(const char *fmt, ...)
+{
+   if (sz_trace_budget <= 0)
+      return;
+
+   sz_trace_budget--;
+
+   char buf[512];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(buf, sizeof(buf), fmt, ap);
+   va_end(ap);
+
+   mesa_logi("SZ: trace: %s", buf);
+}
 
 void
 sz_debug_init(void)
