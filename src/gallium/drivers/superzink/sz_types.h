@@ -64,6 +64,14 @@ struct sz_vk_entrypoints {
    PFN_vkBindImageMemory BindImageMemory;
    PFN_vkCreateImageView CreateImageView;
    PFN_vkDestroyImageView DestroyImageView;
+   PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
+
+   /* External memory (sz_dmabuf). All three are extension entry points, so they
+    * stay NULL until the extensions are enabled and are only called after
+    * sz_caps says they are there. */
+   PFN_vkGetMemoryFdKHR GetMemoryFdKHR;
+   PFN_vkGetMemoryFdPropertiesKHR GetMemoryFdPropertiesKHR;
+   PFN_vkGetImageDrmFormatModifierPropertiesEXT GetImageDrmFormatModifierPropertiesEXT;
 
    /* Command submission (sz_batch / sz_sync). */
    PFN_vkCreateCommandPool CreateCommandPool;
@@ -173,6 +181,10 @@ struct sz_screen {
 
    bool is_cpu;
    bool driver_name_is_inferred;
+
+   /* Set by the first dma-buf failure, so a missing capability is reported once
+    * instead of on every allocation attempt. */
+   bool dmabuf_warned;
 };
 
 static inline struct sz_screen *

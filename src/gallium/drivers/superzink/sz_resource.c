@@ -25,6 +25,7 @@
 
 #include "sz_resource.h"
 
+#include "sz_dmabuf.h"
 #include "sz_format.h"
 
 #include "util/log.h"
@@ -32,6 +33,7 @@
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 
+#include "drm-uapi/drm_fourcc.h"
 #include "vk_format.h"
 
 #include <inttypes.h>
@@ -129,8 +131,17 @@ sz_resource_alloc(struct sz_screen *screen, const struct pipe_resource *tmpl)
    res->screen = screen;
    res->layout = VK_IMAGE_LAYOUT_UNDEFINED;
    res->undefined_contents = true;
+   res->imported_memory = VK_NULL_HANDLE;
 
    return res;
+}
+
+VkDeviceMemory
+sz_resource_memory(const struct sz_resource *res)
+{
+   if (res->imported_memory != VK_NULL_HANDLE)
+      return res->imported_memory;
+   return res->bo ? sz_bo_memory(res->bo) : VK_NULL_HANDLE;
 }
 
 /* ── buffers ─────────────────────────────────────────────────────────────── */
@@ -245,6 +256,64 @@ sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
    };
 }
 
+/* A whole-resource view, which is what a framebuffer attachment needs. Cube maps
+ * get a cube view; everything else becomes a 1D/2D/3D view of the same shape, so
+ * the view never reinterprets anything.
+ *
+ * Shared with the dma-buf import path, which creates its VkImage outside this
+ * file and would otherwise carry a second copy of this switch. */
+static bool
+sz_resource_create_view(struct sz_screen *screen, struct sz_resource *res,
+                        VkFormat format)
+{
+   VkImageViewType view_type;
+   switch (res->base.target) {
+   case PIPE_TEXTURE_1D:
+      view_type = VK_IMAGE_VIEW_TYPE_1D;
+      break;
+   case PIPE_TEXTURE_1D_ARRAY:
+      view_type = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+      break;
+   case PIPE_TEXTURE_2D_ARRAY:
+      view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      break;
+   case PIPE_TEXTURE_3D:
+      view_type = VK_IMAGE_VIEW_TYPE_3D;
+      break;
+   case PIPE_TEXTURE_CUBE:
+      view_type = VK_IMAGE_VIEW_TYPE_CUBE;
+      break;
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      view_type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+      break;
+   default:
+      view_type = VK_IMAGE_VIEW_TYPE_2D;
+      break;
+   }
+
+   const VkImageViewCreateInfo view_ci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = res->image,
+      .viewType = view_type,
+      .format = format,
+      .subresourceRange = {
+         .aspectMask = sz_format_aspect(res->base.format),
+         .baseMipLevel = 0,
+         .levelCount = VK_REMAINING_MIP_LEVELS,
+         .baseArrayLayer = 0,
+         .layerCount = VK_REMAINING_ARRAY_LAYERS,
+      },
+   };
+
+   VkResult vkres = screen->vk.CreateImageView(screen->dev, &view_ci, NULL,
+                                               &res->view);
+   if (vkres != VK_SUCCESS) {
+      mesa_loge("SZ: vkCreateImageView failed (VkResult %d)", vkres);
+      return false;
+   }
+   return true;
+}
+
 static struct pipe_resource *
 sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
 {
@@ -260,12 +329,46 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
       return NULL;
    }
 
+   /* A texture the state tracker wants to hand to somebody else has to be in a
+    * layout that other process can describe. DRM_FORMAT_MOD_LINEAR is the one
+    * layout every consumer supports, so that is the only one this phase claims;
+    * declaring it through VK_EXT_image_drm_format_modifier is what makes Vulkan
+    * honour it instead of picking a driver-internal layout and telling us the
+    * row pitch afterwards. */
+   const bool exportable = sz_bindings_require_export(tmpl->bind) &&
+                           screen->caps.external_memory_dma_buf &&
+                           tmpl->target == PIPE_TEXTURE_2D &&
+                           tmpl->last_level == 0 && MAX2(tmpl->array_size, 1) == 1;
+
    VkImageCreateInfo ci = sz_image_create_info(screen, tmpl);
+
+   VkExternalMemoryImageCreateInfo ext_ci = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   const uint64_t linear_modifier = DRM_FORMAT_MOD_LINEAR;
+   VkImageDrmFormatModifierListCreateInfoEXT mod_ci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+      .drmFormatModifierCount = 1,
+      .pDrmFormatModifiers = &linear_modifier,
+   };
+
+   if (exportable) {
+      ci.tiling = screen->caps.drm_format_modifier
+                     ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+                     : VK_IMAGE_TILING_LINEAR;
+      /* A list of one leaves the driver no choice, which is the point: the
+       * consumer will be told LINEAR and cannot be told otherwise. */
+      ext_ci.pNext = screen->caps.drm_format_modifier ? &mod_ci : NULL;
+      ci.pNext = &ext_ci;
+      ci.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   }
 
    struct sz_resource *res = sz_resource_alloc(screen, tmpl);
    if (!res)
       return NULL;
-   res->linear = ci.tiling == VK_IMAGE_TILING_LINEAR;
+   res->linear = ci.tiling != VK_IMAGE_TILING_OPTIMAL;
+   res->exportable = exportable;
 
    VkResult vkres = screen->vk.CreateImage(screen->dev, &ci, NULL, &res->image);
    if (vkres != VK_SUCCESS) {
@@ -301,16 +404,23 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
    const bool dedicated_alloc =
       dedicated.requiresDedicatedAllocation || dedicated.prefersDedicatedAllocation;
 
-   /* Linear images must be host-visible: that is the entire point of asking for
-    * one, since the winsys reads the pixels directly. Tiled images never are. */
+   /* An exported image lives in VRAM even though it is linear: the consumer
+    * samples it through its own GPU, never through the CPU, and a back buffer in
+    * host-visible memory crosses PCIe on every presented frame. CPU access via
+    * PIPE_BIND_LINEAR still works -- sz_transfer_map() falls back to a staging
+    * buffer when the resource has no persistent mapping. */
    const VkMemoryPropertyFlags props =
-      res->linear ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-                  : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+      exportable ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+      : res->linear ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-   res->bo = dedicated_alloc
-                ? sz_bo_alloc_dedicated(screen, &req2.memoryRequirements, props)
-                : sz_bo_alloc(screen, &req2.memoryRequirements, props);
+   res->bo = exportable
+                ? sz_bo_alloc_export(screen, &req2.memoryRequirements, props,
+                                     res->image)
+                : dedicated_alloc
+                     ? sz_bo_alloc_dedicated(screen, &req2.memoryRequirements, props)
+                     : sz_bo_alloc(screen, &req2.memoryRequirements, props);
    if (!res->bo) {
       screen->vk.DestroyImage(screen->dev, res->image, NULL);
       FREE(res);
@@ -328,51 +438,7 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
       return NULL;
    }
 
-   /* A whole-resource view, which is what a framebuffer attachment needs. Cube
-    * maps get a cube view; everything else becomes 2D or 3D view of the same
-    * shape, so the view never reinterprets anything. */
-   VkImageViewType view_type;
-   switch (tmpl->target) {
-   case PIPE_TEXTURE_1D:
-      view_type = VK_IMAGE_VIEW_TYPE_1D;
-      break;
-   case PIPE_TEXTURE_1D_ARRAY:
-      view_type = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
-      break;
-   case PIPE_TEXTURE_2D_ARRAY:
-      view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-      break;
-   case PIPE_TEXTURE_3D:
-      view_type = VK_IMAGE_VIEW_TYPE_3D;
-      break;
-   case PIPE_TEXTURE_CUBE:
-      view_type = VK_IMAGE_VIEW_TYPE_CUBE;
-      break;
-   case PIPE_TEXTURE_CUBE_ARRAY:
-      view_type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
-      break;
-   default:
-      view_type = VK_IMAGE_VIEW_TYPE_2D;
-      break;
-   }
-
-   const VkImageViewCreateInfo view_ci = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-      .image = res->image,
-      .viewType = view_type,
-      .format = format,
-      .subresourceRange = {
-         .aspectMask = sz_format_aspect(tmpl->format),
-         .baseMipLevel = 0,
-         .levelCount = VK_REMAINING_MIP_LEVELS,
-         .baseArrayLayer = 0,
-         .layerCount = VK_REMAINING_ARRAY_LAYERS,
-      },
-   };
-
-   vkres = screen->vk.CreateImageView(screen->dev, &view_ci, NULL, &res->view);
-   if (vkres != VK_SUCCESS) {
-      mesa_loge("SZ: vkCreateImageView failed (VkResult %d)", vkres);
+   if (!sz_resource_create_view(screen, res, format)) {
       sz_bo_free(res->bo);
       screen->vk.DestroyImage(screen->dev, res->image, NULL);
       FREE(res);
@@ -388,6 +454,38 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
                 ci.samples == 1 ? "" : "s",
                 res->linear ? "linear" : "optimal",
                 dedicated_alloc ? " dedicated" : "", sz_bo_size(res->bo));
+   }
+
+   return &res->base;
+}
+
+/* Wraps a VkImage whose memory came from a dma-buf. The caller has already
+ * created the image and imported the memory; everything that is common with a
+ * locally allocated image -- the resource header, the view, the refcount -- is
+ * done here so the two paths cannot drift. */
+struct pipe_resource *
+sz_resource_wrap_imported(struct sz_screen *screen,
+                          const struct pipe_resource *tmpl,
+                          VkImage image, VkDeviceMemory memory)
+{
+   const VkFormat format = vk_format_from_pipe_format(tmpl->format);
+
+   struct sz_resource *res = sz_resource_alloc(screen, tmpl);
+   if (!res)
+      return NULL;
+
+   res->image = image;
+   res->imported_memory = memory;
+   /* Linear by definition: it is a dma-buf, and this phase only accepts
+    * DRM_FORMAT_MOD_LINEAR. */
+   res->linear = true;
+   /* The contents belong to whoever made the buffer, so the first write may not
+    * discard them. */
+   res->undefined_contents = false;
+
+   if (!sz_resource_create_view(screen, res, format)) {
+      FREE(res);
+      return NULL;
    }
 
    return &res->base;
@@ -447,6 +545,11 @@ sz_screen_resource_destroy(struct pipe_screen *pscreen,
    if (res->image != VK_NULL_HANDLE)
       screen->vk.DestroyImage(screen->dev, res->image, NULL);
 
+   /* sz_bo_free refuses a NULL bo, so an imported resource needs nothing more
+    * than the memory handle it owns. */
+   if (res->imported_memory != VK_NULL_HANDLE)
+      screen->vk.FreeMemory(screen->dev, res->imported_memory, NULL);
+
    sz_bo_free(res->bo);
 
    FREE(res);
@@ -461,37 +564,16 @@ sz_resource_map(struct sz_resource *res)
    return sz_bo_map(res->bo);
 }
 
-/* Exporting a buffer to the winsys is what presentation needs: DRI3 hands the
- * compositor a dma-buf, and without it there is no swapchain. That is the next
- * piece of work, but the entry point has to exist now: the DRI frontend calls it
- * unconditionally, and a NULL pointer there is a segfault inside Mesa rather
- * than a message anyone can act on.
- *
- * Returning false is the honest answer -- it makes the DRI3 buffer allocation
- * fail, which is exactly the situation. */
-static bool
-sz_screen_resource_get_handle(struct pipe_screen *pscreen,
-                              struct pipe_context *pipe,
-                              struct pipe_resource *res,
-                              struct winsys_handle *handle,
-                              unsigned usage)
-{
-   static bool warned;
-   if (!warned) {
-      mesa_logw("SZ: dma-buf export is not implemented yet, so nothing can be "
-                "presented. Presentation arrives with the WSI phase.");
-      warned = true;
-   }
-   return false;
-}
-
 void
 sz_resource_screen_init(struct sz_screen *screen)
 {
    screen->base.can_create_resource = sz_screen_can_create_resource;
    screen->base.resource_create = sz_screen_resource_create;
    screen->base.resource_destroy = sz_screen_resource_destroy;
-   screen->base.resource_get_handle = sz_screen_resource_get_handle;
+
+   /* resource_get_handle / resource_from_handle and the modifier queries all
+    * belong to the dma-buf path, which needs the external-memory extensions. */
+   sz_dmabuf_screen_init(screen);
 }
 
 /* ── self-test ───────────────────────────────────────────────────────────── */

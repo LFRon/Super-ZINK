@@ -156,6 +156,13 @@ sz_bindings_require_linear(unsigned bindings)
                          PIPE_BIND_SCANOUT | PIPE_BIND_SHARED));
 }
 
+bool
+sz_bindings_require_export(unsigned bindings)
+{
+   return !!(bindings & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT |
+                         PIPE_BIND_SHARED));
+}
+
 static VkFormatFeatureFlags
 sz_tiling_features(struct sz_screen *screen,
                    VkFormat format,

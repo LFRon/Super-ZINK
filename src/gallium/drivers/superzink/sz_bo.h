@@ -51,6 +51,19 @@ struct sz_bo *sz_bo_alloc_dedicated(struct sz_screen *screen,
                                     const VkMemoryRequirements *req,
                                     VkMemoryPropertyFlags props);
 
+/* Same, but on a private VkDeviceMemory that may be exported as a dma-buf.
+ *
+ * Vulkan only permits exporting memory that was allocated with the matching
+ * VkExportMemoryAllocateInfo, so this cannot be retrofitted onto an allocation
+ * that came out of the pool -- which is why it is a separate entry point rather
+ * than a flag on sz_bo_alloc().
+ *
+ * Requires screen->caps.external_memory_dma_buf. */
+struct sz_bo *sz_bo_alloc_export(struct sz_screen *screen,
+                                 const VkMemoryRequirements *req,
+                                 VkMemoryPropertyFlags props,
+                                 VkImage image);
+
 void sz_bo_free(struct sz_bo *bo);
 
 /* Persistent CPU pointer for host-visible memory, NULL otherwise. Blocks are

@@ -34,6 +34,13 @@ VkImageAspectFlags sz_format_aspect(enum pipe_format format);
 /* Whether a resource created with these bindings must be linearly tiled. */
 bool sz_bindings_require_linear(unsigned bindings);
 
+/* Whether a resource with these bindings is expected to leave the process as a
+ * dma-buf. A superset relation with sz_bindings_require_linear(), not the same
+ * question: PIPE_BIND_LINEAR alone says "the CPU reads these pixels", which does
+ * not need an exported VkDeviceMemory, while PIPE_BIND_SHARED says "another
+ * process reads them", which does. */
+bool sz_bindings_require_export(unsigned bindings);
+
 /* The single entry point behind pipe_screen::is_format_supported(). */
 bool sz_format_supported(struct sz_screen *screen,
                          enum pipe_format format,

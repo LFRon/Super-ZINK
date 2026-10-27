@@ -250,9 +250,10 @@ sz_bo_alloc(struct sz_screen *screen, const VkMemoryRequirements *req,
    return sz_bo_wrap(screen, block, offset, size);
 }
 
-struct sz_bo *
-sz_bo_alloc_dedicated(struct sz_screen *screen, const VkMemoryRequirements *req,
-                      VkMemoryPropertyFlags props)
+static struct sz_bo *
+sz_bo_alloc_private(struct sz_screen *screen, const VkMemoryRequirements *req,
+                    VkMemoryPropertyFlags props,
+                    VkExportMemoryAllocateInfo *export_info)
 {
    uint32_t mem_type =
       sz_device_find_memory_type(screen, req->memoryTypeBits, props);
@@ -274,6 +275,8 @@ sz_bo_alloc_dedicated(struct sz_screen *screen, const VkMemoryRequirements *req,
       .allocationSize = req->size,
       .memoryTypeIndex = mem_type,
    };
+   if (export_info)
+      ai.pNext = export_info;
 
    struct sz_mem_block *block = CALLOC_STRUCT(sz_mem_block);
    if (!block)
@@ -304,6 +307,36 @@ sz_bo_alloc_dedicated(struct sz_screen *screen, const VkMemoryRequirements *req,
    list_addtail(&block->link, &screen->bo->blocks);
 
    return sz_bo_wrap(screen, block, 0, req->size);
+}
+
+struct sz_bo *
+sz_bo_alloc_dedicated(struct sz_screen *screen, const VkMemoryRequirements *req,
+                      VkMemoryPropertyFlags props)
+{
+   return sz_bo_alloc_private(screen, req, props, NULL);
+}
+
+struct sz_bo *
+sz_bo_alloc_export(struct sz_screen *screen, const VkMemoryRequirements *req,
+                   VkMemoryPropertyFlags props, VkImage image)
+{
+   /* VkMemoryDedicatedAllocateInfo is chained unconditionally: an external
+    * allocation belongs to exactly one image by definition, and a driver that
+    * requires the struct to be present fails the allocation without it. */
+   VkMemoryDedicatedAllocateInfo dedicated = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .image = image,
+   };
+   VkExportMemoryAllocateInfo export_info = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+      .pNext = &dedicated,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+
+   /* Exportable memory is shared with another process, so it must be a whole
+    * VkDeviceMemory of its own: neither end may point into the middle of an
+    * allocation the other one has no handle to. */
+   return sz_bo_alloc_private(screen, req, props, &export_info);
 }
 
 void

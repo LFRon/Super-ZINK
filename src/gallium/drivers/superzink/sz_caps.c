@@ -233,6 +233,21 @@ sz_caps_init(struct sz_caps *caps,
    caps->core_features = q.core;
    caps->uses_vk14_core = vk14;
 
+   /* Extension-only capabilities. The dependency is folded in rather than left
+    * to the caller: a dma-buf we cannot turn into a file descriptor, or a
+    * modifier we cannot describe, is not a capability. */
+   caps->external_memory_fd =
+      sz_ext_advertised(exts, ext_count,
+                        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+   caps->external_memory_dma_buf =
+      caps->external_memory_fd &&
+      sz_ext_advertised(exts, ext_count,
+                        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+   caps->drm_format_modifier =
+      caps->external_memory_dma_buf &&
+      sz_ext_advertised(exts, ext_count,
+                        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+
    FREE(exts);
 }
 
@@ -249,6 +264,19 @@ sz_caps_table(void)
       SZ_CAP_OPTIONAL_LIST(SZ_CAP_ROW)
 #undef SZ_CAP_ROW
       { NULL, NULL, 0, 0, false },
+   };
+   return rows;
+}
+
+const struct sz_cap_ext_row *
+sz_caps_ext_table(void)
+{
+   static const struct sz_cap_ext_row rows[] = {
+#define SZ_CAP_EXT_ROW(field, ext)                                             \
+      { #field, ext, offsetof(struct sz_caps, field) },
+      SZ_CAP_EXT_ONLY_LIST(SZ_CAP_EXT_ROW)
+#undef SZ_CAP_EXT_ROW
+      { NULL, NULL, 0 },
    };
    return rows;
 }
@@ -309,5 +337,11 @@ sz_caps_dump(const struct sz_caps *caps)
       mesa_logi("SZ:   %-34s %-8s %-4s %s",
                 r->name, source, r->required ? "req" : "opt",
                 have ? "ok" : (r->required ? "FAIL" : "off"));
+   }
+
+   for (const struct sz_cap_ext_row *r = sz_caps_ext_table(); r->name; r++) {
+      const bool have = SZ_CAP_BOOL(caps, r);
+      mesa_logi("SZ:   %-34s %-8s %-4s %s", r->name, "ext", "opt",
+                have ? "ok" : "off");
    }
 }

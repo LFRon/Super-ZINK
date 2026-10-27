@@ -19,6 +19,7 @@
 #include "sz_compiler.h"
 #include "sz_context.h"
 #include "sz_device.h"
+#include "sz_dmabuf.h"
 #include "sz_format.h"
 #include "sz_resource.h"
 #include "sz_types.h"
@@ -486,6 +487,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texture_array_layers = 2048;
       caps->max_render_targets = 8;
       caps->max_dual_source_render_targets = 1;
+      /* Disable the "depth must be as wide as colour" restriction the DRI config
+       * generator applies by default. Every hardware driver sets this: GLX
+       * clients ask for a 16-bit depth buffer while the window is 32-bit colour,
+       * and with the restriction on, the only depth configs generated are the
+       * ones that match the colour width, so glXChooseVisual finds nothing. */
+      caps->mixed_color_depth_bits = true;
    }
 
    snprintf(screen->renderer_string, sizeof(screen->renderer_string),
@@ -511,6 +518,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       if (sz_render_selftest(screen) != 0) {
          mesa_loge("SZ: SZ_DEBUG=selftest failed; refusing to publish a screen "
                    "that cannot render a triangle");
+         goto fail_submit;
+      }
+      if (sz_dmabuf_selftest(screen) != 0) {
+         mesa_loge("SZ: SZ_DEBUG=selftest failed; refusing to publish a screen "
+                   "that cannot hand its own frames to someone else");
          goto fail_submit;
       }
    }

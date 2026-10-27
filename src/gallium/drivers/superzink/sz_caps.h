@@ -169,11 +169,30 @@ void sz_vk_features_link(struct sz_vk_features *f, uint32_t api_version,
                          const struct sz_vk_feature_selection *sel,
                          VkPhysicalDeviceFeatures2 *features2);
 
+/* Capabilities that are nothing but an extension name: vk.xml marks them
+ * "nofeatures", there is no VkPhysicalDevice*Features member to test.
+ *
+ * They stay out of the two lists above because those lists' contract is
+ * "feature bit && (core || extension)". Writing a placeholder `true` for the
+ * feature expression would report a capability the device may not have, which is
+ * exactly the failure ADR-001 exists to prevent. Here the rule collapses to
+ * "the extension is advertised", and the version plays no part because none of
+ * these was ever promoted to core.
+ *
+ * X(field, extension) */
+#define SZ_CAP_EXT_ONLY_LIST(X)                                                \
+   X(external_memory_fd,          "VK_KHR_external_memory_fd")                  \
+   X(external_memory_dma_buf,     "VK_EXT_external_memory_dma_buf")             \
+   X(drm_format_modifier,         "VK_EXT_image_drm_format_modifier")
+
 struct sz_caps {
 #define SZ_CAP_FIELD(field, name, ext, core, expr) bool field;
    SZ_CAP_REQUIRED_LIST(SZ_CAP_FIELD)
    SZ_CAP_OPTIONAL_LIST(SZ_CAP_FIELD)
 #undef SZ_CAP_FIELD
+#define SZ_CAP_EXT_FIELD(field, ext) bool field;
+   SZ_CAP_EXT_ONLY_LIST(SZ_CAP_EXT_FIELD)
+#undef SZ_CAP_EXT_FIELD
 
    /* The 1.0 feature set verbatim, so device creation can gate on it instead
     * of asking the driver a second, possibly different, question. */
@@ -196,8 +215,18 @@ struct sz_cap_row {
    bool required;
 };
 
+/* One row of the extension-only table: no core version, never required. */
+struct sz_cap_ext_row {
+   const char *name;
+   const char *extension;
+   size_t offset;
+};
+
 /* The full table, terminated by a row with name == NULL. */
 const struct sz_cap_row *sz_caps_table(void);
+
+/* The extension-only table, terminated by a row with name == NULL. */
+const struct sz_cap_ext_row *sz_caps_ext_table(void);
 
 /* Fills caps from a single vkGetPhysicalDeviceFeatures2 pass.
  *

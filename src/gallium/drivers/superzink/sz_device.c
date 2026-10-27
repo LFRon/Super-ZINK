@@ -73,6 +73,15 @@ static const struct sz_ext_dep sz_ext_deps[] = {
      { VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PRESENT_ID_EXTENSION_NAME, NULL } },
    { VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME,
      { VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, NULL, NULL } },
+   /* VK_KHR_external_memory is core in 1.1, but a driver may still want the
+    * extension spelled out, and vkCreateDevice validates the chain we pass. */
+   { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+     { VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, NULL, NULL } },
+   { VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+     { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, NULL, NULL } },
+   { VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+     { VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
+       VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, NULL } },
 };
 
 struct sz_ext_list {
@@ -152,6 +161,16 @@ sz_build_extension_list(const struct sz_screen *screen,
                                           r->extension))
          continue;
 
+      sz_ext_list_add(list, r->extension);
+   }
+
+   for (const struct sz_cap_ext_row *r = sz_caps_ext_table(); r->name; r++) {
+      const bool have = *(const bool *)((const char *)caps + r->offset);
+      if (!have)
+         continue;
+      if (!sz_device_extension_advertised(advertised, advertised_count,
+                                          r->extension))
+         continue;
       sz_ext_list_add(list, r->extension);
    }
 
@@ -436,6 +455,13 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(BindImageMemory, vkBindImageMemory);
    SZ_DEV_PROC(CreateImageView, vkCreateImageView);
    SZ_DEV_PROC(DestroyImageView, vkDestroyImageView);
+   SZ_DEV_PROC(GetImageSubresourceLayout, vkGetImageSubresourceLayout);
+   /* Null unless the external-memory extensions were enabled; every caller
+    * checks screen->caps before reaching for them. */
+   SZ_DEV_PROC(GetMemoryFdKHR, vkGetMemoryFdKHR);
+   SZ_DEV_PROC(GetMemoryFdPropertiesKHR, vkGetMemoryFdPropertiesKHR);
+   SZ_DEV_PROC(GetImageDrmFormatModifierPropertiesEXT,
+               vkGetImageDrmFormatModifierPropertiesEXT);
 
    SZ_DEV_PROC(CreateCommandPool, vkCreateCommandPool);
    SZ_DEV_PROC(DestroyCommandPool, vkDestroyCommandPool);

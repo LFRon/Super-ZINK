@@ -10,6 +10,7 @@ files_libsuperzink = files(
   'sz_context.c',
   'sz_device.c',
   'sz_debug.c',
+  'sz_dmabuf.c',
   'sz_format.c',
   'sz_pipeline.c',
   'sz_range.c',

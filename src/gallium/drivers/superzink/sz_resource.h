@@ -64,7 +64,21 @@ struct sz_resource {
    /* Set when the contents are known to be undefined, so the next write may use
     * loadOp=DONT_CARE / discard instead of preserving garbage. */
    bool undefined_contents;
+
+   /* Set when the VkImage was created with an external memory handle type, so
+    * vkGetMemoryFdKHR may be called on its memory. Vulkan refuses the export
+    * otherwise, and the refusal is a validation error rather than a VkResult. */
+   bool exportable;
+
+   /* Set when the memory came from a dma-buf instead of sz_bo. The fd itself is
+    * owned by Vulkan after the import, so the only thing that has to be freed
+    * here is the VkDeviceMemory. */
+   VkDeviceMemory imported_memory;
 };
+
+/* The VkDeviceMemory behind a resource, whichever way it was obtained.
+ * VK_NULL_HANDLE for a resource that owns no memory yet. */
+VkDeviceMemory sz_resource_memory(const struct sz_resource *res);
 
 static inline struct sz_resource *
 sz_resource(struct pipe_resource *res)
@@ -88,6 +102,14 @@ void *sz_resource_map(struct sz_resource *res);
 
 /* Installs the pipe_screen resource entry points. */
 void sz_resource_screen_init(struct sz_screen *screen);
+
+/* Wraps a VkImage whose memory was imported from a dma-buf into a
+ * pipe_resource. Used by sz_dmabuf's resource_from_handle, which owns the
+ * VkImage creation because only it knows the plane layout. */
+struct pipe_resource *sz_resource_wrap_imported(struct sz_screen *screen,
+                                                const struct pipe_resource *tmpl,
+                                                VkImage image,
+                                                VkDeviceMemory memory);
 
 /* SZ_DEBUG=selftest: round-trips representative buffers and images through the
  * real device and the allocator. Returns the number of failed checks, so a
