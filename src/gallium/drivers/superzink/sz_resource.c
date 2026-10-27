@@ -79,8 +79,16 @@ sz_buffer_usage_from_bindings(unsigned bindings)
 }
 
 static VkMemoryPropertyFlags
-sz_buffer_memory_properties(unsigned bindings)
+sz_buffer_memory_properties(unsigned bindings, enum pipe_resource_usage usage)
 {
+   /* STAGING means the CPU is the main user, so the buffer has to be mappable
+    * whatever else it is bound as. Mesa removed the old PIPE_BIND_TRANSFER_*
+    * flags, so usage is now the only signal for this. */
+   if (usage == PIPE_USAGE_STAGING) {
+      return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   }
+
    /* Any buffer the CPU may write goes to host-visible memory and is flushed
     * lazily. Buffers that are only ever read by the GPU (index/vertex data
     * uploaded once, indirect args) prefer device-local. */
@@ -108,6 +116,16 @@ sz_resource_alloc(struct sz_screen *screen, const struct pipe_resource *tmpl)
     * has no own allocator that a deep copy would need to duplicate. */
    res->base = *tmpl;
    res->base.next = NULL;
+   /* Gallium reads base.screen in a lot of places -- the DRI frontend asks the
+    * resource's own screen to export it, for one -- and a NULL there is a
+    * segfault deep inside Mesa rather than anywhere near the resource code. */
+   res->base.screen = &screen->base;
+   /* The caller's template has a zeroed refcount, so the new resource has to
+    * start at one. Without this the count goes 0 -> 1 on the first reference and
+    * 1 -> 0 on the first release, and it can be freed twice: once here and once
+    * by whoever took a second reference later. The failure shows up as heap
+    * corruption in the frontend, nowhere near the resource code. */
+   pipe_reference_init(&res->base.reference, 1);
    res->screen = screen;
    res->layout = VK_IMAGE_LAYOUT_UNDEFINED;
    res->undefined_contents = true;
@@ -147,7 +165,7 @@ sz_buffer_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
    VkMemoryRequirements req;
    screen->vk.GetBufferMemoryRequirements(screen->dev, res->buffer, &req);
 
-   res->bo = sz_bo_alloc(screen, &req, sz_buffer_memory_properties(tmpl->bind));
+   res->bo = sz_bo_alloc(screen, &req, sz_buffer_memory_properties(tmpl->bind, tmpl->usage));
    if (!res->bo) {
       screen->vk.DestroyBuffer(screen->dev, res->buffer, NULL);
       FREE(res);
@@ -388,12 +406,37 @@ sz_resource_map(struct sz_resource *res)
    return sz_bo_map(res->bo);
 }
 
+/* Exporting a buffer to the winsys is what presentation needs: DRI3 hands the
+ * compositor a dma-buf, and without it there is no swapchain. That is the next
+ * piece of work, but the entry point has to exist now: the DRI frontend calls it
+ * unconditionally, and a NULL pointer there is a segfault inside Mesa rather
+ * than a message anyone can act on.
+ *
+ * Returning false is the honest answer -- it makes the DRI3 buffer allocation
+ * fail, which is exactly the situation. */
+static bool
+sz_screen_resource_get_handle(struct pipe_screen *pscreen,
+                              struct pipe_context *pipe,
+                              struct pipe_resource *res,
+                              struct winsys_handle *handle,
+                              unsigned usage)
+{
+   static bool warned;
+   if (!warned) {
+      mesa_logw("SZ: dma-buf export is not implemented yet, so nothing can be "
+                "presented. Presentation arrives with the WSI phase.");
+      warned = true;
+   }
+   return false;
+}
+
 void
 sz_resource_screen_init(struct sz_screen *screen)
 {
    screen->base.can_create_resource = sz_screen_can_create_resource;
    screen->base.resource_create = sz_screen_resource_create;
    screen->base.resource_destroy = sz_screen_resource_destroy;
+   screen->base.resource_get_handle = sz_screen_resource_get_handle;
 }
 
 /* ── self-test ───────────────────────────────────────────────────────────── */

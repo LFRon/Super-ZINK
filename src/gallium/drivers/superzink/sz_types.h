@@ -16,6 +16,7 @@
 #include "util/simple_mtx.h"
 #include "util/u_dl.h"
 
+#include "sz_batch.h"
 #include "sz_caps.h"
 #include "sz_debug.h"
 #include "sz_public.h"
@@ -61,6 +62,33 @@ struct sz_vk_entrypoints {
    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
    PFN_vkGetImageMemoryRequirements2 GetImageMemoryRequirements2;
    PFN_vkBindImageMemory BindImageMemory;
+
+   /* Command submission (sz_batch / sz_sync). */
+   PFN_vkCreateCommandPool CreateCommandPool;
+   PFN_vkDestroyCommandPool DestroyCommandPool;
+   PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
+   PFN_vkFreeCommandBuffers FreeCommandBuffers;
+   PFN_vkBeginCommandBuffer BeginCommandBuffer;
+   PFN_vkEndCommandBuffer EndCommandBuffer;
+   PFN_vkResetCommandBuffer ResetCommandBuffer;
+   PFN_vkQueueSubmit2 QueueSubmit2;
+   PFN_vkQueueWaitIdle QueueWaitIdle;
+   PFN_vkCreateSemaphore CreateSemaphore;
+   PFN_vkDestroySemaphore DestroySemaphore;
+   PFN_vkWaitSemaphores WaitSemaphores;
+   PFN_vkGetSemaphoreCounterValue GetSemaphoreCounterValue;
+   PFN_vkCmdPipelineBarrier2 CmdPipelineBarrier2;
+   PFN_vkCmdClearColorImage CmdClearColorImage;
+   PFN_vkCmdClearDepthStencilImage CmdClearDepthStencilImage;
+   PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
+   PFN_vkCmdCopyImage CmdCopyImage;
+   PFN_vkCmdCopyBuffer CmdCopyBuffer;
+   PFN_vkCmdFillBuffer CmdFillBuffer;
+   PFN_vkCmdUpdateBuffer CmdUpdateBuffer;
+   PFN_vkCmdBeginRendering CmdBeginRendering;
+   PFN_vkCmdEndRendering CmdEndRendering;
+   PFN_vkCmdSetViewport CmdSetViewport;
+   PFN_vkCmdSetScissor CmdSetScissor;
 };
 
 /* Declared before struct sz_screen because sz_screen embeds them by value. */
@@ -108,6 +136,15 @@ struct sz_screen {
    struct sz_caps caps;
 
    struct sz_queue queues[SZ_QUEUE_COUNT];
+
+   /* Command submission state for the graphics family. Phase 1 has one context
+    * at a time, so the pool lives on the screen rather than being duplicated per
+    * context. */
+   struct sz_queue_state batch_state;
+
+   /* pipe_context::destroy has no way to reach the screen's flag, so the screen
+    * tracks it here. See sz_screen_context_create(). */
+   bool context_alive;
 
    /* Device memory suballocator (sz_bo). */
    struct sz_bo_state *bo;

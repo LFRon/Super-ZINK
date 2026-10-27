@@ -435,6 +435,32 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(GetImageMemoryRequirements2, vkGetImageMemoryRequirements2);
    SZ_DEV_PROC(BindImageMemory, vkBindImageMemory);
 
+   SZ_DEV_PROC(CreateCommandPool, vkCreateCommandPool);
+   SZ_DEV_PROC(DestroyCommandPool, vkDestroyCommandPool);
+   SZ_DEV_PROC(AllocateCommandBuffers, vkAllocateCommandBuffers);
+   SZ_DEV_PROC(FreeCommandBuffers, vkFreeCommandBuffers);
+   SZ_DEV_PROC(BeginCommandBuffer, vkBeginCommandBuffer);
+   SZ_DEV_PROC(EndCommandBuffer, vkEndCommandBuffer);
+   SZ_DEV_PROC(ResetCommandBuffer, vkResetCommandBuffer);
+   SZ_DEV_PROC(QueueSubmit2, vkQueueSubmit2);
+   SZ_DEV_PROC(QueueWaitIdle, vkQueueWaitIdle);
+   SZ_DEV_PROC(CreateSemaphore, vkCreateSemaphore);
+   SZ_DEV_PROC(DestroySemaphore, vkDestroySemaphore);
+   SZ_DEV_PROC(WaitSemaphores, vkWaitSemaphores);
+   SZ_DEV_PROC(GetSemaphoreCounterValue, vkGetSemaphoreCounterValue);
+   SZ_DEV_PROC(CmdPipelineBarrier2, vkCmdPipelineBarrier2);
+   SZ_DEV_PROC(CmdClearColorImage, vkCmdClearColorImage);
+   SZ_DEV_PROC(CmdClearDepthStencilImage, vkCmdClearDepthStencilImage);
+   SZ_DEV_PROC(CmdCopyImageToBuffer, vkCmdCopyImageToBuffer);
+   SZ_DEV_PROC(CmdCopyImage, vkCmdCopyImage);
+   SZ_DEV_PROC(CmdCopyBuffer, vkCmdCopyBuffer);
+   SZ_DEV_PROC(CmdFillBuffer, vkCmdFillBuffer);
+   SZ_DEV_PROC(CmdUpdateBuffer, vkCmdUpdateBuffer);
+   SZ_DEV_PROC(CmdBeginRendering, vkCmdBeginRendering);
+   SZ_DEV_PROC(CmdEndRendering, vkCmdEndRendering);
+   SZ_DEV_PROC(CmdSetViewport, vkCmdSetViewport);
+   SZ_DEV_PROC(CmdSetScissor, vkCmdSetScissor);
+
 #undef SZ_DEV_PROC
 }
 

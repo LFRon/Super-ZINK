@@ -16,6 +16,7 @@
  */
 
 #include "sz_caps.h"
+#include "sz_context.h"
 #include "sz_device.h"
 #include "sz_format.h"
 #include "sz_resource.h"
@@ -355,9 +356,25 @@ sz_screen_query_memory_info(struct pipe_screen *pscreen,
 static struct pipe_context *
 sz_screen_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
 {
-   mesa_loge("SZ: context creation is not implemented yet (Phase 1: the "
-             "VkDevice exists, the pipe_context does not).");
-   return NULL;
+   struct sz_screen *screen = sz_screen(pscreen);
+
+   /* One context at a time: the command pool and timeline live on the screen, so
+    * a second context would share a submission timeline it does not expect to.
+    * The state tracker only ever asks for one per pipe_screen, but a
+    * multithreaded frontend could, so refuse rather than corrupt. */
+   if (screen->context_alive) {
+      mesa_loge("SZ: only one context per screen is supported so far");
+      return NULL;
+   }
+
+   struct pipe_context *pipe = sz_context_create(screen, flags);
+   if (!pipe) {
+      mesa_loge("SZ: context creation failed");
+      return NULL;
+   }
+
+   screen->context_alive = true;
+   return pipe;
 }
 
 static void
@@ -365,6 +382,7 @@ sz_screen_destroy(struct pipe_screen *pscreen)
 {
    struct sz_screen *screen = sz_screen(pscreen);
 
+   sz_queue_state_finish(&screen->batch_state);
    sz_bo_finish(screen);
    sz_device_finish(screen);
 
@@ -429,6 +447,13 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
 
    sz_bo_init(screen);
    sz_resource_screen_init(screen);
+   sz_screen_fence_init(screen);
+
+   if (!sz_queue_state_init(&screen->batch_state, screen,
+                            screen->queues[SZ_QUEUE_GRAPHICS].family)) {
+      mesa_loge("SZ: could not create the command submission state");
+      goto fail;
+   }
 
    /* pipe_screen base */
    screen->base.destroy = sz_screen_destroy;
@@ -441,8 +466,9 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
 
    u_init_pipe_screen_caps(&screen->base, !screen->is_cpu);
 
-   /* Capabilities are deliberately minimal at Phase 0: the screen exists so
-    * the loader can see a device, but no context can be made yet. */
+   /* Capabilities stay minimal until there is a compiler: without GLSL support
+    * the state tracker would refuse to build a context and the failure would
+    * look like a driver bug rather than a missing feature. */
    {
       struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
       caps->glsl_feature_level = 120;
@@ -468,7 +494,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       if (sz_resource_selftest(screen) != 0) {
          mesa_loge("SZ: SZ_DEBUG=selftest failed; refusing to publish a screen "
                    "whose resource layer does not round-trip");
-         goto fail;
+         goto fail_submit;
+      }
+      if (sz_context_selftest(screen) != 0) {
+         mesa_loge("SZ: SZ_DEBUG=selftest failed; refusing to publish a screen "
+                   "whose command submission does not round-trip");
+         goto fail_submit;
       }
    }
 
@@ -493,6 +524,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
 
    return &screen->base;
 
+fail_submit:
+   sz_queue_state_finish(&screen->batch_state);
 fail:
    sz_bo_finish(screen);
    sz_device_finish(screen);

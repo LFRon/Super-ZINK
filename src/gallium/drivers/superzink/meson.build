@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: MIT
 
 files_libsuperzink = files(
+  'sz_batch.c',
   'sz_bo.c',
   'sz_caps.c',
+  'sz_context.c',
   'sz_device.c',
   'sz_debug.c',
   'sz_format.c',
   'sz_range.c',
   'sz_resource.c',
   'sz_screen.c',
+  'sz_sync.c',
 )
 
 libsuperzink = static_library(
