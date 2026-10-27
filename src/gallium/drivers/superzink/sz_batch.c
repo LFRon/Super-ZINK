@@ -339,8 +339,17 @@ sz_batch_submit(struct sz_batch *batch, VkPipelineStageFlags2 wait_stage)
 /* Fences                                                                     */
 /* ------------------------------------------------------------------------- */
 
+/* A fence is a value on the queue's timeline.
+ *
+ * pipe_context::flush creates one from the value the next submission will
+ * signal, so a fence describes exactly the work issued before it -- not the
+ * whole queue, which is what waiting for idle would mean. Finishing it is a
+ * wait for that value, and because the timeline is one object for the lifetime
+ * of the screen the fence needs no Vulkan object of its own. */
 struct sz_fence {
    struct pipe_reference reference;
+   VkSemaphore timeline;
+   uint64_t value;
 };
 
 static void
@@ -370,7 +379,37 @@ bool
 sz_fence_finish(struct pipe_screen *pscreen, struct pipe_context *pipe,
                 struct pipe_fence_handle *fence, uint64_t timeout)
 {
-   return true;
+   struct sz_screen *screen = sz_screen(pscreen);
+   struct sz_fence *f = (struct sz_fence *)fence;
+
+   if (!f || f->timeline == VK_NULL_HANDLE)
+      return true;
+
+   /* GL_ARB_sync allows a poll: a timeout of zero asks whether the work is done
+    * without blocking, which is what glClientWaitSync(GL_SYNC_FLUSH_COMMANDS_BIT
+    * absent) and every "is it ready yet" loop does. */
+   const VkSemaphoreWaitInfo wait = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+      .semaphoreCount = 1,
+      .pSemaphores = &f->timeline,
+      .pValues = &f->value,
+   };
+
+   return screen->vk.WaitSemaphores(screen->dev, &wait,
+                                    timeout == 0 ? 0 : UINT64_MAX) == VK_SUCCESS;
+}
+
+struct pipe_fence_handle *
+sz_fence_create(struct sz_screen *screen, uint64_t value)
+{
+   struct sz_fence *fence = calloc(1, sizeof(*fence));
+   if (!fence)
+      return NULL;
+
+   pipe_reference_init(&fence->reference, 1);
+   fence->timeline = screen->batch_state.timeline;
+   fence->value = value;
+   return (struct pipe_fence_handle *)fence;
 }
 
 int

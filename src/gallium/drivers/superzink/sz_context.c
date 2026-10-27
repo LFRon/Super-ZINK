@@ -215,12 +215,12 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
 
    sz_trace("flush flags=0x%x fence=%d", flags, fence != NULL);
 
-   /* There is no fence object yet, so a NULL return has to mean "already
-    * complete" -- and it only does if the submission is waited for here. A
-    * caller that flushes without either flag only asked for the work to reach
-    * the queue, and keeps running. */
+   /* The fence names the value the submission below will signal, so it covers
+    * exactly the work issued up to this point. The value is taken before the
+    * submit because submitting is what assigns it. */
    if (fence)
-      *fence = NULL;
+      *fence = sz_fence_create(ctx->screen,
+                               ctx->screen->batch_state.next_value + 1);
 
    sz_context_submit(ctx);
 

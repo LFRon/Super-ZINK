@@ -114,6 +114,11 @@ void sz_queue_wait_idle(struct sz_queue_state *qs);
  * NULL pointer there aborts the process on window close, long after anything the
  * driver did wrong. */
 void sz_screen_fence_init(struct sz_screen *screen);
+/* Creates a fence for a timeline value. Called from pipe_context::flush with the
+ * value the pending submission will signal. */
+struct pipe_fence_handle *sz_fence_create(struct sz_screen *screen,
+                                          uint64_t value);
+
 void sz_fence_reference(struct pipe_screen *pscreen,
                         struct pipe_fence_handle **ptr,
                         struct pipe_fence_handle *fence);
