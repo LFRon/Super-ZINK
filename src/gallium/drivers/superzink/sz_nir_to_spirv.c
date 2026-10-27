@@ -271,6 +271,23 @@ sz_scalar_type(struct sz_translate *t, enum sz_base base, unsigned bits)
    UNREACHABLE("bad base type");
 }
 
+/* A scalar constant of the given base and width.
+ *
+ * A one-bit value is a bool, and a bool has no OpConstant form: SPIR-V spells it
+ * OpConstantTrue/OpConstantFalse, and `OpConstant %bool 1` is rejected with
+ * "Type Id ... is not a scalar numeric type" -- which the validation layer
+ * reports and a driver's parser is free to do anything with. Routing through
+ * here is what keeps every constant site honest. */
+static uint32_t
+sz_const_scalar(struct sz_translate *t, enum sz_base base, unsigned bits,
+                uint32_t bits_value)
+{
+   if (base == SZ_BASE_BOOL || bits == 1)
+      return sz_spv_const_bool(t->m, bits_value != 0);
+
+   return sz_spv_const_bits(t->m, sz_scalar_type(t, base, bits), bits_value);
+}
+
 static uint32_t
 sz_dtype_type(struct sz_translate *t, const struct sz_dtype *type)
 {
@@ -1142,7 +1159,7 @@ sz_emit_load_const(struct sz_translate *t, nir_load_const_instr *lconst)
          bits = lconst->value[i].u32;
          break;
       }
-      comps[i] = sz_spv_const_bits(t->m, scalar, bits);
+      comps[i] = sz_const_scalar(t, type.base, type.bits, bits);
    }
 
    t->defs_id[lconst->def.index] =
@@ -2263,12 +2280,11 @@ static uint32_t
 sz_const_as(struct sz_translate *t, const nir_load_const_instr *lconst,
             const struct sz_dtype *want)
 {
-   const uint32_t scalar = sz_scalar_type(t, want->base, want->bits);
    uint32_t comps[4];
    for (unsigned i = 0; i < want->ncomp; i++) {
       const uint32_t bits = want->bits == 64 ? (uint32_t)lconst->value[i].u64
                                              : lconst->value[i].u32;
-      comps[i] = sz_spv_const_bits(t->m, scalar, bits);
+      comps[i] = sz_const_scalar(t, want->base, want->bits, bits);
    }
 
    return want->ncomp == 1
