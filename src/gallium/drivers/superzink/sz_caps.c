@@ -251,12 +251,22 @@ sz_caps_init(struct sz_caps *caps,
       VkPhysicalDeviceTransformFeedbackPropertiesEXT xfb = {
          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT,
       };
+      VkPhysicalDeviceDescriptorBufferPropertiesEXT desc = {
+         .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT,
+      };
       push.pNext = &multi;
       multi.pNext = &xfb;
+      xfb.pNext = &desc;
       get_props2(pdev, &query);
       caps->max_push_descriptors = push.maxPushDescriptors;
       caps->max_multi_draw_count = multi.maxMultiDrawCount;
       caps->max_transform_feedback_buffers = xfb.maxTransformFeedbackBuffers;
+      caps->descriptor_buffer_offset_alignment =
+         desc.descriptorBufferOffsetAlignment;
+      caps->descriptor_size_uniform_buffer = desc.uniformBufferDescriptorSize;
+      caps->descriptor_size_combined_image_sampler =
+         desc.combinedImageSamplerDescriptorSize;
    }
 
    /* ── resolve every listed capability ───────────────────────────────────── */

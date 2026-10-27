@@ -31,6 +31,10 @@ struct sz_resource {
    /* Exactly one of these is non-NULL. */
    VkImage image;
    VkBuffer buffer;
+   /* Device address of `buffer`, valid when it is not VK_NULL_HANDLE. A
+    * descriptor names a buffer by address in the descriptor-buffer path, and
+    * asking once at creation beats asking on every draw. */
+   uint64_t address;
 
    /* A whole-resource view of `image`, created alongside it.
     *

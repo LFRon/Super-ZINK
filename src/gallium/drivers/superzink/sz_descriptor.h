@@ -68,6 +68,11 @@ bool sz_descriptor_screen_init(struct sz_screen *screen,
                                unsigned max_push_descriptors);
 void sz_descriptor_screen_finish(struct sz_screen *screen);
 
+/* Whether the current batch can take another pair of descriptor sets. A caller
+ * that sees false flushes and submits, which starts a new batch on a fresh ring
+ * slot and therefore a fresh descriptor buffer. */
+bool sz_descriptor_has_room(struct sz_context *ctx);
+
 /* Records the descriptors a draw needs, from the context's recorded constant
  * buffers. Must be called after the pipeline is bound: the push goes to the
  * layout the bound pipeline was created with. */

@@ -51,11 +51,21 @@ sz_descriptor_layout_create(struct sz_screen *screen, VkDescriptorSetLayout *out
       }
    }
 
+   /* The two ways of getting descriptors to the device need layouts that were
+    * created with different flags, and one layout may not carry both: a push
+    * layout has an opaque size and no binding offsets, and a descriptor-buffer
+    * layout cannot be pushed to (VUID-vkGetDescriptorSetLayoutSizeEXT-layout-11811).
+    * So the screen picks a path once, at creation, and everything below follows
+    * it. */
+   const VkDescriptorSetLayoutCreateFlags layout_flags =
+      screen->caps.descriptor_buffer
+         ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT
+         : VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+
    VkDescriptorSetLayoutCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      /* ADR-008: nothing is ever allocated from a pool. The flag is what makes
-       * vkCmdPushDescriptorSet legal against this layout. */
-      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+      /* ADR-008: nothing is ever allocated from a pool. */
+      .flags = layout_flags,
       .bindingCount = SZ_DESCRIPTOR_UBO_BINDINGS,
       .pBindings = bindings,
    };
@@ -90,7 +100,6 @@ sz_descriptor_layout_create(struct sz_screen *screen, VkDescriptorSetLayout *out
       }
    }
 
-   ci.flags = 0;
    ci.bindingCount = SZ_DESCRIPTOR_SAMPLER_BINDINGS;
    ci.pBindings = sampler_bindings;
 
@@ -101,9 +110,14 @@ sz_descriptor_layout_create(struct sz_screen *screen, VkDescriptorSetLayout *out
       goto fail;
    }
 
-   /* A pool for the sampler sets. Each update allocates a set and the pool is
-    * only reset once everything it handed out has been submitted, so the size is
-    * the number of sampler-state changes that may be in flight at once. */
+   /* The descriptor-buffer path needs no pool at all: descriptors go straight
+    * into a mapped buffer and are selected by offset. */
+   if (screen->caps.descriptor_buffer)
+      return true;
+
+   /* Push path: a pool for the sampler sets. Each update allocates a set and the
+    * pool is only reset once everything it handed out has been submitted, so the
+    * size is the number of sampler-state changes that may be in flight at once. */
    const VkDescriptorPoolSize pool_sizes[] = {
       {
          .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -210,6 +224,160 @@ sz_descriptor_dummy_create(struct sz_screen *screen)
    return true;
 }
 
+/* Allocates the descriptor buffers and the unbound-slot placeholders.
+ *
+ * Called after the layouts exist, because their sizes and binding offsets are
+ * layout properties.
+ *
+ * Failures are fatal rather than a silent fallback: the layouts were already
+ * created for this path, so a screen that cannot produce descriptors cannot
+ * draw. Saying so here is far cheaper than debugging an empty window. */
+static bool
+sz_descriptor_db_init(struct sz_screen *screen)
+{
+   if (!screen->caps.descriptor_buffer)
+      return true;
+
+   if (!screen->vk.GetDescriptorSetLayoutSizeEXT ||
+       !screen->vk.GetDescriptorSetLayoutBindingOffsetEXT ||
+       !screen->vk.GetDescriptorEXT || !screen->vk.CmdBindDescriptorBuffersEXT ||
+       !screen->vk.CmdSetDescriptorBufferOffsetsEXT) {
+      mesa_loge("SZ: VK_EXT_descriptor_buffer is advertised but its entry points "
+                "did not resolve");
+      return false;
+   }
+
+   screen->vk.GetDescriptorSetLayoutSizeEXT(
+      screen->dev, screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_UBO],
+      &screen->db.ubo_size);
+   screen->vk.GetDescriptorSetLayoutSizeEXT(
+      screen->dev, screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_SAMPLERS],
+      &screen->db.sampler_size);
+
+   if (!screen->db.ubo_size || !screen->db.sampler_size) {
+      mesa_loge("SZ: a descriptor set layout reports size zero");
+      return false;
+   }
+
+   /* Every offset handed to vkCmdSetDescriptorBufferOffsetsEXT must be a
+    * multiple of the device's alignment, so the two sets are padded to it. */
+   const uint64_t align =
+      MAX2(screen->caps.descriptor_buffer_offset_alignment, 1ull);
+   screen->db.ubo_size = align64(screen->db.ubo_size, align);
+   screen->db.sampler_size = align64(screen->db.sampler_size, align);
+
+   /* Sized so that running out is not a practical concern: a batch is flushed
+    * on every state change, and one draw costs a few hundred bytes here. */
+   const VkDeviceSize slot_size = 4ull * 1024 * 1024;
+
+   for (unsigned i = 0; i < SZ_BATCH_RING_SIZE; i++) {
+      const VkBufferCreateInfo ci = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .size = slot_size,
+         /* Both usages: sampler descriptors for the image samplers, resource
+          * descriptors for the uniform buffers. There is no combined bit. */
+         .usage = VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+                  VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                  /* Needed because the buffer is named by device address in
+                   * vkCmdBindDescriptorBuffersEXT, and
+                   * vkGetBufferDeviceAddress requires this bit on the buffer it
+                   * is asked about. Without it the address is garbage and the
+                   * device reads descriptors from nowhere, which hangs rather
+                   * than reporting an error. */
+                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      };
+      if (screen->vk.CreateBuffer(screen->dev, &ci, NULL,
+                                  &screen->db.ring[i].buffer) != VK_SUCCESS) {
+         mesa_loge("SZ: could not create a descriptor buffer");
+         return false;
+      }
+
+      VkMemoryRequirements req;
+      screen->vk.GetBufferMemoryRequirements(screen->dev,
+                                             screen->db.ring[i].buffer, &req);
+      /* Host-visible and coherent because descriptors are produced by the CPU
+       * between draws; that is what the extension is for. */
+      screen->db.ring[i].bo =
+         sz_bo_alloc(screen, &req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+      if (!screen->db.ring[i].bo ||
+          screen->vk.BindBufferMemory(screen->dev, screen->db.ring[i].buffer,
+                                      sz_bo_memory(screen->db.ring[i].bo),
+                                      sz_bo_offset(screen->db.ring[i].bo)) !=
+             VK_SUCCESS) {
+         mesa_loge("SZ: could not back a descriptor buffer");
+         return false;
+      }
+
+      screen->db.ring[i].mapped = sz_bo_map(screen->db.ring[i].bo);
+      if (!screen->db.ring[i].mapped) {
+         mesa_loge("SZ: could not map a descriptor buffer");
+         return false;
+      }
+
+      const VkBufferDeviceAddressInfo address_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+         .buffer = screen->db.ring[i].buffer,
+      };
+      screen->db.ring[i].address =
+         screen->vk.GetBufferDeviceAddress(screen->dev, &address_info);
+      screen->db.ring[i].size = slot_size;
+      screen->db.ring[i].used = 0;
+   }
+
+   /* The placeholder an unbound constant buffer slot points at. It must be a
+    * real uniform buffer: pointing the slot at the descriptor buffer fails
+    * VUID-VkDescriptorGetInfoEXT-type-12220, because that one was not created
+    * with VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT. */
+   {
+      const VkBufferCreateInfo ci = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .size = 256,
+         .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      };
+      if (screen->vk.CreateBuffer(screen->dev, &ci, NULL,
+                                  &screen->dummy_ubo.buffer) != VK_SUCCESS) {
+         mesa_loge("SZ: could not create the unbound uniform buffer placeholder");
+         return false;
+      }
+
+      VkMemoryRequirements req;
+      screen->vk.GetBufferMemoryRequirements(screen->dev,
+                                             screen->dummy_ubo.buffer, &req);
+      screen->dummy_ubo.bo =
+         sz_bo_alloc(screen, &req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if (!screen->dummy_ubo.bo ||
+          screen->vk.BindBufferMemory(screen->dev, screen->dummy_ubo.buffer,
+                                      sz_bo_memory(screen->dummy_ubo.bo),
+                                      sz_bo_offset(screen->dummy_ubo.bo)) !=
+             VK_SUCCESS) {
+         mesa_loge("SZ: could not back the unbound uniform buffer placeholder");
+         return false;
+      }
+
+      const VkBufferDeviceAddressInfo info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+         .buffer = screen->dummy_ubo.buffer,
+      };
+      screen->dummy_ubo.address =
+         screen->vk.GetBufferDeviceAddress(screen->dev, &info);
+   }
+
+   screen->db.enabled = true;
+
+   if (sz_debug_enabled(SZ_DEBUG_INFO))
+      mesa_logi("SZ: descriptor buffers: %" PRIu64 " + %" PRIu64
+                " bytes per set, %u slots of %" PRIu64 " bytes",
+                (uint64_t)screen->db.ubo_size,
+                (uint64_t)screen->db.sampler_size, SZ_BATCH_RING_SIZE,
+                (uint64_t)slot_size);
+
+   return true;
+}
+
 bool
 sz_descriptor_screen_init(struct sz_screen *screen, unsigned max_push_descriptors)
 {
@@ -229,12 +397,32 @@ sz_descriptor_screen_init(struct sz_screen *screen, unsigned max_push_descriptor
 
    /* Without the placeholder there is no safe way to leave a binding that used
     * to name a destroyed view, so a screen without it is not usable. */
-   return sz_descriptor_dummy_create(screen);
+   if (!sz_descriptor_dummy_create(screen))
+      return false;
+
+   return sz_descriptor_db_init(screen);
 }
 
 void
 sz_descriptor_screen_finish(struct sz_screen *screen)
 {
+   if (screen->dummy_ubo.buffer != VK_NULL_HANDLE)
+      screen->vk.DestroyBuffer(screen->dev, screen->dummy_ubo.buffer, NULL);
+   if (screen->dummy_ubo.bo)
+      sz_bo_free(screen->dummy_ubo.bo);
+   screen->dummy_ubo.buffer = VK_NULL_HANDLE;
+   screen->dummy_ubo.bo = NULL;
+
+   for (unsigned i = 0; i < SZ_BATCH_RING_SIZE; i++) {
+      if (screen->db.ring[i].buffer != VK_NULL_HANDLE)
+         screen->vk.DestroyBuffer(screen->dev, screen->db.ring[i].buffer, NULL);
+      if (screen->db.ring[i].bo)
+         sz_bo_free(screen->db.ring[i].bo);
+      screen->db.ring[i].buffer = VK_NULL_HANDLE;
+      screen->db.ring[i].bo = NULL;
+      screen->db.ring[i].mapped = NULL;
+   }
+
    if (screen->dummy_sampler.sampler != VK_NULL_HANDLE)
       screen->vk.DestroySampler(screen->dev, screen->dummy_sampler.sampler, NULL);
    if (screen->dummy_sampler.view != VK_NULL_HANDLE)
@@ -639,6 +827,172 @@ sz_descriptor_sampler_set(struct sz_context *ctx, VkCommandBuffer cmd,
    return screen->sampler_sets[slot].set;
 }
 
+/* Writes both sets into the batch's descriptor buffer and selects them.
+ *
+ * The buffer is bound immediately before the offsets that index into it, in the
+ * same command buffer. Binding once per command buffer would be one command
+ * cheaper and is what the first version did, but a binding does not survive
+ * being split across two command buffers, and the draw path does open a new one
+ * mid-frame -- the offsets then reference a buffer index nothing bound
+ * (VUID-vkCmdSetDescriptorBufferOffsetsEXT-pBufferIndices-08065).
+ *
+ * Returns false when there is no room left, which is reported rather than
+ * silently writing past the end: a descriptor written out of bounds is a GPU
+ * fault, not a validation error. */
+static bool
+sz_descriptor_db_emit(struct sz_context *ctx, VkCommandBuffer cmd)
+{
+   struct sz_screen *screen = ctx->screen;
+   if (!screen->db.enabled || !ctx->batch)
+      return false;
+
+   const unsigned slot = ctx->batch->ring_index;
+   if (slot >= SZ_BATCH_RING_SIZE)
+      return false;
+
+   const uint64_t align =
+      MAX2(screen->caps.descriptor_buffer_offset_alignment, 1ull);
+
+   VkDeviceSize ubo_offset = align64(screen->db.ring[slot].used, align);
+   VkDeviceSize sampler_offset = align64(ubo_offset + screen->db.ubo_size, align);
+
+   if (sampler_offset + screen->db.sampler_size > screen->db.ring[slot].size)
+      return false;
+
+   screen->db.ring[slot].used = sampler_offset + screen->db.sampler_size;
+
+   uint8_t *const mapped = screen->db.ring[slot].mapped;
+   const size_t ubo_size = screen->caps.descriptor_size_uniform_buffer;
+   const size_t sampler_size =
+      screen->caps.descriptor_size_combined_image_sampler;
+   const VkDescriptorSetLayout ubo_layout =
+      screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_UBO];
+   const VkDescriptorSetLayout sampler_layout =
+      screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_SAMPLERS];
+
+   for (unsigned s = 0; s < ARRAY_SIZE(sz_descriptor_stages); s++) {
+      const mesa_shader_stage stage = sz_descriptor_stages[s];
+
+      /* ── uniform buffers ──────────────────────────────────────────────── */
+      for (unsigned i = 0; i < SZ_MAX_CONST_BUFFERS; i++) {
+         VkDeviceSize binding_offset = 0;
+         screen->vk.GetDescriptorSetLayoutBindingOffsetEXT(
+            screen->dev, ubo_layout, sz_descriptor_binding(stage, i),
+            &binding_offset);
+
+         const struct pipe_constant_buffer *cb =
+            &ctx->state.constant_buffers[stage][i];
+
+         VkDescriptorAddressInfoEXT address = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+            .format = VK_FORMAT_UNDEFINED,
+            .address = screen->dummy_ubo.address,
+            .range = 256,
+         };
+
+         if (cb->buffer) {
+            struct sz_resource *res = sz_resource(cb->buffer);
+            if (res->buffer != VK_NULL_HANDLE) {
+               sz_resource_access(screen, cmd, res, SZ_ACCESS_UNIFORM_BUFFER);
+
+               const uint64_t offset = cb->buffer_offset;
+               uint64_t range = cb->buffer_size ? cb->buffer_size : VK_WHOLE_SIZE;
+               if (range != VK_WHOLE_SIZE)
+                  range = MIN2(range, (uint64_t)cb->buffer->width0 - offset);
+
+               address.address = res->address + offset;
+               address.range = range;
+            }
+         }
+
+         const VkDescriptorGetInfoEXT info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .data.pUniformBuffer = &address,
+         };
+         screen->vk.GetDescriptorEXT(screen->dev, &info, ubo_size,
+                                     mapped + ubo_offset + binding_offset);
+      }
+
+      /* ── combined image samplers ──────────────────────────────────────── */
+      for (unsigned i = 0; i < SZ_MAX_SAMPLERS; i++) {
+         VkDeviceSize binding_offset = 0;
+         screen->vk.GetDescriptorSetLayoutBindingOffsetEXT(
+            screen->dev, sampler_layout, sz_sampler_binding(stage, i),
+            &binding_offset);
+
+         const struct sz_state *state = NULL;
+         const struct sz_sampler_view *sv = NULL;
+         const struct sz_resource *res =
+            sz_sampled_resource(ctx, stage, i, &state, &sv);
+
+         /* An unbound unit names the placeholder: GL says it samples as black,
+          * and Vulkan has no such rule -- a descriptor naming a destroyed view
+          * is undefined, and on RADV it hangs. */
+         VkDescriptorImageInfo image = {
+            .sampler = res ? state->u.sampler.sampler
+                           : screen->dummy_sampler.sampler,
+            .imageView = res ? (ctx->sampled_override.view[s][i]
+                                   ? ctx->sampled_override.view[s][i]
+                                   : sv->view)
+                             : screen->dummy_sampler.view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+         };
+
+         const VkDescriptorGetInfoEXT info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .data.pCombinedImageSampler = &image,
+         };
+         screen->vk.GetDescriptorEXT(screen->dev, &info, sampler_size,
+                                     mapped + sampler_offset + binding_offset);
+      }
+   }
+
+   const VkDescriptorBufferBindingInfoEXT binding = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT,
+      .address = screen->db.ring[slot].address,
+      .usage = VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+               VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT,
+   };
+   screen->vk.CmdBindDescriptorBuffersEXT(cmd, 1, &binding);
+
+   const uint32_t buffer_index = 0;
+   const VkDeviceSize offsets[SZ_DESCRIPTOR_SET_COUNT] = { ubo_offset,
+                                                           sampler_offset };
+   screen->vk.CmdSetDescriptorBufferOffsetsEXT(
+      cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, screen->pipeline_layout,
+      SZ_DESCRIPTOR_SET_UBO, SZ_DESCRIPTOR_SET_COUNT, &buffer_index, offsets);
+
+
+   return true;
+}
+
+/* Whether the batch being recorded still has room for one more pair of sets.
+ *
+ * Checked before a batch is extended rather than when it is flushed, because a
+ * flush that runs out has already committed to the command buffer it is
+ * recording into: the only safe reaction there is to drop the draw, and the only
+ * good reaction is not to get there. */
+bool
+sz_descriptor_has_room(struct sz_context *ctx)
+{
+   struct sz_screen *screen = ctx->screen;
+   if (!screen->db.enabled || !ctx->batch)
+      return true;
+
+   const unsigned slot = ctx->batch->ring_index;
+   if (slot >= SZ_BATCH_RING_SIZE)
+      return false;
+
+   const uint64_t align =
+      MAX2(screen->caps.descriptor_buffer_offset_alignment, 1ull);
+   const VkDeviceSize need = align64(screen->db.ubo_size, align) +
+                             align64(screen->db.sampler_size, align);
+   return align64(screen->db.ring[slot].used, align) + need <=
+          screen->db.ring[slot].size;
+}
+
 void
 sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd)
 {
@@ -649,6 +1003,17 @@ sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd)
    const VkPipelineLayout layout = screen->pipeline_layout;
    if (layout == VK_NULL_HANDLE)
       return;
+
+   /* On a device with VK_EXT_descriptor_buffer the layouts were created for that
+    * path and cannot be pushed to, so the descriptor buffer is the only way to
+    * get descriptors to the device. There is deliberately no fallback: pushing
+    * to a layout that was not created for it is a validation error and binds
+    * nothing, which shows up as a black frame rather than as a failure. */
+   if (screen->db.enabled) {
+      if (!sz_descriptor_db_emit(ctx, cmd))
+         sz_warn_once("the descriptor buffer for this batch is full");
+      return;
+   }
 
    /* Uniform buffers: one push for both stages. A push names bindings rather than
     * a whole set, and each binding carries its own stage flags in the layout, so

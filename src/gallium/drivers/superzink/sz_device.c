@@ -476,6 +476,19 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    /* The sampler set is an ordinary descriptor set: it is not a push set (a
     * pipeline layout may hold only one of those), so it is allocated from a pool
     * and bound with vkCmdBindDescriptorSets. */
+   /* bufferDeviceAddress is a required capability, so this always resolves. */
+   SZ_DEV_PROC(GetBufferDeviceAddress, vkGetBufferDeviceAddress);
+
+   if (screen->caps.descriptor_buffer) {
+      SZ_DEV_PROC(GetDescriptorSetLayoutSizeEXT, vkGetDescriptorSetLayoutSizeEXT);
+      SZ_DEV_PROC(GetDescriptorSetLayoutBindingOffsetEXT,
+                  vkGetDescriptorSetLayoutBindingOffsetEXT);
+      SZ_DEV_PROC(GetDescriptorEXT, vkGetDescriptorEXT);
+      SZ_DEV_PROC(CmdBindDescriptorBuffersEXT, vkCmdBindDescriptorBuffersEXT);
+      SZ_DEV_PROC(CmdSetDescriptorBufferOffsetsEXT,
+                  vkCmdSetDescriptorBufferOffsetsEXT);
+   }
+
    SZ_DEV_PROC(CreateDescriptorPool, vkCreateDescriptorPool);
    SZ_DEV_PROC(DestroyDescriptorPool, vkDestroyDescriptorPool);
    SZ_DEV_PROC(AllocateDescriptorSets, vkAllocateDescriptorSets);

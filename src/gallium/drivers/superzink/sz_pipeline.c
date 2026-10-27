@@ -899,6 +899,14 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
 
    const VkGraphicsPipelineCreateInfo pipeline_ci = {
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+      /* A pipeline whose descriptors come from a descriptor buffer has to say so
+       * at creation time, or binding a descriptor buffer and drawing from it is
+       * invalid (VUID-vkCmdDraw-None-08117). The flag is a promise that the
+       * pipeline is *only* drawn with descriptor buffers, which is exactly the
+       * case whenever the screen took that path. */
+      .flags = screen->db.enabled
+                  ? VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT
+                  : 0,
       .pNext = &rendering,
       .stageCount = ARRAY_SIZE(stages),
       .pStages = stages,

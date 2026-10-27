@@ -151,6 +151,14 @@ sz_context_cmd(struct sz_context *ctx)
        * the only place where the dirty mask is set wholesale. */
       ctx->dirty = SZ_DIRTY_ALL;
       ctx->pipeline = NULL;
+      /* The descriptor buffer belongs to this batch: a slot may only be
+       * re-recorded once its submission finished, so the bump pointer can start
+       * from zero again at exactly the moment a new command buffer takes it
+       * over. Descriptor bindings do not carry into a new command buffer
+       * either, which is why sz_descriptor_push() re-binds on every batch. */
+      const unsigned slot = ctx->batch->ring_index;
+      if (slot < SZ_BATCH_RING_SIZE)
+         ctx->screen->db.ring[slot].used = 0;
       /* Descriptor set bindings are per command buffer, so the "already bound"
        * memo has to be cleared with the rest of the inherited state. */
       ctx->screen->bound_sampler_set = VK_NULL_HANDLE;
@@ -1691,6 +1699,7 @@ sz_set_stream_output_targets(struct pipe_context *pipe, unsigned num_targets,
       pipe_so_target_reference(&ctx->so_targets[i], NULL);
 
    ctx->num_so_targets = n;
+   ctx->so_counter_dirty = n > 0;
    (void)output_prim;
 }
 
@@ -1957,6 +1966,47 @@ sz_so_counter_ensure(struct sz_context *ctx)
    return true;
 }
 
+/* Zeroes the counter buffer for the capture about to be recorded, outside the
+ * render pass.
+ *
+ * vkCmdFillBuffer may not be recorded inside a dynamic render pass
+ * (VUID-vkCmdFillBuffer-renderpass), and the counters must read zero when
+ * vkCmdBeginTransformFeedbackEXT loads the starting offsets from them -- which
+ * the driver does at begin time, inside the pass.
+ *
+ * Zeroing in the command stream rather than on the host matters: a previously
+ * submitted capture may still be reading these dwords. */
+static bool sz_so_counter_ensure(struct sz_context *ctx);
+
+static void
+sz_so_counter_zero(struct sz_context *ctx, VkCommandBuffer cmd)
+{
+   /* The counter buffer may not exist yet: it is created on first use, and this
+    * runs before the capture bracket below would have asked for it. */
+   if (ctx->num_so_targets == 0 || !sz_so_counter_ensure(ctx))
+      return;
+
+   for (unsigned i = 0; i < ctx->num_so_targets; i++)
+      ctx->screen->vk.CmdFillBuffer(cmd, ctx->so_counter_buffer,
+                                    i * sizeof(uint32_t), sizeof(uint32_t), 0);
+
+   const VkMemoryBarrier2 fill_barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                      VK_PIPELINE_STAGE_2_CLEAR_BIT,
+      .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT,
+      .dstAccessMask = VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT |
+                       VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT,
+   };
+   const VkDependencyInfo fill_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &fill_barrier,
+   };
+   ctx->screen->vk.CmdPipelineBarrier2(cmd, &fill_dep);
+}
+
 void
 sz_draw_flush(struct sz_context *ctx)
 {
@@ -1987,6 +2037,18 @@ sz_draw_flush(struct sz_context *ctx)
 
    if (ctx->dirty & SZ_DIRTY_DESCRIPTORS)
       sz_descriptor_prepare_sampled(ctx, cmd);
+
+   /* Zeroing the capture counters may not be recorded inside a render pass, so
+    * it forces the pass closed -- only when a capture actually starts, not on
+    * every batch of one. */
+   if (ctx->so_counter_dirty) {
+      if (ctx->rendering) {
+         ctx->screen->vk.CmdEndRendering(cmd);
+         ctx->rendering = false;
+      }
+      sz_so_counter_zero(ctx, cmd);
+      ctx->so_counter_dirty = false;
+   }
 
    if (!ctx->rendering && !sz_renderpass_begin(ctx, cmd)) {
       ctx->pending.count = 0;
@@ -2132,34 +2194,15 @@ sz_draw_flush(struct sz_context *ctx)
          VkBuffer counters[PIPE_MAX_SO_BUFFERS];
          VkDeviceSize counter_offsets[PIPE_MAX_SO_BUFFERS];
 
-         /* Zero in the command stream, not on the host: a previously submitted
-          * capture may still be reading the counters. */
          for (unsigned i = 0; i < n; i++) {
-            struct pipe_stream_output_target *t = ctx->so_targets[i];
+            const struct pipe_stream_output_target *t = ctx->so_targets[i];
             sizes[i] = t->buffer_size;
             counters[i] = ctx->so_counter_buffer;
             counter_offsets[i] = i * sizeof(uint32_t);
-            ctx->screen->vk.CmdFillBuffer(cmd, ctx->so_counter_buffer,
-                                          counter_offsets[i], sizeof(uint32_t),
-                                          0);
          }
 
-         const VkMemoryBarrier2 fill_barrier = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT,
-            .dstAccessMask =
-               VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT |
-               VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT,
-         };
-         const VkDependencyInfo fill_dep = {
-            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .memoryBarrierCount = 1,
-            .pMemoryBarriers = &fill_barrier,
-         };
-         ctx->screen->vk.CmdPipelineBarrier2(cmd, &fill_dep);
-
+         /* The counters were zeroed before the render pass opened (see
+          * sz_so_counter_zero): vkCmdFillBuffer is illegal inside one. */
          ctx->screen->vk.CmdBindTransformFeedbackBuffersEXT(cmd, 0, n, buffers,
                                                             offsets, sizes);
          ctx->screen->vk.CmdBeginTransformFeedbackEXT(cmd, 0, n, counters,
@@ -2278,6 +2321,16 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    if (ctx->state.num_vertex_buffers == 0) {
       sz_warn_once("draw without vertex buffers, ignoring");
       return;
+   }
+
+   /* A batch accumulates one descriptor-set copy per flush, so a draw stream
+    * with many state changes can fill a ring slot. Starting a fresh batch here
+    * keeps every offset valid: the descriptors a command buffer references must
+    * stay put until that command buffer is submitted, so the only way to reclaim
+    * the space is to submit. */
+   if (!sz_descriptor_has_room(ctx)) {
+      sz_draw_flush(ctx);
+      sz_context_submit(ctx);
    }
 
    struct sz_resource *index = NULL;

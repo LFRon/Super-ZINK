@@ -622,17 +622,14 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
 
    sz_decorate_stream_output(t, var, id);
 
-   /* Integer varyings have to be flat: the Vulkan rule is unconditional, and a
-    * missing decoration is a validation error rather than a performance hint.
-    * Flat is only meaningful -- and only legal -- on fragment stage inputs and
-    * on outputs, so a vertex input never gets it. */
-   const bool flat_stage = storage == SpvStorageClassOutput ||
-      (storage == SpvStorageClassInput &&
-       t->nir->info.stage == MESA_SHADER_FRAGMENT);
-   if (flat_stage && type.base != SZ_BASE_FLOAT && type.base != SZ_BASE_BOOL)
-      sz_spv_decorate_bare(t->m, id, SpvDecorationFlat);
-   else if (flat_stage && storage == SpvStorageClassInput &&
-            var->data.interpolation == INTERP_MODE_FLAT)
+   /* Flat is meaningful only on fragment stage inputs: an integer varying
+    * carries no interpolation because it cannot be blended, and SPIR-V requires
+    * the decoration there. On an output the same decoration is *invalid*
+    * (VUID-StandaloneSpirv-Flat-06201), which is why the check is on the storage
+    * class rather than on the type alone. */
+   if (storage == SpvStorageClassInput &&
+       t->nir->info.stage == MESA_SHADER_FRAGMENT &&
+       (type.base != SZ_BASE_FLOAT || var->data.interpolation == INTERP_MODE_FLAT))
       sz_spv_decorate_bare(t->m, id, SpvDecorationFlat);
 
    t->vars[t->num_vars].var = var;

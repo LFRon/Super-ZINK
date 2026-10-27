@@ -87,6 +87,14 @@ struct sz_vk_entrypoints {
    PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
    PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
    PFN_vkCmdPushDescriptorSetKHR CmdPushDescriptorSetKHR;
+   /* VK_EXT_descriptor_buffer. NULL when the device does not offer it, which is
+    * why no call site reaches them without checking screen->db.enabled first. */
+   PFN_vkGetDescriptorSetLayoutSizeEXT GetDescriptorSetLayoutSizeEXT;
+   PFN_vkGetDescriptorSetLayoutBindingOffsetEXT GetDescriptorSetLayoutBindingOffsetEXT;
+   PFN_vkGetDescriptorEXT GetDescriptorEXT;
+   PFN_vkCmdBindDescriptorBuffersEXT CmdBindDescriptorBuffersEXT;
+   PFN_vkCmdSetDescriptorBufferOffsetsEXT CmdSetDescriptorBufferOffsetsEXT;
+   PFN_vkGetBufferDeviceAddress GetBufferDeviceAddress;
 
    /* Command submission (sz_batch / sz_sync). */
    PFN_vkCreateCommandPool CreateCommandPool;
@@ -236,6 +244,45 @@ struct sz_screen {
 
    /* One descriptor set layout per stage, indexed by descriptor set. */
    VkDescriptorSetLayout descriptor_set_layout[SZ_DESCRIPTOR_SET_COUNT];
+
+   /* VK_EXT_descriptor_buffer path.
+    *
+    * One descriptor buffer per command-buffer ring slot. That ties the lifetime
+    * of recorded descriptors to the lifetime of the batch that names them: a
+    * slot may only be re-recorded once its submission has completed, so the
+    * buffer is free to be reused at exactly the moment the bump pointer is
+    * reset, with no tracking of its own.
+    *
+    * This is what replaces the pool of cached sampler sets. Descriptors are
+    * produced straight into host-visible memory and selected by offset, so the
+    * capacity is memory rather than 1024 cached configurations -- which is the
+    * limit that made a command buffer binding thousands of distinct textures
+    * run out. */
+   struct {
+      bool enabled;
+      VkDeviceSize ubo_size;
+      VkDeviceSize sampler_size;
+      struct {
+         VkBuffer buffer;
+         struct sz_bo *bo;
+         uint8_t *mapped;
+         VkDeviceSize size;
+         VkDeviceSize used;
+         uint64_t address;
+      } ring[SZ_BATCH_RING_SIZE];
+   } db;
+
+   /* A small uniform buffer that an unbound constant buffer slot points at.
+    *
+    * A descriptor has to name an allocated range created for its own use: naming
+    * the descriptor buffer fails VUID-VkDescriptorGetInfoEXT-type-12220 because
+    * that buffer was not created with VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT.
+    * Reading zeros is also the right answer. */
+   struct {
+      VkBuffer buffer;
+      struct sz_bo *bo;
+      uint64_t address;
+   } dummy_ubo;
    /* The sampler set is not a push set, so it needs a pool to be allocated
     * from. Sets are cached by content; a slot is only reused once the
     * submission that last bound it has completed. */

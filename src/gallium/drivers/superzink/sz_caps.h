@@ -228,6 +228,14 @@ struct sz_caps {
     * or zero when the extension is absent. GL only needs four. */
    uint32_t max_transform_feedback_buffers;
 
+   /* VK_EXT_descriptor_buffer properties. The descriptor sizes are properties
+    * because the in-memory layout of a descriptor is implementation-defined:
+    * vkGetDescriptorEXT writes that many bytes and nothing else knows how many
+    * it will be. The alignment applies to every bound buffer offset. */
+   uint64_t descriptor_buffer_offset_alignment;
+   size_t descriptor_size_uniform_buffer;
+   size_t descriptor_size_combined_image_sampler;
+
    uint32_t instance_api_version;
    uint32_t device_api_version;
 

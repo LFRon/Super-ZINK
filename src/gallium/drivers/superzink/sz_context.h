@@ -195,6 +195,12 @@ struct sz_context {
     * driver keeps track of the target offsets itself. */
    VkBuffer so_counter_buffer;
    struct sz_bo *so_counter_bo;
+   /* Set when a new capture is about to be recorded and its counters still have
+    * to be zeroed. Kept as a flag rather than done unconditionally because the
+    * zeroing may not be recorded inside a render pass, so it forces the pass
+    * closed -- which is worth avoiding on every batch of a capture that spans
+    * many. */
+   bool so_counter_dirty;
 
    /* Draw stream: draws accumulate here and leave as one vkCmdDrawMulti* call.
     *

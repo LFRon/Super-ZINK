@@ -213,11 +213,19 @@ sz_buffer_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
       return NULL;
    }
 
+   /* A descriptor names a buffer by device address in the descriptor-buffer
+    * path, so the address is taken once here rather than per draw. */
+   const VkBufferDeviceAddressInfo address_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+      .buffer = res->buffer,
+   };
+   res->address = screen->vk.GetBufferDeviceAddress(screen->dev, &address_info);
+
    if (sz_debug_enabled(SZ_DEBUG_INFO)) {
       mesa_logi("SZ: buffer %u bytes, bind 0x%x -> %" PRIu64 " bytes @ offset %"
-                PRIu64,
+                PRIu64 " address 0x%" PRIx64,
                 tmpl->width0, tmpl->bind, sz_bo_size(res->bo),
-                sz_bo_offset(res->bo));
+                sz_bo_offset(res->bo), res->address);
    }
 
    return &res->base;
