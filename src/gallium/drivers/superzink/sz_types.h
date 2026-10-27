@@ -63,6 +63,8 @@ struct sz_vk_entrypoints {
    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
    PFN_vkGetImageMemoryRequirements2 GetImageMemoryRequirements2;
    PFN_vkBindImageMemory BindImageMemory;
+   PFN_vkCreateSampler CreateSampler;
+   PFN_vkDestroySampler DestroySampler;
    PFN_vkCreateImageView CreateImageView;
    PFN_vkDestroyImageView DestroyImageView;
    PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
@@ -113,6 +115,7 @@ struct sz_vk_entrypoints {
    PFN_vkCmdBindIndexBuffer CmdBindIndexBuffer;
    PFN_vkCmdDraw CmdDraw;
    PFN_vkCmdDrawIndexed CmdDrawIndexed;
+   PFN_vkCmdClearAttachments CmdClearAttachments;
 
    /* Pipelines and shaders (sz_pipeline). */
    PFN_vkCreateShaderModule CreateShaderModule;

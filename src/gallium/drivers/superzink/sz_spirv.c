@@ -332,6 +332,46 @@ sz_spv_type_array(struct sz_spv_module *m, uint32_t element, unsigned count)
 }
 
 uint32_t
+sz_spv_type_image(struct sz_spv_module *m, uint32_t sampled_type, SpvDim dim,
+                  bool depth, bool arrayed, bool ms, bool sampled)
+{
+   /* OpTypeImage's Dim, Depth, Arrayed, MS and Sampled operands are literal
+    * numbers rather than ids, so they cannot share the three-word cache key
+    * directly; they are packed into it instead. */
+   const uint32_t flags = (uint32_t)dim | (depth ? 1u << 8 : 0) |
+                          (arrayed ? 1u << 9 : 0) | (ms ? 1u << 10 : 0) |
+                          (sampled ? 1u << 11 : 0);
+
+   uint32_t id = sz_spv_type_lookup(m, SpvOpTypeImage, sampled_type, flags, 0);
+   if (id)
+      return id;
+
+   /* Every texture in this driver is a sampled texture with an ordinary GL
+    * format, so the format operand is Unknown: it only matters for storage
+    * images, where the shader and the view must agree exactly. */
+   id = sz_spv_id(m);
+   const uint32_t ops[] = { id, sampled_type, (uint32_t)dim, depth, arrayed, ms,
+                            sampled, SpvImageFormatUnknown };
+   sz_spv_emit_simple(m, SEC_TYPES, SpvOpTypeImage, ops, 8);
+   sz_spv_type_record(m, SpvOpTypeImage, sampled_type, flags, 0, id);
+   return id;
+}
+
+uint32_t
+sz_spv_type_sampled_image(struct sz_spv_module *m, uint32_t image)
+{
+   uint32_t id = sz_spv_type_lookup(m, SpvOpTypeSampledImage, image, 0, 0);
+   if (id)
+      return id;
+
+   id = sz_spv_id(m);
+   const uint32_t ops[] = { id, image };
+   sz_spv_emit_simple(m, SEC_TYPES, SpvOpTypeSampledImage, ops, 2);
+   sz_spv_type_record(m, SpvOpTypeSampledImage, image, 0, 0, id);
+   return id;
+}
+
+uint32_t
 sz_spv_type_struct(struct sz_spv_module *m, const uint32_t *members,
                    unsigned count)
 {
@@ -733,4 +773,63 @@ sz_spv_raw_function_op(struct sz_spv_module *m, SpvOp opcode,
                        const uint32_t *operands, unsigned count)
 {
    sz_spv_emit_simple(m, SEC_FUNCTIONS, opcode, operands, count);
+}
+
+void
+sz_spv_branch(struct sz_spv_module *m, uint32_t target)
+{
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpBranch, &target, 1);
+}
+
+void
+sz_spv_branch_conditional(struct sz_spv_module *m, uint32_t condition,
+                          uint32_t then_id, uint32_t else_id)
+{
+   const uint32_t ops[] = { condition, then_id, else_id };
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpBranchConditional, ops, 3);
+}
+
+void
+sz_spv_selection_merge(struct sz_spv_module *m, uint32_t merge,
+                       SpvSelectionControlMask control)
+{
+   const uint32_t ops[] = { merge, control };
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpSelectionMerge, ops, 2);
+}
+
+void
+sz_spv_loop_merge(struct sz_spv_module *m, uint32_t merge, uint32_t cont,
+                  SpvLoopControlMask control)
+{
+   const uint32_t ops[] = { merge, cont, control };
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpLoopMerge, ops, 3);
+}
+
+uint32_t
+sz_spv_phi(struct sz_spv_module *m, uint32_t type, const uint32_t *operands,
+           unsigned count, size_t *first_operand)
+{
+   struct sz_spv_section *s = &m->section[SEC_FUNCTIONS];
+   const uint32_t id = sz_spv_id(m);
+   const uint32_t header = sz_spv_op_word(SpvOpPhi, 2 + count);
+   const size_t start = s->used;
+
+   sz_spv_append(m, SEC_FUNCTIONS, &header, 1);
+   sz_spv_append(m, SEC_FUNCTIONS, &type, 1);
+   sz_spv_append(m, SEC_FUNCTIONS, &id, 1);
+   if (count)
+      sz_spv_append(m, SEC_FUNCTIONS, operands, count);
+
+   if (first_operand)
+      *first_operand = start + 3;
+
+   return id;
+}
+
+void
+sz_spv_patch_function_word(struct sz_spv_module *m, size_t offset,
+                           uint32_t word)
+{
+   if (offset < m->section[SEC_FUNCTIONS].used)
+      m->section[SEC_FUNCTIONS].words[offset] = word;
 }

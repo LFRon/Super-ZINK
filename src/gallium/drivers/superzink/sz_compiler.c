@@ -112,10 +112,36 @@ sz_compiler_dump_spirv(const uint32_t *words, size_t word_count,
 void
 sz_lower_nir(struct nir_shader *nir)
 {
+   /* GLSL lets a shader call functions, and NIR keeps them: ANGLE's translated
+    * shaders (which is what a browser hands us) are full of helpers, and Skia
+    * puts a call to its own entry wrapper around the whole body. Translating a
+    * call properly means a second function emitter -- parameters, per-function
+    * bodies, OpFunctionCall -- for no gain, because a call site is exactly as
+    * inlinable here as it is in the GLSL compiler that produced it. Inline them
+    * instead, following the sequence nir_functions.c documents.
+    *
+    * Cost is code size at the call site, which matters only for a shader that
+    * calls the same helper many times in a loop body; the SPIR-V consumer
+    * optimises afterwards either way. */
+   unsigned num_impls = 0;
+   nir_foreach_function_impl (impl, nir) {
+      (void)impl;
+      if (++num_impls > 1)
+         break;
+   }
+   if (num_impls > 1) {
+      nir_lower_variable_initializers(nir, nir_var_function_temp);
+      nir_lower_returns(nir);
+      nir_inline_functions(nir);
+      nir_opt_deref(nir);
+      nir_remove_non_entrypoints(nir);
+   }
+
    /* Locals become SSA. This is a lowering, not an optimisation: SPIR-V variables
     * in Function storage have to be declared in the entry block, and an SSA
     * emitter has no reason to track them. Doing it here keeps the translator free
-    * of a whole class of deref. */
+    * of a whole class of deref. Running it after inlining is what turns the
+    * callee's locals -- now the caller's locals -- into SSA as well. */
    nir_lower_vars_to_ssa(nir);
 
    /* GL clip space has z in [-1, 1] and Vulkan's viewport expects [0, 1]. The Y

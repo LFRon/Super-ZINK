@@ -27,7 +27,13 @@
 
 /* Number of constant buffer slots a stage can bind, which is also how many
  * uniform buffer bindings that stage owns in the descriptor set layout. */
-#define SZ_MAX_CONST_BUFFERS 16
+#define SZ_MAX_CONST_BUFFERS 8
+
+/* Combined image samplers per stage, i.e. GL's texture image units after the
+ * driver had its say. The binding budget below is what fixes this number: a
+ * conformant device may push as few as 32 descriptors, and every slot of every
+ * stage has to fit in that. */
+#define SZ_MAX_SAMPLERS 8
 
 /* Size of the array the translator declares inside a uniform block, in 32-bit
  * words. The block has no declared member types -- the load applies one -- so
@@ -46,13 +52,19 @@
  *
  * The layout may not declare more than maxPushDescriptors bindings in total
  * (VUID 00281), and the spec's minimum for that limit is 32 -- a limit a
- * conformant device is allowed to report. Two stages times SZ_MAX_CONST_BUFFERS
- * is exactly 32, so only the two stages that can actually be compiled fit:
- * vertex and fragment. A stage registered beyond these gets a binding number
- * outside the layout, which is why sz_descriptor_push() asserts on it. */
+ * conformant device is allowed to report. Each stage owns SZ_DESCRIPTOR_SLOTS
+ * of them (constant buffers first, then samplers), and two stages fill the 32
+ * exactly, which is also why only vertex and fragment are compiled: a stage
+ * registered beyond these gets a binding number outside the layout, which is
+ * why sz_descriptor_push() asserts on it.
+ *
+ * Wanting more of either is a signal to move to VK_EXT_descriptor_buffer,
+ * where descriptors live in a plain buffer and the count is bounded by memory
+ * rather than by a per-device limit. */
 #define SZ_DESCRIPTOR_SET 0
 #define SZ_DESCRIPTOR_STAGES 2
-#define SZ_DESCRIPTOR_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_CONST_BUFFERS)
+#define SZ_DESCRIPTOR_SLOTS (SZ_MAX_CONST_BUFFERS + SZ_MAX_SAMPLERS)
+#define SZ_DESCRIPTOR_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_DESCRIPTOR_SLOTS)
 
 /* VK_KHR_push_descriptor's own floor for maxPushDescriptors. A device that
  * reports less is out of spec, but the decode is cheap and the alternative is
@@ -66,16 +78,25 @@ sz_descriptor_stage_base(mesa_shader_stage stage)
    case MESA_SHADER_VERTEX:
       return 0;
    case MESA_SHADER_FRAGMENT:
-      return SZ_MAX_CONST_BUFFERS;
+      return SZ_DESCRIPTOR_SLOTS;
    default:
       return SZ_DESCRIPTOR_BINDINGS;
    }
 }
 
+/* Binding of gallium constant buffer `slot` for `stage`. */
 static inline unsigned
 sz_descriptor_binding(mesa_shader_stage stage, unsigned slot)
 {
    return sz_descriptor_stage_base(stage) + slot;
+}
+
+/* Binding of texture unit `slot` for `stage`: the samplers of a stage follow its
+ * constant buffers in one contiguous run. */
+static inline unsigned
+sz_sampler_binding(mesa_shader_stage stage, unsigned slot)
+{
+   return sz_descriptor_stage_base(stage) + SZ_MAX_CONST_BUFFERS + slot;
 }
 
 /* The options for one shader stage. The returned pointer stays valid for the

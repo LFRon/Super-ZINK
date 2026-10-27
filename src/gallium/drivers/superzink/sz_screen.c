@@ -566,6 +566,18 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * ones that match the colour width, so glXChooseVisual finds nothing. */
       caps->mixed_color_depth_bits = true;
 
+      /* Separate RGB/alpha blend equations are ordinary Vulkan state: every
+       * attachment carries srcColorBlendFactor/colorBlendOp next to the alpha
+       * pair, which is exactly what Gallium's blend state asks for. st/mesa
+       * gates GL 2.0 on this cap, so leaving it unset caps the reported version
+       * at 1.5 and every consumer that needs shaders refuses to start. */
+      caps->blend_equation_separate = true;
+      /* Same story for per-target blend: the pipeline key keeps the whole blend
+       * state and each attachment gets its own VkPipelineColorBlendAttachmentState,
+       * whether or not independent blending is enabled. */
+      caps->indep_blend_enable = true;
+      caps->indep_blend_func = true;
+
       /* The primitives Vulkan can rasterise, which is fewer than GL can emit.
        * A mode left out of this mask is converted by the primitive converter
        * reaches the driver, which is the only correct answer for QUADS,
@@ -624,8 +636,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * block, so no shader can ask for a block the block type cannot hold. */
       sc->max_const_buffer0_size = SZ_MAX_CONSTBUF_WORDS * 4;
       sc->max_const_buffers = SZ_MAX_CONST_BUFFERS;
-      sc->max_texture_samplers = 16;
-      sc->max_sampler_views = 16;
+      /* Must match the number of sampler bindings the descriptor layout
+       * reserves per stage, or the frontend will hand over a unit the layout
+       * cannot describe. */
+      sc->max_texture_samplers = SZ_MAX_SAMPLERS;
+      sc->max_sampler_views = SZ_MAX_SAMPLERS;
       sc->max_shader_buffers = 8;
       sc->max_shader_images = 8;
       sc->supported_irs = 1u << PIPE_SHADER_IR_NIR;

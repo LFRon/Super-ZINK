@@ -58,6 +58,10 @@ struct sz_gfx_pipeline {
    } key;
 };
 
+/* Gallium's PIPE_FUNC_* to VkCompareOp. Depth state and sampler state both need
+ * it, and the two orderings are not the same enum, so it lives in one place. */
+VkCompareOp sz_compare_op(unsigned func);
+
 /* Frees the retired pipelines whose submission has completed. Called before a
  * pipeline is replaced and on context teardown. */
 void sz_pipeline_reclaim(struct sz_context *ctx);

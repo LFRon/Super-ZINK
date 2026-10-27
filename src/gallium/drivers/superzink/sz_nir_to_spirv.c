@@ -71,6 +71,13 @@ struct sz_translate {
    /* Indexed by nir_def::index. */
    struct sz_dtype *def_types;
    uint32_t *defs_id;
+   /* Constants are untyped in NIR and typed in SPIR-V, so a def that reaches a
+    * phi as a different base type needs its own typed constant; remembering the
+    * instruction here is what makes that possible. */
+   nir_load_const_instr **consts;
+
+   /* Set once OpCapability DerivativeControl has been emitted. */
+   bool derivative_control;
 
    struct {
       const nir_variable *var;
@@ -91,11 +98,60 @@ struct sz_translate {
    } ubos[SZ_MAX_UBOS];
    unsigned num_ubos;
 
+   /* Samplers are declared on first use for the same reason uniform blocks are:    * nir_lower_samplers() has already replaced every sampler deref with a plain
+    * sampler_index, so the NIR no longer carries a type to declare from -- but
+    * that index is exactly the texture unit whose binding the layout holds. */
+   struct {
+      unsigned index;
+      SpvDim dim;
+      bool arrayed;
+      bool depth;
+      /* OpTypeImage, kept so OpImageFetch and the query ops can name it. */
+      uint32_t image_type;
+      /* The value OpLoad produced from the variable, which is what the sampling
+       * ops take as their image operand. */
+      uint32_t value;
+   } samplers[SZ_MAX_SAMPLERS];
+   unsigned num_samplers;
+
    uint32_t *interfaces;
    unsigned num_interfaces;
+
+   /* Control flow. NIR is already structured, so the emitter walks its if/loop
+    * tree directly; these are the pieces of state that walking needs. Block
+    * labels are assigned up front because a phi and a branch both name blocks
+    * that have not been emitted yet -- the back edge of a loop always does. */
+   uint32_t *labels;
+   bool block_open;
+   uint32_t loop_continue;
+   uint32_t loop_break;
+   /* Only needed to recognise the back edge: a continue issued by the continue
+    * target block itself means "back to the top". */
+   uint32_t loop_header;
+   /* A loop without a continue construct still gets a continue target block of
+    * its own, so the phis in the loop header are told the back edge arrives from
+    * that block rather than from the NIR predecessor it was derived from. */
+   nir_block *back_edge_pred;
+   uint32_t back_edge_label;
+   /* Emitted after the last block of the function, for a construct at the end of
+    * the body that has no following block to merge into. */
+   uint32_t end_label;
+
+   /* Phi operands that name a value defined later, resolved once the whole
+    * function has been translated. */
+   struct {
+      size_t offset;
+      unsigned def;
+   } *phi_fixups;
+   unsigned num_phi_fixups;
+   unsigned phi_fixups_capacity;
 };
 
 static bool sz_emit_instr(struct sz_translate *t, nir_instr *instr);
+static bool sz_emit_phi(struct sz_translate *t, nir_phi_instr *phi);
+static void sz_emit_cf_list_from(struct sz_translate *t, struct exec_list *list,
+                                 nir_cf_node *after, uint32_t fallthrough,
+                                 nir_loop *loop);
 
 /* ------------------------------------------------------------------------- */
 /* Diagnostics                                                               */
@@ -289,6 +345,13 @@ sz_infer_def_base(nir_def *def, unsigned depth, enum sz_base *out)
             *out = base;
             return true;
          }
+      } else if (parent->type == nir_instr_type_phi) {
+         /* The initial value of a loop induction variable is a bare integer
+          * constant, which carries no type of its own; the phi it feeds has one,
+          * through the instruction that updates the variable. Following the phi
+          * is what keeps an integer 0 from being emitted as a float 0.0. */
+         if (sz_infer_def_base(&nir_instr_as_phi(parent)->def, depth + 1, out))
+            return true;
       }
    }
 
@@ -301,7 +364,8 @@ sz_infer_def_base(nir_def *def, unsigned depth, enum sz_base *out)
  * float, and that is also what the frontend produces for the cases this driver
  * can reach, so it is the fallback. */
 static void
-sz_guess_def_type(struct sz_translate *t, nir_def *def, struct sz_dtype *out)
+sz_guess_def_type(struct sz_translate *t, const nir_def *def,
+                  struct sz_dtype *out)
 {
    out->base = SZ_BASE_FLOAT;
    out->bits = def->bit_size;
@@ -313,7 +377,7 @@ sz_guess_def_type(struct sz_translate *t, nir_def *def, struct sz_dtype *out)
    }
 
    enum sz_base base;
-   if (sz_infer_def_base(def, 0, &base))
+   if (sz_infer_def_base((nir_def *)def, 0, &base))
       out->base = base;
 }
 
@@ -420,8 +484,21 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
        * pass bailed out, and pointing at it beats translating it wrong. */
       sz_fail(t, "local variable `%s` survived vars-to-SSA", var->name);
       return false;
+   case nir_var_uniform: {
+      /* A sampler uniform survives the lowering as a declaration with no
+       * remaining user: the tex instructions name their unit directly. Its
+       * type is what the translator cannot express here -- a sampler has no
+       * SPIR-V representation outside a descriptor -- so it is skipped rather
+       * than declared, and sz_sampler_get() declares the descriptor when a tex
+       * instruction first names the unit. */
+      if (glsl_type_is_sampler(glsl_without_array(var->type)))
+         return true;
+      sz_fail(t, "uniform `%s` survived nir_lower_uniforms_to_ubo", var->name);
+      return false;
+   }
    default:
-      /* Uniforms, UBOs and samplers need descriptors, which is Phase 2. */
+      /* Images and atomic counters need descriptors that are not in the layout
+       * yet. */
       sz_fail(t, "variable `%s` in mode 0x%x is not supported yet", var->name,
               (unsigned)var->data.mode);
       return false;
@@ -595,6 +672,7 @@ static const struct sz_glsl_map sz_glsl_maps[] = {
    { nir_op_flrp, GLSLstd450FMix },
    { nir_op_fexp2, GLSLstd450Exp2 },
    { nir_op_flog2, GLSLstd450Log2 },
+   { nir_op_fpow, GLSLstd450Pow },
    { nir_op_fsin, GLSLstd450Sin },
    { nir_op_fcos, GLSLstd450Cos },
    { nir_op_ftanh, GLSLstd450Tanh },
@@ -697,6 +775,22 @@ sz_emit_b2x(struct sz_translate *t, const struct sz_dtype *dst,
    return sz_spv_alu(t->m, SpvOpSelect, sz_dtype_type(t, dst), ops, 3);
 }
 
+/* Splats a float constant over the destination type. Most ALU sources are
+ * scalars here, but fsat/clamp and friends take the same operand list whether
+ * the value is a float or a vec4, so the constant has to match. */
+static uint32_t
+sz_splat_float32(struct sz_translate *t, const struct sz_dtype *dst,
+                 float value)
+{
+   const uint32_t scalar = sz_spv_const_float32(t->m, value);
+   if (dst->ncomp == 1)
+      return scalar;
+
+   uint32_t comps[4] = { scalar, scalar, scalar, scalar };
+   return sz_spv_composite_construct(t->m, sz_dtype_type(t, dst), comps,
+                                     dst->ncomp);
+}
+
 static void
 sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
 {
@@ -794,11 +888,25 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       }
    }
 
+   if (op == nir_op_frcp) {
+      /* GLSL.std.450 has no reciprocal, so it is spelled 1/x. x == 0 gives the
+       * correctly-signed infinity from OpFDiv, which is what GL promises. */
+      const uint32_t src = sz_alu_source(t, &alu->src[0], dst.ncomp);
+      const uint32_t one = sz_splat_float32(t, &dst, 1.0f);
+      const uint32_t ops[] = { one, src };
+      t->defs_id[alu->def.index] =
+         sz_spv_alu(t->m, SpvOpFDiv, sz_dtype_type(t, &dst), ops, 2);
+      t->def_types[alu->def.index] = dst;
+      return;
+   }
+
    if (op == nir_op_fsat) {
       const uint32_t src = sz_alu_source(t, &alu->src[0], dst.ncomp);
-      const uint32_t zero = sz_spv_const_float32(t->m, 0.0f);
-      const uint32_t one = sz_spv_const_float32(t->m, 1.0f);
-      const uint32_t ops[] = { src, zero, one };
+      const uint32_t ops[] = {
+         src,
+         sz_splat_float32(t, &dst, 0.0f),
+         sz_splat_float32(t, &dst, 1.0f),
+      };
       t->defs_id[alu->def.index] = sz_emit_ext(t, GLSLstd450FClamp, &dst, ops, 3);
       t->def_types[alu->def.index] = dst;
       return;
@@ -881,6 +989,7 @@ sz_emit_load_const(struct sz_translate *t, nir_load_const_instr *lconst)
                         sz_spv_const_composite(t->m, sz_dtype_type(t, &type),
                                                comps, type.ncomp);
    t->def_types[lconst->def.index] = type;
+   t->consts[lconst->def.index] = lconst;
 }
 
 /* Declares (once) the uniform block for a gallium constant buffer slot and
@@ -1165,17 +1274,18 @@ sz_emit_store_deref(struct sz_translate *t, nir_intrinsic_instr *intrin)
 }
 
 static void
-sz_emit_jump(struct sz_translate *t, nir_jump_instr *jump, nir_block *block,
-             const uint32_t *labels)
+sz_emit_jump(struct sz_translate *t, nir_jump_instr *jump, nir_block *block)
 {
    switch (jump->type) {
    case nir_jump_return:
       sz_spv_return(t->m);
+      t->block_open = false;
       return;
 
    case nir_jump_goto: {
-      const uint32_t target = labels[jump->target->index];
-      sz_spv_raw_function_op(t->m, SpvOpBranch, &target, 1);
+      const uint32_t target = t->labels[jump->target->index];
+      sz_spv_branch(t->m, target);
+      t->block_open = false;
       return;
    }
 
@@ -1183,10 +1293,11 @@ sz_emit_jump(struct sz_translate *t, nir_jump_instr *jump, nir_block *block,
       const uint32_t cond = t->defs_id[jump->condition.ssa->index];
       const uint32_t ops[] = {
          cond,
-         labels[jump->target->index],
-         labels[jump->else_target ? jump->else_target->index : block->index],
+         t->labels[jump->target->index],
+         t->labels[jump->else_target ? jump->else_target->index : block->index],
       };
-      sz_spv_raw_function_op(t->m, SpvOpBranchConditional, ops, 3);
+      sz_spv_branch_conditional(t->m, ops[0], ops[1], ops[2]);
+      t->block_open = false;
       return;
    }
 
@@ -1195,23 +1306,503 @@ sz_emit_jump(struct sz_translate *t, nir_jump_instr *jump, nir_block *block,
       /* Both terminate the invocation; the driver has no discards yet, so the
        * closest legal SPIR-V is a return. */
       sz_spv_return(t->m);
+      t->block_open = false;
       return;
 
    case nir_jump_break:
-   case nir_jump_continue:
-      /* nir_foreach_block_unstructured flattens loops, so a break is a branch to
-       * a flattened block that the structured iteration would have hidden. */
-      sz_fail(t, "jump type %d is not handled yet", (int)jump->type);
+      if (!t->loop_break) {
+         sz_fail(t, "break outside of a loop");
+         return;
+      }
+      sz_spv_branch(t->m, t->loop_break);
+      t->block_open = false;
       return;
+
+   case nir_jump_continue: {
+      if (!t->loop_continue) {
+         sz_fail(t, "continue outside of a loop");
+         return;
+      }
+      const uint32_t target = t->loop_continue == t->labels[block->index]
+                                 ? t->loop_header
+                                 : t->loop_continue;
+      sz_spv_branch(t->m, target);
+      t->block_open = false;
+      return;
+   }
    }
 
    sz_fail(t, "unknown jump type %d", (int)jump->type);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Texture sampling                                                         */
+/* ------------------------------------------------------------------------- */
+
+/* Vulkan's image dimensionality, from the NIR sampler dimension. RECT and
+ * EXTERNAL both map onto 2D: Vulkan has no separate rectangle sampler, and a
+ * texture that is addressed with normalised coordinates anyway is exactly what
+ * a 2D image is. */
+static bool
+sz_sampler_dim(struct sz_translate *t, enum glsl_sampler_dim dim, SpvDim *out)
+{
+   switch (dim) {
+   case GLSL_SAMPLER_DIM_1D:
+      *out = SpvDim1D;
+      return true;
+   case GLSL_SAMPLER_DIM_2D:
+   case GLSL_SAMPLER_DIM_RECT:
+   case GLSL_SAMPLER_DIM_EXTERNAL:
+      *out = SpvDim2D;
+      return true;
+   case GLSL_SAMPLER_DIM_3D:
+      *out = SpvDim3D;
+      return true;
+   case GLSL_SAMPLER_DIM_CUBE:
+      *out = SpvDimCube;
+      return true;
+   case GLSL_SAMPLER_DIM_MS:
+      *out = SpvDim2D;
+      return true;
+   case GLSL_SAMPLER_DIM_BUF:
+      *out = SpvDimBuffer;
+      return true;
+   default:
+      sz_fail(t, "sampler dimension %d is not supported", (int)dim);
+      return false;
+   }
+}
+
+/* The value a def was translated into, or zero if it was never translated. */
+static uint32_t
+sz_def_value(struct sz_translate *t, const nir_def *def)
+{
+   if (def == NULL) {
+      sz_fail(t, "texture instruction is missing a source");
+      return 0;
+   }
+
+   const uint32_t id = t->defs_id[def->index];
+   if (id == 0)
+      sz_fail(t, "texture source was never translated");
+
+   return id;
+}
+
+/* The sampled image value for `tex`'s texture unit, declaring the descriptor
+ * variable the first time the unit appears in the shader. */
+static uint32_t
+sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
+{
+   const unsigned index = tex->sampler_index;
+   const bool arrayed = tex->is_array;
+   const bool depth = tex->is_shadow;
+
+   for (unsigned i = 0; i < t->num_samplers; i++) {
+      if (t->samplers[i].index != index)
+         continue;
+
+      /* The same unit used with two different types cannot be described by one
+       * binding: a VkDescriptorSetLayoutBinding has a single descriptor type and
+       * a SPIR-V variable a single pointee type. GL allows the aliasing, so say
+       * so instead of sampling through the wrong declaration. */
+      if (t->samplers[i].dim != dim || t->samplers[i].arrayed != arrayed ||
+          t->samplers[i].depth != depth) {
+         sz_fail(t, "texture unit %u is sampled as two different texture types "
+                 "in one shader", index);
+         return 0;
+      }
+
+      return t->samplers[i].value;
+   }
+
+   if (index >= SZ_MAX_SAMPLERS) {
+      sz_fail(t, "texture unit %u is past the %d the descriptor layout holds",
+              index, SZ_MAX_SAMPLERS);
+      return 0;
+   }
+
+   /* The texel component type: GLSL samplers are float, integer and unsigned
+    * integer textures, and SPIR-V needs the matching scalar type because it is
+    * what decides how the sampled values are converted. */
+   enum sz_base base;
+   if (!sz_base_from_alu_type(tex->dest_type, &base)) {
+      sz_fail(t, "unsupported texture result type %d", (int)tex->dest_type);
+      return 0;
+   }
+
+   const uint32_t sampled_type = sz_scalar_type(t, base, 32);
+   const uint32_t image_type = sz_spv_type_image(
+      t->m, sampled_type, dim, depth, arrayed, false, true);
+   const uint32_t sampled_image_type = sz_spv_type_sampled_image(t->m, image_type);
+   const uint32_t ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassUniformConstant, sampled_image_type);
+   const uint32_t var =
+      sz_spv_variable(t->m, ptr_type, SpvStorageClassUniformConstant);
+
+   sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet, SZ_DESCRIPTOR_SET);
+   sz_spv_decorate(t->m, var, SpvDecorationBinding,
+                   sz_sampler_binding(t->nir->info.stage, index));
+
+   /* A combined image sampler is read as a whole, so one OpLoad yields both
+    * halves; the load is emitted once and its result reused by every instruction
+    * that samples this unit. */
+   const uint32_t value = sz_spv_load(t->m, sampled_image_type, var);
+
+   t->samplers[t->num_samplers].index = index;
+   t->samplers[t->num_samplers].dim = dim;
+   t->samplers[t->num_samplers].arrayed = arrayed;
+   t->samplers[t->num_samplers].depth = depth;
+   t->samplers[t->num_samplers].image_type = image_type;
+   t->samplers[t->num_samplers].value = value;
+   t->num_samplers++;
+
+   t->interfaces[t->num_interfaces++] = var;
+
+   return value;
+}
+
+/* SPIR-V has no projective sampling instruction, so the divide that GL's
+ * texture2DProj implies happens here. The layer component of an arrayed
+ * coordinate is not part of the projection. */
+static uint32_t
+sz_emit_projector(struct sz_translate *t, uint32_t coord, unsigned ncomp,
+                  bool arrayed, uint32_t projector)
+{
+   const unsigned projected = arrayed ? ncomp - 1 : ncomp;
+   const uint32_t float_type = sz_spv_type_float32(t->m);
+   const uint32_t vec_type = sz_spv_type_vec(t->m, float_type, ncomp);
+
+   uint32_t comps[4];
+   for (unsigned i = 0; i < ncomp; i++) {
+      uint32_t comp;
+      if (ncomp > 1) {
+         const uint32_t index[] = { i };
+         comp = sz_spv_composite_extract(t->m, float_type, coord, index, 1);
+      } else {
+         comp = coord;
+      }
+
+      if (i < projected) {
+         const uint32_t ops[] = { comp, projector };
+         comp = sz_spv_alu(t->m, SpvOpFDiv, float_type, ops, 2);
+      }
+
+      comps[i] = comp;
+   }
+
+   if (ncomp == 1)
+      return comps[0];
+
+   return sz_spv_composite_construct(t->m, vec_type, comps, ncomp);
+}
+
+static void
+sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
+{
+   if (tex->is_sparse) {
+      sz_fail(t, "sparse texture reads are not supported");
+      return;
+   }
+
+   const nir_def *coord = NULL, *bias = NULL, *lod = NULL, *dref = NULL;
+   const nir_def *ddx = NULL, *ddy = NULL, *projector = NULL;
+
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      const nir_tex_src *src = &tex->src[i];
+      switch (src->src_type) {
+      case nir_tex_src_coord:
+         coord = src->src.ssa;
+         break;
+      case nir_tex_src_bias:
+         bias = src->src.ssa;
+         break;
+      case nir_tex_src_lod:
+         lod = src->src.ssa;
+         break;
+      case nir_tex_src_comparator:
+         dref = src->src.ssa;
+         break;
+      case nir_tex_src_ddx:
+         ddx = src->src.ssa;
+         break;
+      case nir_tex_src_ddy:
+         ddy = src->src.ssa;
+         break;
+      case nir_tex_src_projector:
+         projector = src->src.ssa;
+         break;
+      default:
+         /* Sampler arrays arrive as an offset added to sampler_index, which the
+          * descriptor layout cannot express: a dynamic index would need
+          * VK_EXT_descriptor_indexing. GLSL 1.20 has no sampler arrays, so this
+          * is a shader this driver should not have accepted. */
+         sz_fail(t, "texture source type %d is not supported yet",
+                 (int)src->src_type);
+         return;
+      }
+   }
+
+   if (coord == NULL) {
+      sz_fail(t, "texture instruction has no coordinate");
+      return;
+   }
+
+   SpvDim dim;
+   if (!sz_sampler_dim(t, tex->sampler_dim, &dim))
+      return;
+
+   const unsigned ncomp = nir_tex_instr_dest_size(tex);
+   struct sz_dtype result_type = {
+      .bits = 32,
+      .ncomp = ncomp,
+   };
+   if (!sz_base_from_alu_type(tex->dest_type, &result_type.base)) {
+      sz_fail(t, "unsupported texture result type %d", (int)tex->dest_type);
+      return;
+   }
+   const uint32_t type = sz_dtype_type(t, &result_type);
+
+   /* Query operations read the image and not the sampler, but the descriptor is
+    * a combined one, so it has to be declared either way. The depth flag is
+    * cleared for them: a shadow sample is the only thing that sets Depth. */
+   const bool needs_sampler =
+      tex->op != nir_texop_txs && tex->op != nir_texop_query_levels &&
+      tex->op != nir_texop_texture_samples;
+   const uint32_t sampled_image =
+      sz_sampler_get(t, tex, dim);
+   if (sampled_image == 0)
+      return;
+
+   unsigned slot = 0;
+   for (; slot < t->num_samplers; slot++)
+      if (t->samplers[slot].index == tex->sampler_index)
+         break;
+   const uint32_t image_type = t->samplers[slot].image_type;
+
+   uint32_t coord_value = sz_def_value(t, coord);
+   if (coord_value == 0)
+      return;
+
+   if (projector != NULL) {
+      const uint32_t projector_value = sz_def_value(t, projector);
+      if (projector_value == 0)
+         return;
+      coord_value = sz_emit_projector(t, coord_value, tex->coord_components,
+                                      tex->is_array, projector_value);
+   }
+
+   /* Extra operands after the coordinate: for the sampled ops these are the
+    * ImageOperands mask followed by one value per bit, in bit order. */
+   uint32_t image_operands[3];
+   unsigned extra = 0;
+
+   SpvOp opcode;
+   switch (tex->op) {
+   case nir_texop_tex:
+   case nir_texop_txb:
+      /* A bias is part of implicit-LOD sampling: GL's texture2D's optional bias
+       * argument and texture2DProj's, plus implicit-LOD texture2D in a fragment
+       * shader that asked for it. */
+      opcode = tex->is_shadow ? SpvOpImageSampleDrefImplicitLod
+                              : SpvOpImageSampleImplicitLod;
+      if (bias != NULL) {
+         const uint32_t value = sz_def_value(t, bias);
+         if (value == 0)
+            return;
+         image_operands[extra++] = SpvImageOperandsBiasMask;
+         image_operands[extra++] = value;
+      }
+      break;
+   case nir_texop_txl:
+      opcode = tex->is_shadow ? SpvOpImageSampleDrefExplicitLod
+                              : SpvOpImageSampleExplicitLod;
+      if (lod == NULL) {
+         sz_fail(t, "explicit-LOD sample has no LOD");
+         return;
+      }
+      image_operands[extra++] = SpvImageOperandsLodMask;
+      image_operands[extra++] = sz_def_value(t, lod);
+      break;
+   case nir_texop_txd:
+      opcode = tex->is_shadow ? SpvOpImageSampleDrefExplicitLod
+                              : SpvOpImageSampleExplicitLod;
+      if (ddx == NULL || ddy == NULL) {
+         sz_fail(t, "gradient sample has no gradients");
+         return;
+      }
+      image_operands[extra++] = SpvImageOperandsGradMask;
+      image_operands[extra++] = sz_def_value(t, ddx);
+      image_operands[extra++] = sz_def_value(t, ddy);
+      break;
+   case nir_texop_txf:
+   case nir_texop_txf_ms: {
+      /* Fetch takes a bare image rather than a sampled one: the sampler state is
+       * not consulted at all, so the combined sampler is unwrapped. */
+      const uint32_t image = sz_spv_alu(t->m, SpvOpImage, image_type,
+                                        &sampled_image, 1);
+      uint32_t ops[4];
+      unsigned n = 0;
+      ops[n++] = image;
+      ops[n++] = coord_value;
+      if (tex->is_array) {
+         /* The array index of a fetch is an integer operand, not part of the
+          * coordinate vector. */
+         sz_fail(t, "arrayed texel fetches are not supported yet");
+         return;
+      }
+      const uint32_t value =
+         sz_spv_alu(t->m, SpvOpImageFetch, type, ops, n);
+      t->defs_id[tex->def.index] = value;
+      t->def_types[tex->def.index] = result_type;
+      return;
+   }
+   case nir_texop_txs: {
+      const uint32_t image = needs_sampler
+         ? sz_spv_alu(t->m, SpvOpImage, image_type, &sampled_image, 1)
+         : sampled_image;
+      const uint32_t zero = sz_spv_const_int32(t->m, 0);
+      const uint32_t ops[] = { image, zero };
+      const uint32_t value =
+         sz_spv_alu(t->m, dim == SpvDimBuffer ? SpvOpImageQuerySize
+                                              : SpvOpImageQuerySizeLod,
+                    type, ops, dim == SpvDimBuffer ? 1 : 2);
+      t->defs_id[tex->def.index] = value;
+      t->def_types[tex->def.index] = result_type;
+      return;
+   }
+   case nir_texop_query_levels: {
+      const uint32_t image = sz_spv_alu(t->m, SpvOpImage, image_type,
+                                        &sampled_image, 1);
+      const uint32_t value =
+         sz_spv_alu(t->m, SpvOpImageQueryLevels, type, &image, 1);
+      t->defs_id[tex->def.index] = value;
+      t->def_types[tex->def.index] = result_type;
+      return;
+   }
+   case nir_texop_texture_samples: {
+      const uint32_t image = sz_spv_alu(t->m, SpvOpImage, image_type,
+                                        &sampled_image, 1);
+      const uint32_t value =
+         sz_spv_alu(t->m, SpvOpImageQuerySamples, type, &image, 1);
+      t->defs_id[tex->def.index] = value;
+      t->def_types[tex->def.index] = result_type;
+      return;
+   }
+   case nir_texop_tg4: {
+      const uint32_t image = sz_spv_alu(t->m, SpvOpImage, image_type,
+                                        &sampled_image, 1);
+      const uint32_t component = sz_spv_const_int32(t->m, tex->component);
+      uint32_t ops[3];
+      unsigned n = 0;
+      ops[n++] = image;
+      ops[n++] = coord_value;
+      ops[n++] = component;
+      const uint32_t value = sz_spv_alu(
+         t->m, tex->is_shadow ? SpvOpImageDrefGather : SpvOpImageGather, type,
+         ops, n);
+      t->defs_id[tex->def.index] = value;
+      t->def_types[tex->def.index] = result_type;
+      return;
+   }
+   case nir_texop_lod: {
+      const uint32_t ops[] = { sampled_image, coord_value };
+      const uint32_t value =
+         sz_spv_alu(t->m, SpvOpImageQueryLod,
+                    sz_spv_type_vec(t->m, sz_spv_type_float32(t->m), 2), ops, 2);
+      t->defs_id[tex->def.index] = value;
+      t->def_types[tex->def.index] = result_type;
+      return;
+   }
+   default:
+      sz_fail(t, "texture opcode %d is not supported yet", (int)tex->op);
+      return;
+   }
+
+   uint32_t ops[5];
+   unsigned n = 0;
+   ops[n++] = sampled_image;
+   ops[n++] = coord_value;
+   if (tex->is_shadow) {
+      if (dref == NULL) {
+         sz_fail(t, "shadow sample has no comparator");
+         return;
+      }
+      ops[n++] = sz_def_value(t, dref);
+   }
+   for (unsigned i = 0; i < extra; i++)
+      ops[n++] = image_operands[i];
+
+   const uint32_t value = sz_spv_alu(t->m, opcode, type, ops, n);
+   t->defs_id[tex->def.index] = value;
+   t->def_types[tex->def.index] = result_type;
+}
+
+/* Screen-space derivatives. They are intrinsics rather than ALU ops in this
+ * Mesa, and the fine/coarse forms need the DerivativeControl capability. */
+static void
+sz_emit_derivative(struct sz_translate *t, nir_intrinsic_instr *intrin)
+{
+   SpvOp op;
+   bool needs_capability = false;
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_ddx:
+      op = SpvOpDPdx;
+      break;
+   case nir_intrinsic_ddy:
+      op = SpvOpDPdy;
+      break;
+   case nir_intrinsic_ddx_fine:
+      op = SpvOpDPdxFine;
+      needs_capability = true;
+      break;
+   case nir_intrinsic_ddy_fine:
+      op = SpvOpDPdyFine;
+      needs_capability = true;
+      break;
+   case nir_intrinsic_ddx_coarse:
+      op = SpvOpDPdxCoarse;
+      needs_capability = true;
+      break;
+   case nir_intrinsic_ddy_coarse:
+      op = SpvOpDPdyCoarse;
+      needs_capability = true;
+      break;
+   default:
+      UNREACHABLE("not a derivative intrinsic");
+   }
+
+   /* Emitted once: a module may contain any number of derivatives, and a
+    * repeated OpCapability is at best redundant. */
+   if (needs_capability && !t->derivative_control) {
+      sz_spv_capability(t->m, SpvCapabilityDerivativeControl);
+      t->derivative_control = true;
+   }
+
+   const struct sz_dtype dst = {
+      .base = SZ_BASE_FLOAT,
+      .bits = intrin->def.bit_size,
+      .ncomp = intrin->def.num_components,
+   };
+   const uint32_t src = sz_def_value(t, intrin->src[0].ssa);
+   t->defs_id[intrin->def.index] =
+      sz_spv_alu(t->m, op, sz_dtype_type(t, &dst), &src, 1);
+   t->def_types[intrin->def.index] = dst;
 }
 
 static bool
 sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
 {
    switch (intrin->intrinsic) {
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddx_fine:
+   case nir_intrinsic_ddy_fine:
+   case nir_intrinsic_ddx_coarse:
+   case nir_intrinsic_ddy_coarse:
+      sz_emit_derivative(t, intrin);
+      return true;
    case nir_intrinsic_load_ubo:
       sz_emit_load_ubo(t, intrin, false);
       return true;
@@ -1256,6 +1847,9 @@ sz_emit_instr(struct sz_translate *t, nir_instr *instr)
    }
    case nir_instr_type_intrinsic:
       return sz_emit_intrinsic(t, nir_instr_as_intrinsic(instr));
+   case nir_instr_type_tex:
+      sz_emit_tex(t, nir_instr_as_tex(instr));
+      return !t->failed;
    case nir_instr_type_load_const:
       sz_emit_load_const(t, nir_instr_as_load_const(instr));
       return true;
@@ -1270,11 +1864,370 @@ sz_emit_instr(struct sz_translate *t, nir_instr *instr)
    case nir_instr_type_jump:
       /* Terminators are emitted with the block they end. */
       return true;
+   case nir_instr_type_phi:
+      return sz_emit_phi(t, nir_instr_as_phi(instr));
    default:
       sz_fail(t, "NIR instruction type %d is not supported yet",
               (int)instr->type);
       return false;
    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Phi                                                                       */
+/* ------------------------------------------------------------------------- */
+
+/* Records a phi operand whose value has not been translated yet. A loop header's
+ * phi always has one, because the value that arrives over the back edge is
+ * defined inside the body, which is emitted after the header. */
+static bool
+sz_phi_fixup_add(struct sz_translate *t, size_t offset, unsigned def)
+{
+   if (t->num_phi_fixups == t->phi_fixups_capacity) {
+      const unsigned capacity = MAX2(t->phi_fixups_capacity * 2, 16);
+      void *fixups = realloc(t->phi_fixups, capacity * sizeof(*t->phi_fixups));
+      if (!fixups) {
+         sz_fail(t, "out of memory tracking phi operands");
+         return false;
+      }
+      t->phi_fixups = fixups;
+      t->phi_fixups_capacity = capacity;
+   }
+
+   t->phi_fixups[t->num_phi_fixups].offset = offset;
+   t->phi_fixups[t->num_phi_fixups].def = def;
+   t->num_phi_fixups++;
+   return true;
+}
+
+/* NIR constants are untyped bit patterns, so one `load_const` can be the float
+ * 0.0 for one phi and the integer 0 for another -- which is exactly what an
+ * induction variable's initial value and an accumulator look like. SPIR-V
+ * constants are typed, so a use that disagrees with the type the def was emitted
+ * with gets a constant of its own from the same bits. A conversion instruction
+ * would not do here: the OpBitcast would have to sit in the predecessor block to
+ * dominate the phi, but the phi is emitted first. */
+static uint32_t
+sz_const_as(struct sz_translate *t, const nir_load_const_instr *lconst,
+            const struct sz_dtype *want)
+{
+   const uint32_t scalar = sz_scalar_type(t, want->base, want->bits);
+   uint32_t comps[4];
+   for (unsigned i = 0; i < want->ncomp; i++) {
+      const uint32_t bits = want->bits == 64 ? (uint32_t)lconst->value[i].u64
+                                             : lconst->value[i].u32;
+      comps[i] = sz_spv_const_bits(t->m, scalar, bits);
+   }
+
+   return want->ncomp == 1
+             ? comps[0]
+             : sz_spv_const_composite(t->m, sz_dtype_type(t, want), comps,
+                                      want->ncomp);
+}
+
+/* A phi becomes OpPhi verbatim: NIR is in SSA form and already names the
+ * predecessor block each operand arrives from, so there is nothing to lower. */
+static bool
+sz_emit_phi(struct sz_translate *t, nir_phi_instr *phi)
+{
+   struct sz_dtype type;
+   sz_guess_def_type(t, &phi->def, &type);
+   const uint32_t type_id = sz_dtype_type(t, &type);
+
+   unsigned entries = 0;
+   nir_foreach_phi_src (src, phi)
+      entries++;
+
+   uint32_t *operands = calloc(MAX2(entries, 1) * 2, sizeof(*operands));
+   if (!operands) {
+      sz_fail(t, "out of memory translating a phi");
+      return false;
+   }
+
+   unsigned unresolved = 0;
+   unsigned i = 0;
+   nir_foreach_phi_src (src, phi) {
+      /* An operand may legitimately be nir_ssa_undef, which has no id yet; it is
+       * resolved by the same fixup pass as a forward reference. */
+      uint32_t value = t->defs_id[src->src.ssa->index];
+      const nir_load_const_instr *lconst = t->consts[src->src.ssa->index];
+      if (value && lconst && t->def_types[src->src.ssa->index].base != type.base)
+         value = sz_const_as(t, lconst, &type);
+      operands[2 * i] = value;
+      operands[2 * i + 1] = src->pred == t->back_edge_pred
+                               ? t->back_edge_label
+                               : t->labels[src->pred->index];
+      if (!value)
+         unresolved++;
+      i++;
+   }
+
+   size_t offset = 0;
+   const uint32_t id =
+      sz_spv_phi(t->m, type_id, operands, entries * 2, &offset);
+   free(operands);
+
+   t->defs_id[phi->def.index] = id;
+   t->def_types[phi->def.index] = type;
+
+   if (unresolved) {
+      unsigned entry = 0;
+      nir_foreach_phi_src (src, phi) {
+         if (!t->defs_id[src->src.ssa->index]) {
+            if (!sz_phi_fixup_add(t, offset + 2 * entry, src->src.ssa->index))
+               return false;
+         }
+         entry++;
+      }
+   }
+
+   return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Control flow                                                             */
+/* ------------------------------------------------------------------------- */
+
+/* NIR keeps its if/loop structure, so the emitter mirrors it directly: no
+ * relooper, no block reordering. The one thing that needs care is that SPIR-V
+ * wants each block to end in an instruction that says where control goes next,
+ * while NIR simply lets one block fall into the next. A block is therefore left
+ * "open" after its instructions and terminated when the next one is opened --
+ * which is also what lets a branch reach the right label when the two arms of an
+ * if are involved. */
+
+static void sz_emit_cf_list(struct sz_translate *t, struct exec_list *list,
+                            uint32_t fallthrough, nir_loop *loop);
+
+/* The first control-flow node of a list, or NULL when the list is empty. */
+static nir_cf_node *
+sz_cf_list_head(struct exec_list *list)
+{
+   struct exec_node *head = exec_list_get_head(list);
+   return head ? exec_node_data(nir_cf_node, head, node) : NULL;
+}
+
+/* The block control reaches after `node`, which is the next sibling block, or
+ * `fallthrough` when the construct is the last node of its list. A nested if or
+ * loop in between does not change the answer: control still ends up at the same
+ * place after it. */
+static uint32_t
+sz_next_label(struct sz_translate *t, nir_cf_node *node, uint32_t fallthrough)
+{
+   for (nir_cf_node *next = nir_cf_node_next(node); next;
+        next = nir_cf_node_next(next)) {
+      if (next->type == nir_cf_node_block)
+         return t->labels[nir_cf_node_as_block(next)->index];
+   }
+
+   return fallthrough;
+}
+
+/* Emits the terminator of the block that is currently open. */
+static void
+sz_emit_branch(struct sz_translate *t, uint32_t target)
+{
+   sz_spv_branch(t->m, target);
+   t->block_open = false;
+}
+
+static void
+sz_emit_branch_conditional(struct sz_translate *t, uint32_t condition,
+                           uint32_t then_id, uint32_t else_id)
+{
+   sz_spv_branch_conditional(t->m, condition, then_id, else_id);
+   t->block_open = false;
+}
+
+static void
+sz_open_block(struct sz_translate *t, uint32_t label)
+{
+   /* Falling out of the previous block is a branch to this one; that is the only
+    * place a NIR block's implicit successor is turned into SPIR-V. */
+   if (t->block_open)
+      sz_emit_branch(t, label);
+
+   sz_spv_label_id(t->m, label);
+   t->block_open = true;
+}
+
+/* `with_phis` is false only for a loop's first block: its phis belong to the loop
+ * header block, which the emitter creates itself. */
+static void
+sz_emit_block_body(struct sz_translate *t, nir_block *block, bool with_phis)
+{   nir_foreach_instr (instr, block) {
+      if (instr->type == nir_instr_type_phi && !with_phis)
+         continue;
+      if (instr->type == nir_instr_type_jump) {
+         sz_emit_jump(t, nir_instr_as_jump(instr), block);
+         return;
+      }
+      if (!sz_emit_instr(t, instr))
+         return;
+   }
+}
+
+static void
+sz_emit_block(struct sz_translate *t, nir_block *block)
+{
+   sz_open_block(t, t->labels[block->index]);
+   sz_emit_block_body(t, block, true);
+}
+
+/* The phis of a loop's first block belong to the header block the emitter
+ * creates; this pushes them there before the merge instruction. */
+static void
+sz_emit_phis(struct sz_translate *t, nir_block *block)
+{
+   nir_foreach_instr (instr, block) {
+      if (instr->type != nir_instr_type_phi)
+         return;
+      if (!sz_emit_instr(t, instr))
+         return;
+   }
+}
+
+static void
+sz_emit_if(struct sz_translate *t, nir_if *nif, uint32_t fallthrough,
+           nir_loop *loop)
+{
+   if (!t->block_open) {
+      sz_fail(t, "if without a preceding block");
+      return;
+   }
+   const uint32_t merge_id = sz_next_label(t, &nif->cf_node, fallthrough);
+   const uint32_t then_id = t->labels[nir_if_first_then_block(nif)->index];
+   const bool has_else = !exec_list_is_empty(&nif->else_list);
+   const uint32_t else_id =
+      has_else ? t->labels[nir_if_first_else_block(nif)->index] : merge_id;
+   const uint32_t condition = t->defs_id[nif->condition.ssa->index];
+
+   sz_spv_selection_merge(t->m, merge_id, SpvSelectionControlMaskNone);
+   sz_emit_branch_conditional(t, condition, then_id, else_id);
+
+   /* Each arm falls through to the merge block, never into the other arm. */
+   sz_emit_cf_list(t, &nif->then_list, merge_id, loop);
+   if (t->block_open)
+      sz_emit_branch(t, merge_id);
+
+   if (has_else) {
+      sz_emit_cf_list(t, &nif->else_list, merge_id, loop);
+      if (t->block_open)
+         sz_emit_branch(t, merge_id);
+   }
+}
+
+/* The loop header is a block of the emitter's own, not the loop's first NIR block.
+ * Two reasons, both of them structural rather than stylistic:
+ *
+ *   - NIR folds the loop test into the first block of the body, and that block may
+ *     also be where a nested if's condition is tested. A SPIR-V block may carry
+ *     only one merge instruction, so the loop merge and the selection merge cannot
+ *     live in the same block.
+ *
+ *   - A loop's phis live in its header, and every phi operand names the block it
+ *     arrives from. Giving the header its own block makes those predecessors
+ *     exactly the two SPIR-V provides: the block before the loop and the continue
+ *     block. */
+static void
+sz_emit_loop(struct sz_translate *t, nir_loop *loop, uint32_t fallthrough)
+{
+   nir_block *begin = nir_loop_first_block(loop);
+   const bool has_continue = nir_loop_has_continue_construct(loop);
+   const uint32_t header_id = sz_spv_id(t->m);
+   const uint32_t merge_id = sz_next_label(t, &loop->cf_node, fallthrough);
+   const uint32_t begin_id = t->labels[begin->index];
+   /* The continue target has to be a block of the continue construct, not the
+    * loop's last block: constructs in the body routinely merge into that one, and
+    * a merge block may not sit outside the construct its header belongs to.
+    * Naming the header makes the whole body the continue construct, which then
+    * has to be post dominated by the back edge -- impossible as soon as the body
+    * contains a break. So a continue target of our own it is. */
+   nir_block *back_edge = has_continue ? NULL : nir_loop_last_block(loop);
+   const uint32_t continue_id =
+      has_continue ? t->labels[nir_loop_first_continue_block(loop)->index]
+                   : sz_spv_id(t->m);
+
+   const uint32_t save_break = t->loop_break;
+   const uint32_t save_continue = t->loop_continue;
+   const uint32_t save_header = t->loop_header;
+   nir_block *save_pred = t->back_edge_pred;
+   const uint32_t save_pred_label = t->back_edge_label;
+   t->loop_break = merge_id;
+   t->loop_continue = continue_id;
+   t->loop_header = header_id;
+   t->back_edge_pred = back_edge;
+   t->back_edge_label = continue_id;
+
+   sz_open_block(t, header_id);
+   sz_emit_phis(t, begin);
+   t->back_edge_pred = save_pred;
+   t->back_edge_label = save_pred_label;
+
+   sz_spv_loop_merge(t->m, merge_id, continue_id, SpvLoopControlMaskNone);
+   sz_emit_branch(t, begin_id);
+
+   sz_open_block(t, begin_id);
+   sz_emit_block_body(t, begin, false);
+
+   /* The rest of the body, starting after the block just emitted. */
+   sz_emit_cf_list_from(t, &loop->body, &begin->cf_node, continue_id, loop);
+   if (t->block_open)
+      sz_emit_branch(t, continue_id);
+
+   t->loop_break = save_break;
+   t->loop_continue = save_continue;
+   t->loop_header = save_header;
+
+   if (has_continue) {
+      sz_emit_cf_list(t, &loop->continue_list, header_id, loop);
+      if (t->block_open)
+         sz_emit_branch(t, header_id);
+      return;
+   }
+
+   /* The continue target: every continue in the body lands here, and this is the
+    * only back edge into the header. */
+   sz_spv_label_id(t->m, continue_id);
+   sz_spv_branch(t->m, header_id);
+   t->block_open = false;
+}
+
+static void
+sz_emit_cf_list_from(struct sz_translate *t, struct exec_list *list,
+                     nir_cf_node *after, uint32_t fallthrough, nir_loop *loop)
+{
+   /* nir_cf_node_next() is what knows where a list ends: the tail sentinel is a
+    * real node whose `next` is NULL, so a loop that stops on a NULL node pointer
+    * would hand the sentinel to the emitters as if it were a block. */
+   for (nir_cf_node *cf = after ? nir_cf_node_next(after)
+                                : sz_cf_list_head(list);
+        cf; cf = nir_cf_node_next(cf)) {
+      if (t->failed)
+         return;
+
+      switch (cf->type) {
+      case nir_cf_node_block:
+         sz_emit_block(t, nir_cf_node_as_block(cf));
+         break;
+      case nir_cf_node_if:
+         sz_emit_if(t, nir_cf_node_as_if(cf), fallthrough, loop);
+         break;
+      case nir_cf_node_loop:
+         sz_emit_loop(t, nir_cf_node_as_loop(cf), fallthrough);
+         break;
+      case nir_cf_node_function:
+         sz_fail(t, "a nested function is not supported");
+         return;
+      }
+   }
+}
+
+static void
+sz_emit_cf_list(struct sz_translate *t, struct exec_list *list,
+                uint32_t fallthrough, nir_loop *loop)
+{
+   sz_emit_cf_list_from(t, list, NULL, fallthrough, loop);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1285,67 +2238,60 @@ static bool
 sz_emit_shader(struct sz_translate *t, uint32_t function)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(t->nir);
-   nir_block *entry = nir_start_block(impl);
 
    /* One extra slot: nir_index_blocks() gives end_block the index num_blocks, so
     * any reference to it would otherwise be one past the end. */
-   uint32_t *labels = calloc(impl->num_blocks + 1, sizeof(*labels));
-   if (!labels) {
+   t->labels = calloc(impl->num_blocks + 1, sizeof(*t->labels));
+   if (!t->labels) {
       sz_fail(t, "out of memory");
       return false;
    }
 
-   nir_foreach_block_unstructured (block, impl)
-      labels[block->index] = sz_spv_id(t->m);
+   nir_foreach_block (block, impl)
+      t->labels[block->index] = sz_spv_id(t->m);
+
+   /* Only allocated when something actually needs to merge into the end of the
+    * function. */
+   t->end_label = sz_spv_id(t->m);
 
    const uint32_t void_type = sz_spv_type_void(t->m);
    const uint32_t fn_type = sz_spv_type_function(t->m, void_type, NULL, 0);
    sz_spv_function(t->m, function, void_type, fn_type);
 
-   /* SPIR-V requires the function's first block to be the one the entry point
-    * executes, so it cannot go through the generic loop below. */
-   sz_spv_label_id(t->m, labels[entry->index]);
-   bool entry_terminated = false;
-   nir_foreach_instr (instr, entry) {
-      if (instr->type == nir_instr_type_jump) {
-         sz_emit_jump(t, nir_instr_as_jump(instr), entry, labels);
-         entry_terminated = true;
-         break;
-      }
-      if (!sz_emit_instr(t, instr))
-         break;
-   }
-   /* A block with no terminator instruction is malformed NIR, but emitting the
-    * return keeps the module valid so the failure names the real problem. */
-   if (!entry_terminated && !t->failed)
+   /* The function's first block is the NIR entry block, which is the first node
+    * of the body, so the structured walk starts there. */
+   sz_emit_cf_list(t, &impl->body, t->end_label, NULL);
+
+   if (t->block_open)
       sz_spv_return(t->m);
 
-   nir_foreach_block_unstructured (block, impl) {
-      if (block == entry || t->failed)
-         continue;
-
-      sz_spv_label_id(t->m, labels[block->index]);
-      bool terminated = false;
-      nir_foreach_instr (instr, block) {
-         if (instr->type == nir_instr_type_jump) {
-            sz_emit_jump(t, nir_instr_as_jump(instr), block, labels);
-            terminated = true;
-            break;
-         }
-         if (!sz_emit_instr(t, instr)) {
-            terminated = true;
-            break;
-         }
-      }
-
-      /* A block with no terminator is malformed NIR, but a validator error that
-       * points at the missing branch is more useful than a crash. */
-      if (!terminated && !t->failed)
-         sz_spv_return(t->m);
-   }
+   /* The end block is only branched to when a construct sits at the end of the
+    * body; emitting it unconditionally is one empty block and keeps the rule
+    * "every label a branch names is defined" free of exceptions. */
+   sz_spv_label_id(t->m, t->end_label);
+   sz_spv_return(t->m);
 
    sz_spv_function_end(t->m);
-   free(labels);
+
+   /* Phi operands that were not defined yet when the phi was emitted are filled
+    * in now that the whole function has been translated. */
+   for (unsigned i = 0; i < t->num_phi_fixups; i++) {
+      const unsigned def = t->phi_fixups[i].def;
+      const uint32_t id = t->defs_id[def];
+      if (!id) {
+         sz_fail(t, "phi operand %u was never translated", def);
+         break;
+      }
+      sz_spv_patch_function_word(t->m, t->phi_fixups[i].offset, id);
+   }
+
+   free(t->phi_fixups);
+   t->phi_fixups = NULL;
+   t->num_phi_fixups = 0;
+   t->phi_fixups_capacity = 0;
+   free(t->labels);
+   t->labels = NULL;
+
    return !t->failed;
 }
 
@@ -1379,10 +2325,12 @@ sz_nir_to_spirv(struct nir_shader *nir, uint32_t **words, size_t *word_count,
    /* num_blocks is only valid once the blocks are indexed, and it is stale (zero)
     * on a freshly cloned shader. */
    nir_index_blocks(impl);
+   nir_foreach_block (dbg_block, impl)
    t.defs_id = calloc(num_defs, sizeof(*t.defs_id));
    t.def_types = calloc(num_defs, sizeof(*t.def_types));
+   t.consts = calloc(num_defs, sizeof(*t.consts));
    t.interfaces = calloc(SZ_MAX_VARIABLES, sizeof(*t.interfaces));
-   if (!t.defs_id || !t.def_types || !t.interfaces) {
+   if (!t.defs_id || !t.def_types || !t.consts || !t.interfaces) {
       sz_fail(&t, "out of memory");
       goto fail;
    }
@@ -1401,6 +2349,10 @@ sz_nir_to_spirv(struct nir_shader *nir, uint32_t **words, size_t *word_count,
    }
 
    sz_spv_capability(t.m, SpvCapabilityShader);
+   /* Emitted unconditionally: the texture queries are reachable from any GLSL
+    * 1.20 shader through textureSize() and textureQueryLevels(), and a capability
+    * the module does not use costs nothing. */
+   sz_spv_capability(t.m, SpvCapabilityImageQuery);
    sz_spv_memory_model(t.m, SpvAddressingModelLogical, SpvMemoryModelGLSL450);
    sz_glsl450 = sz_spv_ext_inst_import(t.m, "GLSL.std.450");
 
@@ -1449,6 +2401,7 @@ sz_nir_to_spirv(struct nir_shader *nir, uint32_t **words, size_t *word_count,
 
    free(t.defs_id);
    free(t.def_types);
+   free(t.consts);
    free(t.interfaces);
    sz_spv_module_destroy(t.m);
    return true;
@@ -1456,6 +2409,7 @@ sz_nir_to_spirv(struct nir_shader *nir, uint32_t **words, size_t *word_count,
 fail:
    free(t.defs_id);
    free(t.def_types);
+   free(t.consts);
    free(t.interfaces);
    sz_spv_module_destroy(t.m);
 

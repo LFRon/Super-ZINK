@@ -164,7 +164,7 @@ static struct pipe_resource *
 sz_buffer_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
 {
    if (tmpl->width0 == 0) {
-      sz_warn("SZ: refusing to create a zero-sized buffer");
+      sz_warn("refusing to create a zero-sized buffer");
       return NULL;
    }
 
@@ -339,7 +339,7 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
    }
 
    if (tmpl->width0 == 0 || tmpl->height0 == 0) {
-      sz_warn("SZ: refusing to create a %ux%u image", tmpl->width0, tmpl->height0);
+      sz_warn("refusing to create a %ux%u image", tmpl->width0, tmpl->height0);
       return NULL;
    }
 

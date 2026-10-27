@@ -60,4 +60,15 @@ void sz_descriptor_screen_finish(struct sz_screen *screen);
  * layout the bound pipeline was created with. */
 void sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd);
 
+/* True when at least one of the images the draw samples is not in the layout a
+ * barrel-free sample needs. The caller uses it to decide whether an already open
+ * render pass has to be closed first: a layout transition is illegal inside one
+ * (VUID-vkCmdPipelineBarrier2-oldLayout-01181), and the alternative -- leaving the
+ * image in a layout the descriptor does not claim -- is undefined reads. */
+bool sz_descriptor_sampled_needs_transition(struct sz_context *ctx);
+
+/* Transitions every sampled image into SHADER_READ_ONLY_OPTIMAL. Must be called
+ * while no render pass is open. */
+void sz_descriptor_prepare_sampled(struct sz_context *ctx, VkCommandBuffer cmd);
+
 #endif /* SZ_DESCRIPTOR_H */

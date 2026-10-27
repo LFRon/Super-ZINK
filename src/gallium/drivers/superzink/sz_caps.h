@@ -62,6 +62,13 @@
    X(buffer_device_address,        "bufferDeviceAddress",                       \
      "VK_KHR_buffer_device_address",        VK_API_VERSION_1_2,                \
      q.f12.bufferDeviceAddress)                                                   \
+   /* Constant buffers are declared as they arrive from Mesa -- a plain word     \
+    * array with a 4 byte stride -- so the layout needs the scalar rules that    \
+    * this feature legalises. Without it every UBO would have to be re-declared  \
+    * with std140 padding, and every load offset recomputed. */                  \
+   X(uniform_buffer_standard_layout, "uniformBufferStandardLayout",             \
+     "VK_KHR_uniform_buffer_standard_layout", VK_API_VERSION_1_2,              \
+     q.f12.uniformBufferStandardLayout)                                           \
    X(format_feature_flags2,        "formatFeatureFlags2",                       \
      "VK_KHR_format_feature_flags2",        VK_API_VERSION_1_3,                \
      true)                                                                       \

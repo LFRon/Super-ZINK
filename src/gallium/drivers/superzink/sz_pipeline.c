@@ -333,7 +333,7 @@ sz_blend(const struct sz_context *ctx)
    return state ? &state->u.blend : NULL;
 }
 
-static VkCompareOp
+VkCompareOp
 sz_compare_op(unsigned func)
 {
    switch (func) {
@@ -640,7 +640,7 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
     * variant the driver does not build yet. Say so rather than render a depth
     * range that silently starts at 0.5. */
    if (rast_state && rast_state->clip_halfz)
-      sz_warn_once("SZ: glClipControl(GL_ZERO_TO_ONE) is not implemented; "
+      sz_warn_once("glClipControl(GL_ZERO_TO_ONE) is not implemented; "
                    "depth will span [0.5, 1]");
    const struct pipe_depth_stencil_alpha_state *dsa = sz_dsa(ctx);
    const struct pipe_blend_state *blend_state = sz_blend(ctx);
@@ -700,7 +700,7 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
     * dropping it, because a stencil-masked effect renders as if the mask were
     * always zero. */
    if (dsa && (dsa->stencil[0].enabled || dsa->stencil[1].enabled))
-      sz_warn_once("SZ: stencil testing is not implemented; ignoring it");
+      sz_warn_once("stencil testing is not implemented; ignoring it");
 
    const VkPipelineDepthStencilStateCreateInfo depth_stencil = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,

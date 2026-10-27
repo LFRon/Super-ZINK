@@ -32,6 +32,7 @@
 #include "util/u_inlines.h"
 #include "util/u_surface.h"
 #include "util/u_upload_mgr.h"
+#include "vk_format.h"
 
 #include <string.h>
 
@@ -289,6 +290,13 @@ sz_delete_state(struct pipe_context *pipe, void *opaque)
                ctx->state.sampler_states[s][i] = NULL;
          }
       }
+      /* A VkSampler is immutable, so the object owns it outright. Destroying it
+       * while a submission still references it is allowed -- samplers are not
+       * pipeline state that a command buffer latches -- but the push that
+       * recorded it has to have happened, which it did at draw time. */
+      if (state->u.sampler.sampler != VK_NULL_HANDLE)
+         ctx->screen->vk.DestroySampler(ctx->screen->dev,
+                                        state->u.sampler.sampler, NULL);
       break;
    case SZ_STATE_SHADER:
       for (unsigned s = 0; s < MESA_SHADER_STAGES; s++) {
@@ -365,13 +373,133 @@ sz_bind_vertex_elements_state(struct pipe_context *pipe, void *opaque)
       ctx->state.vertex_elements = NULL;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Samplers                                                                   */
+/* ------------------------------------------------------------------------- */
+
+static VkFilter
+sz_tex_filter(unsigned filter)
+{
+   return filter == PIPE_TEX_FILTER_NEAREST ? VK_FILTER_NEAREST
+                                            : VK_FILTER_LINEAR;
+}
+
+static VkSamplerMipmapMode
+sz_mipmap_mode(unsigned filter)
+{
+   /* PIPE_TEX_MIPFILTER_NONE still needs a mode: it is the minFilter that
+    * decides whether mips are used at all, and picking a mode that the sampler
+    * never reaches costs nothing. */
+   return filter == PIPE_TEX_MIPFILTER_NEAREST
+             ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+             : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+}
+
+static VkSamplerAddressMode
+sz_address_mode(enum pipe_tex_wrap wrap)
+{
+   switch (wrap) {
+   case PIPE_TEX_WRAP_REPEAT:
+      return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+   case PIPE_TEX_WRAP_CLAMP:
+      return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+   case PIPE_TEX_WRAP_CLAMP_TO_EDGE:
+      return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+   case PIPE_TEX_WRAP_CLAMP_TO_BORDER:
+      return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+   case PIPE_TEX_WRAP_MIRROR_REPEAT:
+      return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+   case PIPE_TEX_WRAP_MIRROR_CLAMP:
+   case PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE:
+      return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+   case PIPE_TEX_WRAP_MIRROR_CLAMP_TO_BORDER:
+      /* Vulkan has no mirrored clamp-to-border; clamped edge is the closest
+       * thing that exists and only differs outside the texture. */
+      return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+   }
+   return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+}
+
+/* Vulkan predefines three border colours unless VK_EXT_custom_border_color is
+ * enabled. Gallium passes the colour as four floats, so the three legal values
+ * are recognised by value and anything else falls back to transparent black with
+ * a warning -- a wrong border colour is visible, a silently unsupported one is
+ * worse. */
+static VkBorderColor
+sz_border_color(const union pipe_color_union *color)
+{
+   const float *c = color->f;
+   const bool zero_rgb = c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f;
+   const bool one_rgb = c[0] == 1.0f && c[1] == 1.0f && c[2] == 1.0f;
+
+   if (zero_rgb && c[3] == 0.0f)
+      return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+   if (zero_rgb && c[3] == 1.0f)
+      return VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+   if (one_rgb && c[3] == 1.0f)
+      return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+
+   sz_warn_once("custom border colours are not supported; using "
+                "transparent black");
+   return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+}
+
+static VkSampler
+sz_sampler_create(struct sz_screen *screen,
+                  const struct pipe_sampler_state *templ)
+{
+   const bool compare = templ->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
+   const float max_anisotropy = MAX2(templ->max_anisotropy, 1u);
+
+   const VkSamplerCreateInfo ci = {
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = sz_tex_filter(templ->mag_img_filter),
+      .minFilter = sz_tex_filter(templ->min_img_filter),
+      .mipmapMode = sz_mipmap_mode(templ->min_mip_filter),
+      .addressModeU = sz_address_mode(templ->wrap_s),
+      .addressModeV = sz_address_mode(templ->wrap_t),
+      .addressModeW = sz_address_mode(templ->wrap_r),
+      .mipLodBias = templ->lod_bias,
+      .anisotropyEnable = max_anisotropy > 1.0f &&
+                          screen->caps.core_features.samplerAnisotropy,
+      .maxAnisotropy = max_anisotropy,
+      .compareEnable = compare,
+      .compareOp = compare ? sz_compare_op(templ->compare_func)
+                           : VK_COMPARE_OP_NEVER,
+      .minLod = templ->min_lod,
+      .maxLod = templ->max_lod,
+      .borderColor = sz_border_color(&templ->border_color),
+      /* GL samplers address in normalised coordinates; unnormalised ones are
+       * a TexGen-era feature Vulkan spells as a device feature, so the honest
+       * answer is a warning rather than a sampler that reads the wrong texels. */
+      .unnormalizedCoordinates = VK_FALSE,
+   };
+
+   if (templ->unnormalized_coords)
+      sz_warn_once("unnormalised texture coordinates are not supported");
+
+   VkSampler sampler = VK_NULL_HANDLE;
+   VkResult result = screen->vk.CreateSampler(screen->dev, &ci, NULL, &sampler);
+   if (result != VK_SUCCESS) {
+      mesa_loge("SZ: vkCreateSampler failed: %d", result);
+      return VK_NULL_HANDLE;
+   }
+
+   return sampler;
+}
+
 static void *
 sz_create_sampler_state(struct pipe_context *pipe,
                         const struct pipe_sampler_state *templ)
 {
    struct sz_state *state = sz_state_alloc(SZ_STATE_SAMPLER);
-   if (state)
-      state->u.sampler = *templ;
+   if (!state)
+      return NULL;
+
+   state->u.sampler.base = *templ;
+   state->u.sampler.sampler =
+      sz_sampler_create(sz_context(pipe)->screen, templ);
+
    return state;
 }
 
@@ -434,7 +562,7 @@ sz_create_shader_state(struct pipe_context *pipe,
     * Pointing at the caller's copy works until the caller frees it, which happens
     * on the very next program change. */
    if (templ->type != PIPE_SHADER_IR_NIR || !templ->ir.nir) {
-      sz_warn_once("SZ: only NIR shaders are supported");
+      sz_warn_once("only NIR shaders are supported");
       state->u.shader.base.ir.nir = NULL;
       return state;
    }
@@ -532,8 +660,61 @@ sz_sampler_view_destroy(struct pipe_context *pipe,
                         struct pipe_sampler_view *view)
 {
    struct sz_sampler_view *sv = (struct sz_sampler_view *)view;
+   struct sz_screen *screen = sz_context(pipe)->screen;
+
+   if (sv->view != VK_NULL_HANDLE)
+      screen->vk.DestroyImageView(screen->dev, sv->view, NULL);
+
    pipe_resource_reference(&sv->base.texture, NULL);
    free(sv);
+}
+
+static VkImageViewType
+sz_view_type(enum pipe_texture_target target, unsigned array_size)
+{
+   switch (target) {
+   case PIPE_TEXTURE_1D:
+      return VK_IMAGE_VIEW_TYPE_1D;
+   case PIPE_TEXTURE_1D_ARRAY:
+      return VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+   case PIPE_TEXTURE_2D:
+      return array_size > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                            : VK_IMAGE_VIEW_TYPE_2D;
+   case PIPE_TEXTURE_2D_ARRAY:
+      return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+   case PIPE_TEXTURE_CUBE:
+      return VK_IMAGE_VIEW_TYPE_CUBE;
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      return VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+   case PIPE_TEXTURE_3D:
+      return VK_IMAGE_VIEW_TYPE_3D;
+   case PIPE_TEXTURE_RECT:
+      return VK_IMAGE_VIEW_TYPE_2D;
+   default:
+      return VK_IMAGE_VIEW_TYPE_2D;
+   }
+}
+
+static VkComponentSwizzle
+sz_component_swizzle(unsigned swizzle)
+{
+   switch (swizzle) {
+   case PIPE_SWIZZLE_X:
+      return VK_COMPONENT_SWIZZLE_R;
+   case PIPE_SWIZZLE_Y:
+      return VK_COMPONENT_SWIZZLE_G;
+   case PIPE_SWIZZLE_Z:
+      return VK_COMPONENT_SWIZZLE_B;
+   case PIPE_SWIZZLE_W:
+      return VK_COMPONENT_SWIZZLE_A;
+   case PIPE_SWIZZLE_0:
+      return VK_COMPONENT_SWIZZLE_ZERO;
+   case PIPE_SWIZZLE_1:
+      return VK_COMPONENT_SWIZZLE_ONE;
+   case PIPE_SWIZZLE_NONE:
+   default:
+      return VK_COMPONENT_SWIZZLE_IDENTITY;
+   }
 }
 
 static void
@@ -549,13 +730,69 @@ static struct pipe_sampler_view *
 sz_create_sampler_view(struct pipe_context *pipe, struct pipe_resource *texture,
                        const struct pipe_sampler_view *templ)
 {
+   struct sz_context *ctx = sz_context(pipe);
+   struct sz_screen *screen = ctx->screen;
+   struct sz_resource *res = sz_resource(texture);
+
+   const VkFormat format = vk_format_from_pipe_format(templ->format);
+   if (format == VK_FORMAT_UNDEFINED) {
+      /* A view in a format the device cannot read would be rejected by
+       * vkCreateImageView with an error that says nothing about which texture
+       * asked for it. */
+      sz_warn_once("sampler view format %u has no Vulkan equivalent",
+                   (unsigned)templ->format);
+      return NULL;
+   }
+
    struct sz_sampler_view *sv = CALLOC_STRUCT(sz_sampler_view);
    if (!sv)
       return NULL;
 
    sv->base = *templ;
    sv->base.context = pipe;
+   /* The frontend deliberately does not clear its template -- pipe_sampler_view's
+    * texture and context are the driver's own storage, and zeroing them is pure
+    * overhead on a hot path -- so both have to be reset here. The copy above
+    * leaves stack garbage in them, and referencing that garbage segfaults. */
+   sv->base.texture = NULL;
    pipe_resource_reference(&sv->base.texture, texture);
+
+   if (res->image == VK_NULL_HANDLE)
+      return &sv->base;
+
+   const unsigned first_level = templ->u.tex.first_level;
+   const unsigned last_level = templ->u.tex.last_level;
+   const unsigned first_layer = templ->u.tex.first_layer;
+   const unsigned last_layer = templ->u.tex.last_layer;
+
+   const VkImageViewCreateInfo ci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = res->image,
+      .viewType = sz_view_type(templ->target, texture->array_size),
+      .format = format,
+      .components = {
+         .r = sz_component_swizzle(templ->swizzle_r),
+         .g = sz_component_swizzle(templ->swizzle_g),
+         .b = sz_component_swizzle(templ->swizzle_b),
+         .a = sz_component_swizzle(templ->swizzle_a),
+      },
+      .subresourceRange = {
+         .aspectMask = sz_format_aspect(templ->format),
+         .baseMipLevel = first_level,
+         .levelCount = last_level > first_level ? last_level - first_level + 1
+                                                : 1,
+         .baseArrayLayer = first_layer,
+         .layerCount = last_layer > first_layer ? last_layer - first_layer + 1
+                                                : 1,
+      },
+   };
+
+   const VkResult result =
+      screen->vk.CreateImageView(screen->dev, &ci, NULL, &sv->view);
+   if (result != VK_SUCCESS) {
+      mesa_loge("SZ: vkCreateImageView(sampler view) failed: %d", result);
+      sv->view = VK_NULL_HANDLE;
+   }
 
    return &sv->base;
 }
@@ -564,9 +801,47 @@ sz_create_sampler_view(struct pipe_context *pipe, struct pipe_resource *texture,
 /* Clears                                                                     */
 /* ------------------------------------------------------------------------- */
 
+/* Clears a rectangle of one of the current framebuffer's attachments.
+ *
+ * vkCmdClearColorImage can only clear a whole subresource, so a scissored
+ * glClear or a glClearTexSubImage has nowhere to go through the transfer path --
+ * they go through vkCmdClearAttachments instead, which is a rectangle inside a
+ * render pass. The pass is left open: a clear is normally followed by draws that
+ * belong in the same one. */
+static bool
+sz_clear_rect(struct sz_context *ctx, unsigned attachment, bool depth_stencil,
+              VkImageAspectFlags aspects, const VkClearValue *value,
+              unsigned x, unsigned y, unsigned width, unsigned height)
+{
+   VkCommandBuffer cmd = sz_context_cmd(ctx);
+   if (cmd == VK_NULL_HANDLE)
+      return false;
+
+   if (!ctx->rendering && !sz_renderpass_begin(ctx, cmd))
+      return false;
+
+   VkClearAttachment clear = {
+      .aspectMask = depth_stencil ? aspects : VK_IMAGE_ASPECT_COLOR_BIT,
+      .colorAttachment = depth_stencil ? 0 : attachment,
+      .clearValue = *value,
+   };
+
+   const VkClearRect rect = {
+      .rect = {
+         .offset = { (int32_t)x, (int32_t)y },
+         .extent = { width, height },
+      },
+      .baseArrayLayer = 0,
+      .layerCount = 1,
+   };
+
+   ctx->screen->vk.CmdClearAttachments(cmd, 1, &clear, 1, &rect);
+   return true;
+}
+
 /* True when `box` covers the whole of `level`'s extent, which is the only case
  * vkCmdClearColorImage can express: it clears a whole subresource. Anything
- * smaller needs a render pass, which needs pipelines, which is Phase 2. */
+ * smaller goes through sz_clear_rect() instead. */
 static bool
 sz_box_covers_surface(const struct pipe_resource *res, unsigned level,
                       unsigned x, unsigned y, unsigned width, unsigned height)
@@ -586,12 +861,19 @@ sz_clear_render_target(struct pipe_context *pipe, struct pipe_surface *dst,
    struct sz_resource *res = sz_resource(dst->texture);
 
    if (!sz_box_covers_surface(&res->base, dst->level, dstx, dsty, width, height)) {
-      /* Silently dropping this would show up as a stale region on screen, so say
-       * so once rather than render the wrong thing quietly. */
+      const VkClearValue value = { .color = {
+         .float32 = { color->f[0], color->f[1], color->f[2], color->f[3] } } };
+      for (unsigned i = 0; i < ctx->state.framebuffer.nr_cbufs; i++) {
+         if (&ctx->state.framebuffer.cbufs[i] != dst)
+            continue;
+         sz_clear_rect(ctx, i, false, 0, &value, dstx, dsty, width, height);
+         return;
+      }
+
       static bool warned;
       if (!warned) {
-         mesa_logw("SZ: partial surface clears need a render pass; ignoring "
-                   "the clear instead of corrupting the surface");
+         mesa_logw("SZ: cannot clear a region of a surface that is not bound; "
+                   "ignoring the clear");
          warned = true;
       }
       return;
@@ -634,9 +916,6 @@ sz_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *dst,
    if (!desc)
       return;
 
-   if (!sz_box_covers_surface(&res->base, dst->level, dstx, dsty, width, height))
-      return;
-
    VkImageAspectFlags aspect = 0;
    if ((clear_flags & PIPE_CLEAR_DEPTH) && util_format_has_depth(desc))
       aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -651,16 +930,32 @@ sz_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *dst,
    if (aspect == 0)
       return;
 
+   const VkClearDepthStencilValue clear = {
+      .depth = (float)depth,
+      .stencil = stencil,
+   };
+
+   if (!sz_box_covers_surface(&res->base, dst->level, dstx, dsty, width, height)) {
+      const VkClearValue value = { .depthStencil = clear };
+      if (dst != &ctx->state.framebuffer.zsbuf) {
+         static bool warned;
+         if (!warned) {
+            mesa_logw("SZ: cannot clear a region of a surface that is not bound; "
+                      "ignoring the clear");
+            warned = true;
+         }
+         return;
+      }
+
+      sz_clear_rect(ctx, 0, true, aspect, &value, dstx, dsty, width, height);
+      return;
+   }
+
    VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
       return;
 
    sz_resource_access(ctx->screen, cmd, res, SZ_ACCESS_TRANSFER_DST);
-
-   const VkClearDepthStencilValue clear = {
-      .depth = (float)depth,
-      .stencil = stencil,
-   };
 
    const VkImageSubresourceRange range = {
       .aspectMask = aspect,
@@ -683,17 +978,43 @@ sz_clear(struct pipe_context *pipe, unsigned buffers, uint32_t color_clear_mask,
    struct sz_context *ctx = sz_context(pipe);
    struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
 
-   /* glClear honours the scissor, and st splits the clear itself rather than
-    * passing one down, so a scissor here means the caller expects per-buffer
-    * handling we cannot express with vkCmdClear*. Refusing loudly beats silently
-    * clearing the whole surface. */
+   /* glClear honours the scissor. Each buffer is cleared through
+    * vkCmdClearAttachments, which takes the rectangle directly, so a scissored
+    * clear of a small damaged region stays a small clear. */
    if (scissor_state) {
-      static bool warned;
-      if (!warned) {
-         mesa_logw("SZ: scissored clears need a render pass; Phase 1 only "
-                   "clears whole surfaces");
-         warned = true;
+      unsigned x0 = scissor_state->minx;
+      unsigned y0 = scissor_state->miny;
+      unsigned x1 = MIN2(scissor_state->maxx, fb->width);
+      unsigned y1 = MIN2(scissor_state->maxy, fb->height);
+      if (x1 <= x0 || y1 <= y0)
+         return;
+
+      if (buffers & PIPE_CLEAR_COLOR) {
+         const VkClearValue value = { .color = {
+            .float32 = { color->f[0], color->f[1], color->f[2], color->f[3] } } };
+         for (unsigned i = 0; i < fb->nr_cbufs; i++) {
+            if (!fb->cbufs[i].texture)
+               continue;
+            sz_clear_rect(ctx, i, false, 0, &value, x0, y0, x1 - x0, y1 - y0);
+         }
       }
+
+      if ((buffers & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)) &&
+          fb->zsbuf.texture) {
+         const struct util_format_description *desc =
+            util_format_description(fb->zsbuf.format);
+         VkImageAspectFlags aspect = 0;
+         if ((buffers & PIPE_CLEAR_DEPTH) && util_format_has_depth(desc))
+            aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
+         if ((buffers & PIPE_CLEAR_STENCIL) && util_format_has_stencil(desc))
+            aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+         if (aspect != 0) {
+            const VkClearValue value = { .depthStencil = {
+               .depth = (float)depth, .stencil = stencil } };
+            sz_clear_rect(ctx, 0, true, aspect, &value, x0, y0, x1 - x0, y1 - y0);
+         }
+      }
+
       return;
    }
 
@@ -1037,7 +1358,7 @@ sz_set_constant_buffer(struct pipe_context *pipe, mesa_shader_stage shader,
    struct sz_context *ctx = sz_context(pipe);
 
    if (shader >= MESA_SHADER_STAGES || index >= SZ_MAX_CONST_BUFFERS) {
-      sz_warn_once("SZ: ignoring a constant buffer outside the supported range");
+      sz_warn_once("ignoring a constant buffer outside the supported range");
       return;
    }
 
@@ -1056,7 +1377,7 @@ sz_set_constant_buffer(struct pipe_context *pipe, mesa_shader_stage shader,
     * blit shader -- and copying it would need an uploader this phase does not
     * have yet. Say so once instead of reading stale descriptors. */
    if (!buf->buffer) {
-      sz_warn_once("SZ: constant buffers in client memory are not implemented, "
+      sz_warn_once("constant buffers in client memory are not implemented, "
                    "ignoring");
       return;
    }
@@ -1259,24 +1580,32 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    struct sz_context *ctx = sz_context(pipe);
 
    if (indirect || num_draws == 0) {
-      sz_warn_once("SZ: indirect draws are not implemented, ignoring");
+      sz_warn_once("indirect draws are not implemented, ignoring");
       return;
    }
 
    const struct sz_state *ve = ctx->state.vertex_elements;
    if (!ve || ve->u.ve.count == 0) {
-      sz_warn_once("SZ: draw without vertex elements, ignoring");
+      sz_warn_once("draw without vertex elements, ignoring");
       return;
    }
 
    if (ctx->state.num_vertex_buffers == 0) {
-      sz_warn_once("SZ: draw without vertex buffers, ignoring");
+      sz_warn_once("draw without vertex buffers, ignoring");
       return;
    }
 
    VkCommandBuffer cmd = sz_context_cmd(ctx);
    if (cmd == VK_NULL_HANDLE)
       return;
+
+   /* Sampled images have to reach SHADER_READ_ONLY_OPTIMAL before the render pass
+    * opens: a layout transition inside one is illegal, and a texture bound
+    * between two draws is in whatever layout its last user left it. Closing the
+    * pass to do it costs two commands and only happens when a new image appears. */
+   if (ctx->rendering && sz_descriptor_sampled_needs_transition(ctx))
+      sz_renderpass_end(ctx, cmd);
+   sz_descriptor_prepare_sampled(ctx, cmd);
 
    if (!ctx->rendering && !sz_renderpass_begin(ctx, cmd))
       return;
@@ -1287,7 +1616,7 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    struct sz_resource *index = NULL;
    if (info->index_size) {
       if (info->has_user_indices) {
-         sz_warn_once("SZ: user index buffers are not implemented, ignoring");
+         sz_warn_once("user index buffers are not implemented, ignoring");
          return;
       }
       index = sz_resource(info->index.resource);
@@ -1826,6 +2155,8 @@ sz_context_destroy(struct pipe_context *pipe)
    sz_queue_wait_idle(&ctx->screen->batch_state);
 
    sz_pipeline_finish(ctx);
+
+   pipe_resource_reference(&ctx->sampled_copy, NULL);
 
    /* The constant buffers are the one piece of shadow state the context owns a
     * reference to, so they are the one piece it has to drop. */

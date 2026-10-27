@@ -61,6 +61,15 @@ uint32_t sz_spv_type_runtime_array(struct sz_spv_module *m, uint32_t element);
  * module's constant pool with every other use of the same number. */
 uint32_t sz_spv_type_array(struct sz_spv_module *m, uint32_t element,
                            unsigned count);
+/* OpTypeImage. `sampled_type` is the type of one texel component as the shader
+ * reads it, `dim` the dimensionality, and the flags map straight onto the
+ * operands of the same name. Not cached by the three-word key alone: the
+ * literal operands are packed into it. */
+uint32_t sz_spv_type_image(struct sz_spv_module *m, uint32_t sampled_type,
+                           SpvDim dim, bool depth, bool arrayed, bool ms,
+                           bool sampled);
+/* OpTypeSampledImage, the type a combined image sampler variable holds. */
+uint32_t sz_spv_type_sampled_image(struct sz_spv_module *m, uint32_t image);
 uint32_t sz_spv_type_ptr(struct sz_spv_module *m, SpvStorageClass storage,
                          uint32_t pointee);
 uint32_t sz_spv_type_function(struct sz_spv_module *m, uint32_t result,
@@ -124,6 +133,29 @@ void sz_spv_function_end(struct sz_spv_module *m);
  * instructions that produce neither. */
 uint32_t sz_spv_load(struct sz_spv_module *m, uint32_t type, uint32_t ptr);
 void sz_spv_store(struct sz_spv_module *m, uint32_t ptr, uint32_t value);
+void sz_spv_branch(struct sz_spv_module *m, uint32_t target);
+void sz_spv_branch_conditional(struct sz_spv_module *m, uint32_t condition,
+                               uint32_t then_id, uint32_t else_id);
+void sz_spv_selection_merge(struct sz_spv_module *m, uint32_t merge,
+                            SpvSelectionControlMask control);
+void sz_spv_loop_merge(struct sz_spv_module *m, uint32_t merge, uint32_t cont,
+                       SpvLoopControlMask control);
+
+/* OpPhi. `operands` is a flat (value, block) sequence. The value of an operand
+ * whose defining instruction has not been translated yet is emitted as zero and
+ * its word offset is returned in `first_operand`, which the caller resolves with
+ * sz_spv_patch_function_word() once the module is complete -- a loop header's
+ * phi always takes one operand from the back edge, which by definition comes
+ * later in the emission order. */
+uint32_t sz_spv_phi(struct sz_spv_module *m, uint32_t type,
+                    const uint32_t *operands, unsigned count,
+                    size_t *first_operand);
+
+/* Overwrites one word of the function section, at an offset returned by
+ * sz_spv_phi(). */
+void sz_spv_patch_function_word(struct sz_spv_module *m, size_t offset,
+                                uint32_t word);
+
 uint32_t sz_spv_composite_construct(struct sz_spv_module *m, uint32_t type,
                                     const uint32_t *members, unsigned count);
 void sz_spv_return(struct sz_spv_module *m);

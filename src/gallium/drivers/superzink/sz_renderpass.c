@@ -39,7 +39,11 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
    struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
 
    if (!sz_renderpass_is_valid(ctx)) {
-      sz_warn("SZ: draw without a complete framebuffer, ignoring");
+      sz_warn("draw without a complete framebuffer, ignoring (%ux%u, %u colour "
+              "buffer%s, %s depth)",
+              fb->width, fb->height, fb->nr_cbufs,
+              fb->nr_cbufs == 1 ? "" : "s",
+              fb->zsbuf.texture ? "with" : "no");
       return false;
    }
 

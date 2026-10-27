@@ -41,7 +41,13 @@ struct sz_state {
    mesa_shader_stage stage;
    union {
       struct pipe_blend_state blend;
-      struct pipe_sampler_state sampler;
+      struct {
+         struct pipe_sampler_state base;
+         /* Created along with the state object and destroyed with it. A
+          * VkSampler is immutable, so there is nothing to update later and
+          * nothing to share between objects that describe the same filter. */
+         VkSampler sampler;
+      } sampler;
       struct pipe_rasterizer_state rasterizer;
       struct pipe_depth_stencil_alpha_state dsa;
       struct {
@@ -72,6 +78,13 @@ struct sz_state {
  * the pointer somewhere a free() cannot follow. */
 struct sz_sampler_view {
    struct pipe_sampler_view base;
+
+   /* The image is what the descriptor needs; the resource it came from is
+    * already referenced through base.texture, so the VkImageView is the only
+    * thing this object owns. Format and swizzle come from the template, so a
+    * view of an RGBA texture as RED is a different view, not a different
+    * resource. */
+   VkImageView view;
 };
 
 struct sz_gfx_pipeline;
@@ -105,6 +118,18 @@ struct sz_context {
    unsigned render_color_count;
 
    struct sz_gfx_pipeline *pipeline;
+
+   /* Set for a draw that samples the very image it renders into. Vulkan leaves
+    * that undefined and RADV's compressed surfaces turn it into noise on screen,
+    * so the attachment is copied to a scratch image first and the descriptor for
+    * that slot names the copy instead. The scratch lives until the format or the
+    * extent changes, which is once per window size. */
+   struct {
+      VkImageView view[SZ_DESCRIPTOR_STAGES][SZ_MAX_SAMPLERS];
+   } sampled_override;
+   struct pipe_resource *sampled_copy;
+   VkFormat sampled_copy_format;
+   unsigned sampled_copy_extent[2];
 
    /* Pipelines replaced while a command buffer still had them bound. Vulkan
     * forbids destroying one in that state, so the objects wait here until the

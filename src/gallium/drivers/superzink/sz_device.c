@@ -268,6 +268,8 @@ sz_gate_features(const struct sz_screen *screen, struct sz_vk_features *features
 #undef SZ_GATE_CORE
 
    features->f12.timelineSemaphore &= caps->timeline_semaphore;
+   features->f12.uniformBufferStandardLayout &=
+      caps->uniform_buffer_standard_layout;
    features->f12.bufferDeviceAddress &= caps->buffer_device_address;
    features->f13.dynamicRendering &= caps->dynamic_rendering;
    features->f13.synchronization2 &= caps->synchronization2;
@@ -453,6 +455,8 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(GetImageMemoryRequirements, vkGetImageMemoryRequirements);
    SZ_DEV_PROC(GetImageMemoryRequirements2, vkGetImageMemoryRequirements2);
    SZ_DEV_PROC(BindImageMemory, vkBindImageMemory);
+   SZ_DEV_PROC(CreateSampler, vkCreateSampler);
+   SZ_DEV_PROC(DestroySampler, vkDestroySampler);
    SZ_DEV_PROC(CreateImageView, vkCreateImageView);
    SZ_DEV_PROC(DestroyImageView, vkDestroyImageView);
    SZ_DEV_PROC(GetImageSubresourceLayout, vkGetImageSubresourceLayout);
@@ -507,6 +511,7 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdBindIndexBuffer, vkCmdBindIndexBuffer);
    SZ_DEV_PROC(CmdDraw, vkCmdDraw);
    SZ_DEV_PROC(CmdDrawIndexed, vkCmdDrawIndexed);
+   SZ_DEV_PROC(CmdClearAttachments, vkCmdClearAttachments);
 
    SZ_DEV_PROC(CreateShaderModule, vkCreateShaderModule);
    SZ_DEV_PROC(DestroyShaderModule, vkDestroyShaderModule);

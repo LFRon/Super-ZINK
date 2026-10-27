@@ -390,7 +390,7 @@ sz_bo_free(struct sz_bo *bo)
                       bo->offset, bo->size)) {
       /* The range table is full. Leaking the range is the only safe response:
        * handing the memory to a second owner would alias. */
-      sz_warn("SZ: range table full, leaking %" PRIu64 " bytes", bo->size);
+      sz_warn("range table full, leaking %" PRIu64 " bytes", bo->size);
    }
 
    /* Reclaim a block that has gone completely idle, but keep one warm block per
