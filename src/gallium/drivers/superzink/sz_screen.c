@@ -1012,21 +1012,26 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * built-in function, and reproduces with
     *   generated_tests/spec/arb_tessellation_shader/execution/
     *   built-in-functions/tcs-abs-float.shader_test */
-   /* The tessellation stages are translated but still not advertised. The two
-    * crash classes are gone -- 1541 crashes became 6 after the Patch decoration
-    * on the two level builtins, the patch location space and a descriptor set
-    * that knew about both stages -- but arb_tessellation_shader is still only
-    * 172 pass against 1619 fail, and the failures are systematic rather than
-    * scattered. Two causes are known:
-    *   - arrays of arrays. The tests pass varyings like `vec3 inpos[][16]`, and
-    *     sz_dtype_from_glsl() rejects an array whose element is itself an array,
-    *     so those shaders do not translate at all.
-    *   - patch and per-vertex I/O between the two stages. A tessellation control
-    *     shader that writes a patch varying and a per-vertex varying reaches the
-    *     evaluation shader with the wrong values, which is what
-    *     generated_tests/.../built-in-functions/tcs-abs-float.shader_test shows.
+   /* The tessellation stages are advertised, so this driver reports GL 4.0 and
+    * 4.1. Both execution models, both sets of execution modes, patch varyings,
+    * the six builtins, VkPipelineTessellationStateCreateInfo and the gl_PerVertex
+    * blocks that Position and PointSize live in are translated, and
+    * headless-tess exercises them end to end.
+    *
+    * arb_tessellation_shader is however only 172 pass against 1612 fail and 13
+    * crash, and the failures are systematic, so the version is one thing and the
+    * conformance is another. Two causes are known:
+    *   - an input indexed by gl_InvocationID inside a tessellation control
+    *     shader. A constant index reads the right vertex, a dynamic one does
+    *     not: `nop` (gl_out[i].gl_Position = gl_in[i].gl_Position) draws
+    *     nothing, and the same shape on a user varying reads zeros. The
+    *     generated tcs and tes built-in-function tests and tcs-input hit this.
+    *   - arrays of arrays. Those tests pass varyings like `vec3 inpos[][16]`,
+    *     and sz_dtype_from_glsl() accepts only one level of nesting.
     * Neither is a matter of a missing capability bit. */
    const mesa_shader_stage supported_stages[] = {MESA_SHADER_VERTEX,
+                                                 MESA_SHADER_TESS_CTRL,
+                                                 MESA_SHADER_TESS_EVAL,
                                                  MESA_SHADER_GEOMETRY,
                                                  MESA_SHADER_FRAGMENT};
    for (unsigned i = 0; i < ARRAY_SIZE(supported_stages); i++) {
