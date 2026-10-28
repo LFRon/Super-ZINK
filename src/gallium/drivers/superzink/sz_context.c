@@ -1370,13 +1370,25 @@ sz_set_framebuffer_state(struct pipe_context *pipe,
    for (unsigned i = 0; !changed && i < fb->nr_cbufs; i++)
       changed = cur->cbufs[i].texture != fb->cbufs[i].texture ||
                 cur->cbufs[i].level != fb->cbufs[i].level ||
-                cur->cbufs[i].first_layer != fb->cbufs[i].first_layer;
+                cur->cbufs[i].first_layer != fb->cbufs[i].first_layer ||
+                cur->cbufs[i].last_layer != fb->cbufs[i].last_layer;
+
+   if (!changed)
+      changed = cur->zsbuf.texture != fb->zsbuf.texture ||
+                cur->zsbuf.level != fb->zsbuf.level ||
+                cur->zsbuf.first_layer != fb->zsbuf.first_layer ||
+                cur->zsbuf.last_layer != fb->zsbuf.last_layer;
 
    if (changed && ctx->rendering) {
       VkCommandBuffer cmd = sz_context_cmd(ctx);
       if (cmd != VK_NULL_HANDLE)
          sz_renderpass_end(ctx, cmd);
    }
+
+   /* The cached attachment views are *not* dropped here. A view a command buffer
+    * already recorded keeps being read until that submission retires, and the
+    * cache is keyed on the subresource anyway, so switching framebuffers merely
+    * looks up a different entry. They are destroyed with the context. */
 
    /* pipe_framebuffer_state holds the surfaces by value in this Mesa version, so
     * a struct copy is the whole update. Formats are part of the pipeline, so the
@@ -2873,11 +2885,20 @@ sz_copy_job_record(struct sz_context *ctx, VkCommandBuffer cmd, void *user)
 
    const bool is_3d = job->res->base.target == PIPE_TEXTURE_3D;
 
+   /* VkBufferImageCopy measures bufferRowLength in *texels*, and for a
+    * block-compressed format that is texels of the image, not blocks of the
+    * buffer: the value has to be a multiple of the block width
+    * (VUID-vkCmdCopyBufferToImage-bufferRowLength-09106). So the row pitch is
+    * divided by the bytes of one block and multiplied by how many texels wide
+    * that block is. */
+   const unsigned block_w = util_format_get_blockwidth(job->res->base.format);
+   const unsigned block_h = util_format_get_blockheight(job->res->base.format);
+
    VkBufferImageCopy region = {
       .bufferOffset = 0,
       /* In texels, not bytes; zero would mean "tightly packed", which is not the
        * pitch the caller sees. */
-      .bufferRowLength = job->row_pitch / bs,
+      .bufferRowLength = (job->row_pitch / bs) * block_w,
       .bufferImageHeight = 0,
       .imageSubresource = {
          .aspectMask = sz_format_aspect(job->res->base.format),
@@ -2891,8 +2912,10 @@ sz_copy_job_record(struct sz_context *ctx, VkCommandBuffer cmd, void *user)
          is_3d ? job->box.z : 0,
       },
       .imageExtent = {
-         job->box.width,
-         job->box.height,
+         /* A copy works in whole blocks, so a partial block at the edge is
+          * rounded up -- the buffer holds whole texel blocks. */
+         ALIGN_POT(DIV_ROUND_UP(job->box.width, block_w) * block_w, block_w),
+         ALIGN_POT(DIV_ROUND_UP(job->box.height, block_h) * block_h, block_h),
          /* For a layered image the box's depth is a layer count and belongs in
           * imageSubresource above; extent.depth must be 1 for every non-3D
           * target (VUID-vkCmdCopyImageToBuffer-srcImage-07980). */
@@ -3190,6 +3213,13 @@ sz_context_destroy(struct pipe_context *pipe)
       pipe_so_target_reference(&ctx->so_targets[i], NULL);
       pipe_so_target_reference(&ctx->so_prev_targets[i], NULL);
    }
+
+   for (unsigned i = 0; i < ctx->num_surface_views; i++)
+      if (ctx->surface_views[i].view != VK_NULL_HANDLE &&
+          ctx->surface_views[i].view != ctx->surface_views[i].res->view)
+         ctx->screen->vk.DestroyImageView(ctx->screen->dev,
+                                          ctx->surface_views[i].view, NULL);
+   free(ctx->surface_views);
 
    if (ctx->so_counter_buffer != VK_NULL_HANDLE) {
       sz_bo_free(ctx->so_counter_bo);

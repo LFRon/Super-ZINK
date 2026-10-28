@@ -670,11 +670,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
-      /* Not claimed yet: cube map arrays need the per-level layout tracking that
-       * sz_sync.c now has (and the image extent.depth fix), and with those the
-       * validation errors are gone -- but mipmap generation into one still writes
-       * the wrong face, so the capability would turn a clean refusal into a wrong
-       * picture. */
+      /* Cube map arrays: VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, a Cube dimension that
+       * carries a layer coordinate, the imageCubeArray feature (required), the
+       * extent.depth fix, per-level layout tracking, and now a per-attachment
+       * view so rendering to one face writes only that face. */
+      caps->cube_map_array = true;
 
       /* Inverted conditional rendering. The predicate is resolved on the host
        * when glBeginConditionalRender is called and the inverted form is the
