@@ -2120,8 +2120,14 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
       }
 
       if (offset != NULL) {
-         mask |= offset_constant ? SpvImageOperandsConstOffsetMask
-                                 : SpvImageOperandsOffsetMask;
+         if (offset_constant) {
+            mask |= SpvImageOperandsConstOffsetMask;
+         } else {
+            /* A computed offset is the non-constant form of the same operand and
+             * needs this capability; the constant form does not. */
+            sz_spv_capability(t->m, SpvCapabilityImageGatherExtended);
+            mask |= SpvImageOperandsOffsetMask;
+         }
          values[num_values++] = offset_value;
       }
 
@@ -2201,8 +2207,12 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
    }
 
    if (offset != NULL) {
-      mask |= offset_constant ? SpvImageOperandsConstOffsetMask
-                              : SpvImageOperandsOffsetMask;
+      if (offset_constant) {
+         mask |= SpvImageOperandsConstOffsetMask;
+      } else {
+         sz_spv_capability(t->m, SpvCapabilityImageGatherExtended);
+         mask |= SpvImageOperandsOffsetMask;
+      }
       values[num_values++] = offset_value;
    }
 
