@@ -460,6 +460,23 @@ sz_infer_def_base(nir_def *def, unsigned depth, enum sz_base *out)
    return false;
 }
 
+/* The base type of a definition, read from the instruction that produced it.
+ *
+ * The alternative -- the base recorded when the def was emitted -- is empty for a
+ * def that has not been emitted yet, and the guess made from its uses is circular
+ * when the only use is the phi being asked about. The producer's own declared
+ * output type has neither problem. */
+static bool
+sz_def_base_from_producer(const nir_def *def, enum sz_base *out)
+{
+   const nir_instr *producer = nir_def_instr_const(def);
+   if (!producer || producer->type != nir_instr_type_alu)
+      return false;
+
+   const nir_alu_instr *alu = nir_instr_as_alu(producer);
+   return sz_base_from_alu_type(nir_op_infos[alu->op].output_type, out);
+}
+
 /* NIR does not record a base type on defs, so instructions that do not carry one
  * -- load_const, undef, and both untyped uniform-buffer loads -- are typed by
  * looking at their uses. GLSL's default for an otherwise ambiguous constant is
@@ -2772,6 +2789,32 @@ sz_emit_phi(struct sz_translate *t, nir_phi_instr *phi)
 {
    struct sz_dtype type = { 0 };
    sz_guess_def_type(t, &phi->def, &type);
+
+   /* The guess is made from the phi's uses, and a phi that merges an induction
+    * variable with an unsigned modulation has uses that cannot agree: the guess
+    * said int while the value coming round the back edge is the uint that
+    * OpUMod produced, and OpPhi's incoming values must all match its result type.
+    * A value's own recorded type is the better evidence -- take it from the first
+    * operand that is not a constant, and let the constants be re-created in that
+    * type below. */
+   nir_foreach_phi_src (src, phi) {
+      if (src->src.ssa == NULL || t->consts[src->src.ssa->index])
+         continue;
+
+      /* Asked of the NIR definition rather than of the type recorded when it was
+       * emitted: a phi's incoming value routinely comes from later in the shader
+       * (the back edge of a loop), so nothing has been recorded for it yet. */
+      struct sz_dtype have = { 0 };
+      sz_guess_def_type(t, src->src.ssa, &have);
+      enum sz_base produced;
+      if (sz_def_base_from_producer(src->src.ssa, &produced))
+         have.base = produced;
+      if (have.base != type.base && have.bits == type.bits &&
+          have.ncomp == type.ncomp)
+         type.base = have.base;
+      break;
+   }
+
    const uint32_t type_id = sz_dtype_type(t, &type);
 
    unsigned entries = 0;
