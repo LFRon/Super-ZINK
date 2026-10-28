@@ -59,7 +59,8 @@
    X(shaderTessellationAndGeometryPointSize)                                    \
    X(occlusionQueryPrecise)                                                     \
    X(pipelineStatisticsQuery)                                                   \
-   X(vertexPipelineStoresAndAtomics)
+   X(vertexPipelineStoresAndAtomics)                                            \
+   X(shaderFloat64)
 
 /* Extension dependency expansion. Every driver that advertises the left-hand
  * extension also advertises its dependencies, but vkCreateDevice validates the

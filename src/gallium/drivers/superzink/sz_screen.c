@@ -720,6 +720,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* ARB_gpu_shader_fp64: the translator's type machinery is width
+       * parametric (sz_scalar_type takes a bit count), so a double is
+       * OpTypeFloat 64 and the arithmetic opcodes are the same ones. Probing. */
+      caps->doubles = screen->caps.core_features.shaderFloat64;
+
       /* ARB_transform_feedback3: four GL streams, each captured into the
        * transform feedback binding of the same index, which is the only
        * arrangement Vulkan allows. sz_decorate_stream_output() emits the Stream

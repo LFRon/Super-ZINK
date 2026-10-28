@@ -31,7 +31,7 @@ static const struct nir_shader_compiler_options sz_nir_options_default = {
    .support_16bit_alu = false,
    .lower_int64_options = ~0,
    .lower_flrp64 = true,
-   .lower_doubles_options = ~0,
+   .lower_doubles_options = 0,
 
    /* SPIR-V has OpFma and GLSL fma() maps onto it directly. */
    .float_mul_add32 = nir_float_muladd_support_has_ffma,
