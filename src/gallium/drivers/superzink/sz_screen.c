@@ -597,8 +597,13 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * look like a driver bug rather than a missing feature. */
    {
       struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
-      caps->glsl_feature_level = 400;
-      caps->glsl_feature_level_compatibility = 400;
+      /* 4.10: tessellation control and evaluation shaders translate, and the
+       * GLSL 4.00 feature set is complete. The number is also what breaks the
+       * version bootstrap -- st_extensions grants ARB_shader_precision on
+       * `GLSLVersion >= 410`, and GLSLVersion is clamped to the version the
+       * context already reached, so 4.1 is unreachable while this says 400. */
+      caps->glsl_feature_level = 410;
+      caps->glsl_feature_level_compatibility = 410;
       caps->max_texture_2d_size = 16384;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
@@ -942,6 +947,15 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       /* GL 3.2 core requires a geometry stage. Vulkan's own floors are far
        * above these numbers, so they are GL's minimums rather than a device
        * query -- the stage works or it does not, and it does. */
+      /* Tessellation: the control and evaluation stages are both translated
+       * (Tessellation execution model, the execution modes the pipeline is
+       * compiled against, the level/coord/invocation builtins and patch
+       * varyings). st grants ARB_tessellation_shader on
+       * shader_caps[TCS].max_instructions alone, and Vulkan's floor for
+       * maxTessellationPatchSize is 32. */
+      caps->max_shader_patch_varyings = 32;
+      caps->glsl_tess_levels_as_inputs = true;
+
       caps->max_geometry_output_vertices = 256;
       caps->max_geometry_total_output_components = 1024;
       caps->max_gs_invocations = 32;
@@ -972,6 +986,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * them and makes cso_context call their bind_* entry points, and neither has
     * a translation yet. */
    const mesa_shader_stage supported_stages[] = {MESA_SHADER_VERTEX,
+                                                 MESA_SHADER_TESS_CTRL,
+                                                 MESA_SHADER_TESS_EVAL,
                                                  MESA_SHADER_GEOMETRY,
                                                  MESA_SHADER_FRAGMENT};
    for (unsigned i = 0; i < ARRAY_SIZE(supported_stages); i++) {
