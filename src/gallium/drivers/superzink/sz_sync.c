@@ -212,9 +212,10 @@ sz_image_layer_count(const struct sz_resource *res)
       return VK_REMAINING_ARRAY_LAYERS;
    case PIPE_TEXTURE_CUBE:
    case PIPE_TEXTURE_CUBE_ARRAY:
-      /* Gallium reports array_size 1 for a plain cube, but a cube is six
-       * layers. */
-      return res->base.array_size * 6;
+      /* Gallium counts a cube's six faces in array_size, so no multiplication
+       * happens here -- doing it once too often made every barrier on a cube map
+       * describe six times the layers the image has. */
+      return MAX2(res->base.array_size, 1);
    default:
       return MAX2(res->base.array_size, 1);
    }

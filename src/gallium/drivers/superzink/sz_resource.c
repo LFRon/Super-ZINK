@@ -264,12 +264,11 @@ sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
    const unsigned levels = MAX2(tmpl->last_level + 1, 1);
    const unsigned layers = MAX2(tmpl->array_size, 1);
 
-   /* A cube is six layers; PIPE_TEXTURE_CUBE reports array_size 1. */
-   const bool cube = tmpl->target == PIPE_TEXTURE_CUBE ||
-                     tmpl->target == PIPE_TEXTURE_CUBE_ARRAY;
-   const unsigned depth = type == VK_IMAGE_TYPE_3D ? MAX2(tmpl->depth0, 1)
-                          : cube                      ? 6
-                                                      : layers;
+   /* Only a 3D image has depth; for every 1D, 2D, array and cube target Vulkan
+    * requires extent.depth to be 1 and puts the layers in arrayLayers instead
+    * (VUID-VkImageCreateInfo-imageType-00957). Gallium already counts a cube as
+    * six layers in array_size, so the two agree without any special case. */
+   const unsigned depth = type == VK_IMAGE_TYPE_3D ? MAX2(tmpl->depth0, 1) : 1;
 
    return (VkImageCreateInfo) {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,

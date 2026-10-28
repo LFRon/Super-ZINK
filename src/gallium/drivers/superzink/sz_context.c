@@ -2842,7 +2842,10 @@ sz_copy_job_record(struct sz_context *ctx, VkCommandBuffer cmd, void *user)
       .imageExtent = {
          job->box.width,
          job->box.height,
-         job->box.depth,
+         /* For a layered image the box's depth is a layer count and belongs in
+          * imageSubresource above; extent.depth must be 1 for every non-3D
+          * target (VUID-vkCmdCopyImageToBuffer-srcImage-07980). */
+         is_3d ? job->box.depth : 1,
       },
    };
 

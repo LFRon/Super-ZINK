@@ -66,22 +66,26 @@ sz_blit_subresource(const struct pipe_resource *res, unsigned level,
    };
 }
 
-/* Positive extent of a box, which is what Vulkan wants for a resolve. */
+/* Positive extent of a box, which is what Vulkan wants for a resolve.
+ *
+ * For a layered target the box's depth is a layer count, and Vulkan keeps that in
+ * imageSubresourceLayers: for a 1D or 2D image extent.depth has to be 1
+ * (VUID-vkCmdBlitImage2-pRegions-00217). Only a 3D image has depth here. */
 static VkExtent3D
-sz_box_extent(const struct pipe_box *box)
+sz_box_extent(const struct pipe_box *box, bool is_3d)
 {
    return (VkExtent3D) {
       .width = abs(box->width),
       .height = abs(box->height),
-      .depth = abs(box->depth),
+      .depth = is_3d ? abs(box->depth) : 1,
    };
 }
 
 static bool
 sz_box_equals(const struct pipe_box *a, const struct pipe_box *b)
 {
-   const VkExtent3D ea = sz_box_extent(a);
-   const VkExtent3D eb = sz_box_extent(b);
+   const VkExtent3D ea = sz_box_extent(a, true);
+   const VkExtent3D eb = sz_box_extent(b, true);
    return ea.width == eb.width && ea.height == eb.height && ea.depth == eb.depth;
 }
 
@@ -101,7 +105,7 @@ sz_blit_resolve(struct sz_context *ctx, VkCommandBuffer cmd,
       .sType = VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2,
       .srcOffset = src_off[0],
       .dstOffset = dst_off[0],
-      .extent = sz_box_extent(&info->src.box),
+      .extent = sz_box_extent(&info->src.box, src_3d),
    };
    sz_blit_subresource(info->src.resource, info->src.level, &info->src.box,
                        aspect, &region.srcSubresource);
@@ -167,9 +171,11 @@ sz_blit_copy(struct sz_context *ctx, VkCommandBuffer cmd,
              const struct pipe_blit_info *info, struct sz_resource *src,
              struct sz_resource *dst, VkImageAspectFlags aspect)
 {
+   const bool src_3d = info->src.resource->target == PIPE_TEXTURE_3D;
+
    VkImageCopy2 region = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
-      .extent = sz_box_extent(&info->src.box),
+      .extent = sz_box_extent(&info->src.box, src_3d),
       .srcOffset = { info->src.box.x, info->src.box.y, 0 },
       .dstOffset = { info->dst.box.x, info->dst.box.y, 0 },
    };
