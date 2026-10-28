@@ -596,6 +596,31 @@ sz_guess_def_type(struct sz_translate *t, const nir_def *def,
 /* Variables                                                                 */
 /* ------------------------------------------------------------------------- */
 
+/* Whether an interface variable is a builtin rather than a user varying.
+ *
+ * The slot number is not enough on its own: a tessellation pipeline numbers its
+ * per-vertex varyings from zero, so an ordinary varying can arrive at slot 0 --
+ * numerically VARYING_SLOT_POS -- in a shader that also has a real gl_Position.
+ *
+ * Two naming conventions have to be recognised. A builtin the frontend keeps by
+ * name is called `gl_*` (gl_Position on the output side, gl_PerVertex members).
+ * A builtin that the state tracker lowered into an array of per-vertex values --
+ * gl_in[].gl_Position in a geometry or tessellation shader -- is called by its
+ * slot name instead, which is why a plain VARYING_SLOT_POS shows up in the NIR
+ * where the source wrote gl_in. A user varying is called whatever the shader
+ * called it. */
+static bool
+sz_is_builtin_var(const nir_variable *var)
+{
+   if (!var->name)
+      return true;
+   if (strncmp(var->name, "gl_", 3) == 0)
+      return true;
+   if (strncmp(var->name, "VARYING_SLOT_", 13) == 0)
+      return true;
+   return false;
+}
+
 static bool
 sz_varying_location(struct sz_translate *t, const nir_variable *var,
                     SpvBuiltIn *builtin, bool *has_builtin, unsigned *location)
@@ -629,9 +654,16 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
          return true;
       }
 
-      if (slot == VARYING_SLOT_POS) {
-         /* gl_FragCoord in a fragment shader, gl_in[].gl_Position in a geometry
-          * shader: the same slot, two different builtins. */
+      /* gl_FragCoord in a fragment shader, gl_in[].gl_Position in a geometry
+       * shader: the same slot, two different builtins.
+       *
+       * The slot number alone is not enough. A tessellation pipeline renumbers
+       * its per-vertex varyings from zero, so an ordinary varying can arrive at
+       * slot 0 -- numerically VARYING_SLOT_POS -- in the same shader that also
+       * has a real gl_Position. What tells them apart is the name, and it is the
+       * same rule the rest of this file and the GLSL linker use: a builtin's name
+       * starts with "gl_". A varying that lost its name is not a builtin. */
+      if (slot == VARYING_SLOT_POS && sz_is_builtin_var(var)) {
          *builtin = frag ? SpvBuiltInFragCoord : SpvBuiltInPosition;
          *has_builtin = true;
          return true;
@@ -698,7 +730,9 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
       }
    } else {
       if (!frag) {
-         if (slot == VARYING_SLOT_POS) {
+         /* Same name rule as the input side: a tessellation pipeline can hand a
+          * plain varying the slot that numbers gl_Position. */
+         if (slot == VARYING_SLOT_POS && sz_is_builtin_var(var)) {
             /* SpvBuiltInPosition is zero, so the builtin value cannot double as
              * its own "was set" flag. */
             *builtin = SpvBuiltInPosition;
@@ -4604,11 +4638,18 @@ sz_nir_to_spirv(struct nir_shader *nir,
       t.interfaces[t.num_interfaces++] = t.vars[t.num_vars - 1].id;
    }
 
-   if (t.used_legacy_varying && t.used_generic_varying) {
-      sz_fail(&t, "mixes legacy (`gl_TexCoord` style) and generic varyings, "
-                  "which would share locations");
-      goto fail;
-   }
+   /* Legacy (`gl_TexCoord` style) and generic varyings are numbered in two
+    * separate spaces in GL, and this driver maps both onto the same Location
+    * range, so mixing them can collide. It need not: a tessellation pipeline
+    * hands its per-vertex varyings slots below VARYING_SLOT_VAR0 while its patch
+    * varyings sit at VARYING_SLOT_PATCH0, and neither shares a number with the
+    * other. Duplicate Locations are a hard SPIR-V rule that spirv-val enforces
+    * with a message naming the variable, so the check is left to it rather than
+    * refusing a combination that is legal. */
+   /* Both flags are still recorded because they document which spaces the
+    * shader drew from; nothing is rejected on their account any more. */
+   (void)t.used_legacy_varying;
+   (void)t.used_generic_varying;
 
    const uint32_t function = sz_spv_id(t.m);
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
