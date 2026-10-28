@@ -191,7 +191,19 @@ struct sz_context {
     * target count means the draws recorded from now on capture. */
    unsigned num_so_targets;
    struct pipe_stream_output_target *so_targets[PIPE_MAX_SO_BUFFERS];
+   /* Where each capture starts, in bytes from the target's own buffer_offset.
+    * `UINT_MAX` is Gallium's "append": continue where the previous capture into
+    * this slot stopped, which is what glBeginTransformFeedback does on a second
+    * pass and what cso_restore_stream_outputs passes when it rebinds. */
    unsigned so_offsets[PIPE_MAX_SO_BUFFERS];
+   /* Which counter slots have to be zeroed before the next capture. A slot with
+    * an explicit offset starts there, so its counter is reset; an appending slot
+    * keeps whatever the previous capture left, which is how the position
+    * survives across the batches a flush splits a capture into. */
+   bool so_counter_reset[PIPE_MAX_SO_BUFFERS];
+   /* The target each slot held last time, to notice a rebind: a different buffer
+    * has no meaningful counter to continue from. */
+   struct pipe_stream_output_target *so_prev_targets[PIPE_MAX_SO_BUFFERS];
    /* Vulkan only captures through the counter-buffer path: the begin call
     * loads the initial dword offset from a counter buffer, and a capture with
     * no counters at all is silently dropped by the driver. One 4-byte slot per

@@ -670,6 +670,15 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* Transform feedback pause and resume. Gallium has no pause entry point:
+       * the state tracker implements glPauseTransformFeedback by unbinding the
+       * targets, so a driver supports it exactly when binding zero targets stops
+       * a capture -- which it does here, because the capture bracket is emitted
+       * per batch from num_so_targets. What pause did need was the counter
+       * surviving the flush that unbinding forces, and an appending rebind
+       * passing UINT_MAX into the byte arithmetic. */
+      caps->stream_output_pause_resume = true;
+
       /* Not claimed: per-sample shading needs a multisampled *renderbuffer* to
        * resolve into its texture, and that resolve arrives as a blit from one
        * multisampled image to another -- which Vulkan cannot do at all, and

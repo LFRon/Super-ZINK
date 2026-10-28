@@ -1867,15 +1867,35 @@ sz_set_stream_output_targets(struct pipe_context *pipe, unsigned num_targets,
    sz_draw_flush(ctx);
 
    const unsigned n = MIN2(num_targets, PIPE_MAX_SO_BUFFERS);
+   bool any_reset = false;
+
    for (unsigned i = 0; i < n; i++) {
+      /* `offsets[i] == UINT_MAX` means append, and it must not reach the byte
+       * arithmetic: taken as an offset it would put the capture four gigabytes
+       * into a buffer that is not that long. */
+      const unsigned offset = offsets ? offsets[i] : 0;
+      const bool append = offset == UINT_MAX;
+
+      /* A slot that points at a different buffer cannot continue the old
+       * counter: it counted bytes into the buffer that was there before. */
+      const bool rebound = ctx->so_prev_targets[i] != targets[i];
+
       pipe_so_target_reference(&ctx->so_targets[i], targets[i]);
-      ctx->so_offsets[i] = offsets ? offsets[i] : 0;
+      pipe_so_target_reference(&ctx->so_prev_targets[i], targets[i]);
+      ctx->so_offsets[i] = append ? UINT_MAX : offset;
+      ctx->so_counter_reset[i] = !append || rebound;
+      any_reset |= ctx->so_counter_reset[i];
    }
-   for (unsigned i = n; i < PIPE_MAX_SO_BUFFERS; i++)
+   for (unsigned i = n; i < PIPE_MAX_SO_BUFFERS; i++) {
       pipe_so_target_reference(&ctx->so_targets[i], NULL);
+      pipe_so_target_reference(&ctx->so_prev_targets[i], NULL);
+   }
 
    ctx->num_so_targets = n;
-   ctx->so_counter_dirty = n > 0;
+   /* Only a capture whose counters actually need zeroing pays for it: it forces
+    * the render pass closed, and a capture that spans many batches would
+    * otherwise restart at its own beginning every time. */
+   ctx->so_counter_dirty = any_reset;
    (void)output_prim;
 }
 
@@ -2178,9 +2198,13 @@ sz_so_counter_zero(struct sz_context *ctx, VkCommandBuffer cmd)
    if (ctx->num_so_targets == 0 || !sz_so_counter_ensure(ctx))
       return;
 
-   for (unsigned i = 0; i < ctx->num_so_targets; i++)
+   for (unsigned i = 0; i < ctx->num_so_targets; i++) {
+      if (!ctx->so_counter_reset[i])
+         continue;
       ctx->screen->vk.CmdFillBuffer(cmd, ctx->so_counter_buffer,
                                     i * sizeof(uint32_t), sizeof(uint32_t), 0);
+      ctx->so_counter_reset[i] = false;
+   }
 
    const VkMemoryBarrier2 fill_barrier = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -2376,7 +2400,8 @@ sz_draw_flush(struct sz_context *ctx)
          if (res->buffer == VK_NULL_HANDLE)
             continue;
          buffers[n] = res->buffer;
-         offsets[n] = t->buffer_offset + ctx->so_offsets[i];
+         offsets[n] = t->buffer_offset +
+                      (ctx->so_offsets[i] == UINT_MAX ? 0 : ctx->so_offsets[i]);
          n++;
       }
 
@@ -3161,8 +3186,10 @@ sz_context_destroy(struct pipe_context *pipe)
          pipe_sampler_view_reference(&ctx->state.sampler_views[sh][i], NULL);
    }
 
-   for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++)
+   for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++) {
       pipe_so_target_reference(&ctx->so_targets[i], NULL);
+      pipe_so_target_reference(&ctx->so_prev_targets[i], NULL);
+   }
 
    if (ctx->so_counter_buffer != VK_NULL_HANDLE) {
       sz_bo_free(ctx->so_counter_bo);
