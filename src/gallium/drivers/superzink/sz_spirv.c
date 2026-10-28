@@ -554,6 +554,16 @@ sz_spv_execution_mode(struct sz_spv_module *m, uint32_t function,
 }
 
 void
+sz_spv_execution_mode_literal(struct sz_spv_module *m, uint32_t function,
+                              SpvExecutionMode mode, uint32_t value)
+{
+   /* OpExecutionModeId would take an id; OutputVertices and Invocations are
+    * literals, which is what a geometry shader's declared counts are. */
+   const uint32_t ops[] = { function, mode, value };
+   sz_spv_emit_simple(m, SEC_EXECUTION_MODES, SpvOpExecutionMode, ops, 3);
+}
+
+void
 sz_spv_entry_point(struct sz_spv_module *m, SpvExecutionModel model,
                    uint32_t function, const char *name,
                    const uint32_t *interface, unsigned interface_count)
@@ -812,6 +822,18 @@ sz_spv_raw_function_op(struct sz_spv_module *m, SpvOp opcode,
                        const uint32_t *operands, unsigned count)
 {
    sz_spv_emit_simple(m, SEC_FUNCTIONS, opcode, operands, count);
+}
+
+void
+sz_spv_emit_vertex(struct sz_spv_module *m)
+{
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpEmitVertex, NULL, 0);
+}
+
+void
+sz_spv_end_primitive(struct sz_spv_module *m)
+{
+   sz_spv_emit_simple(m, SEC_FUNCTIONS, SpvOpEndPrimitive, NULL, 0);
 }
 
 void

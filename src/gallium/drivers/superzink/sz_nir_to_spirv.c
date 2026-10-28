@@ -61,6 +61,10 @@ struct sz_dtype {
    enum sz_base base;
    unsigned bits;
    unsigned ncomp;
+   /* Non-zero when this is an array of `ncomp`-wide values. Only one level is
+    * ever needed: the arrays that reach the translator are a geometry shader's
+    * per-vertex inputs, which GL itself limits to one array dimension. */
+   unsigned array_len;
 };
 
 struct sz_translate {
@@ -169,6 +173,10 @@ struct sz_translate {
 };
 
 static bool sz_emit_instr(struct sz_translate *t, nir_instr *instr);
+static uint32_t sz_def_value(struct sz_translate *t, const nir_def *def);
+static uint32_t sz_bitcast_to(struct sz_translate *t, uint32_t id,
+                              const struct sz_dtype *from,
+                              const struct sz_dtype *to);
 static bool sz_emit_phi(struct sz_translate *t, nir_phi_instr *phi);
 static void sz_emit_cf_list_from(struct sz_translate *t, struct exec_list *list,
                                  nir_cf_node *after, uint32_t fallthrough,
@@ -296,15 +304,37 @@ static uint32_t
 sz_dtype_type(struct sz_translate *t, const struct sz_dtype *type)
 {
    const uint32_t scalar = sz_scalar_type(t, type->base, type->bits);
-   if (type->ncomp == 1)
-      return scalar;
-   return sz_spv_type_vec(t->m, scalar, type->ncomp);
+   const uint32_t element = type->ncomp == 1
+                               ? scalar
+                               : sz_spv_type_vec(t->m, scalar, type->ncomp);
+
+   if (type->array_len > 0)
+      return sz_spv_type_array(t->m, element, type->array_len);
+
+   return element;
 }
 
 static bool
 sz_dtype_from_glsl(struct sz_translate *t, const struct glsl_type *glsl,
                    struct sz_dtype *out)
 {
+   out->array_len = 0;
+
+   /* One level of array, which is what a geometry shader's per-vertex inputs
+    * are. Nested arrays and structs would need the OpTypeArray recursion and a
+    * member-offset scheme that nothing here asks for yet. */
+   if (glsl_type_is_array(glsl)) {
+      const struct glsl_type *elem = glsl_get_array_element(glsl);
+      if (glsl_type_is_array(elem) || glsl_type_is_struct_or_ifc(elem) ||
+          glsl_type_is_matrix(elem)) {
+         sz_fail(t, "unsupported array element type in `%s`",
+                 glsl_get_type_name(glsl));
+         return false;
+      }
+      out->array_len = glsl_get_length(glsl);
+      glsl = elem;
+   }
+
    if (glsl_type_is_array(glsl) || glsl_type_is_struct_or_ifc(glsl) ||
        glsl_type_is_matrix(glsl)) {
       sz_fail(t, "unsupported shader variable type `%s`",
@@ -440,8 +470,15 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
    const bool frag = t->nir->info.stage == MESA_SHADER_FRAGMENT;
    *has_builtin = false;
 
+   const bool vertex = t->nir->info.stage == MESA_SHADER_VERTEX;
+
    if (var->data.mode == nir_var_shader_in) {
-      if (!frag) {
+      /* A geometry shader's inputs are the previous stage's *outputs*, not
+       * vertex attributes, so they follow the varying rules below. Ranking them
+       * among the shader's inputs -- the vertex rule -- would declare
+       * gl_in[].gl_Position at Location 0 and break the interface with the
+       * vertex stage. */
+      if (!frag && vertex) {
          /* Vertex elements are packed in slot order, so the element index of an
           * attribute is its rank among the attributes the shader reads, not the
           * slot itself: st_atom_array.cpp places elements with
@@ -459,7 +496,9 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
       }
 
       if (slot == VARYING_SLOT_POS) {
-         *builtin = SpvBuiltInFragCoord;
+         /* gl_FragCoord in a fragment shader, gl_in[].gl_Position in a geometry
+          * shader: the same slot, two different builtins. */
+         *builtin = frag ? SpvBuiltInFragCoord : SpvBuiltInPosition;
          *has_builtin = true;
          return true;
       }
@@ -616,7 +655,7 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
       return false;
    }
 
-   struct sz_dtype type;
+   struct sz_dtype type = { 0 };
    if (!sz_dtype_from_glsl(t, var->type, &type))
       return false;
 
@@ -701,9 +740,47 @@ sz_emit_deref(struct sz_translate *t, nir_deref_instr *deref)
       return sz_emit_deref(t, parent);
    }
 
+   case nir_deref_type_array: {
+      /* One element of an array variable: OpAccessChain with the index. The
+       * result pointer type comes from the deref itself, which NIR has already
+       * computed, so nothing here has to re-derive the element type. */
+      nir_deref_instr *parent = nir_src_as_deref(deref->parent);
+      if (!parent) {
+         sz_fail(t, "array deref without a deref parent");
+         return 0;
+      }
+      const uint32_t base = sz_emit_deref(t, parent);
+      if (!base)
+         return 0;
+
+      struct sz_dtype elem_type = { 0 };
+      if (!sz_dtype_from_glsl(t, deref->type, &elem_type))
+         return 0;
+      elem_type.array_len = 0;
+
+      uint32_t index = sz_def_value(t, deref->arr.index.ssa);
+      if (index == 0)
+         return 0;
+
+      /* The index must be a 32-bit int; an index built from a float or a
+       * differently-typed constant is reinterpreted rather than trusted. */
+      const struct sz_dtype want = { SZ_BASE_INT, 32, 1, 0 };
+      const uint32_t cast =
+         sz_bitcast_to(t, index, &t->def_types[deref->arr.index.ssa->index],
+                       &want);
+      if (cast)
+         index = cast;
+
+      const uint32_t ptr_type =
+         sz_spv_type_ptr(t->m, SpvStorageClassInput, sz_dtype_type(t, &elem_type));
+
+      /* The storage class follows the parent variable, not the deref: a chain
+       * into a uniform or an input keeps that class. */
+      return sz_spv_access_chain(t->m, ptr_type, base, &index, 1);
+   }
+
    default:
-      sz_fail(t, "unsupported deref type %d (arrays and structs come with "
-                 "descriptors)",
+      sz_fail(t, "unsupported deref type %d (structs come with descriptors)",
               (int)deref->deref_type);
       return 0;
    }
@@ -939,7 +1016,7 @@ static void
 sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
 {
    const nir_op op = alu->op;
-   struct sz_dtype dst;
+   struct sz_dtype dst = { 0 };
    dst.bits = alu->def.bit_size;
    dst.ncomp = alu->def.num_components;
 
@@ -1148,7 +1225,7 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
 static void
 sz_emit_load_const(struct sz_translate *t, nir_load_const_instr *lconst)
 {
-   struct sz_dtype type;
+   struct sz_dtype type = { 0 };
    sz_guess_def_type(t, &lconst->def, &type);
 
    const uint32_t scalar = sz_scalar_type(t, type.base, type.bits);
@@ -1380,7 +1457,7 @@ sz_emit_load_deref(struct sz_translate *t, nir_intrinsic_instr *intrin)
    if (!ptr)
       return;
 
-   struct sz_dtype type;
+   struct sz_dtype type = { 0 };
    if (!sz_dtype_from_glsl(t, deref->type, &type))
       return;
 
@@ -1441,7 +1518,7 @@ sz_emit_store_deref(struct sz_translate *t, nir_intrinsic_instr *intrin)
    if (!ptr)
       return;
 
-   struct sz_dtype dst_type;
+   struct sz_dtype dst_type = { 0 };
    if (!sz_dtype_from_glsl(t, deref->type, &dst_type))
       return;
 
@@ -1903,11 +1980,59 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
 
    switch (tex->op) {
    case nir_texop_txs: {
-      const uint32_t level = lod ? sz_def_value(t, lod)
-                                 : sz_spv_const_int32(t->m, 0);
-      if (level == 0)
-         return;
+      uint32_t level = sz_spv_const_int32(t->m, 0);
+      if (lod) {
+         level = sz_def_value(t, lod);
+         if (level == 0)
+            return;
+         /* The Lod operand must be a 32-bit int scalar; a value loaded from the
+          * untyped uniform block carries whatever base the translator guessed,
+          * so it is reinterpreted here rather than trusted. */
+         const struct sz_dtype want = { SZ_BASE_INT, 32, 1, 0 };
+         const uint32_t cast =
+            sz_bitcast_to(t, level, &t->def_types[lod->index], &want);
+         if (cast)
+            level = cast;
+      }
       const uint32_t ops[] = { image, level };
+
+      /* An aliased 1D shadow texture is a 2D image, so the query answers with
+       * one more component than the shader asked for: (width, height) instead
+       * of (width), and (width, height, layers) instead of (width, layers). The
+       * extra component is the one-texel row, so it is dropped -- asking with
+       * the shader's own narrow type instead would be a type mismatch between
+       * the instruction's result and the query's. */
+      if (alias_2d) {
+         const unsigned wide = tex->is_array ? 3 : 2;
+         const uint32_t int_type = sz_spv_type_int32(t->m);
+         const uint32_t wide_type =
+            sz_spv_type_vec(t->m, int_type, wide);
+
+         const uint32_t queried =
+            sz_spv_alu(t->m, SpvOpImageQuerySizeLod, wide_type, ops, 2);
+
+         /* OpCompositeExtract's indices are literals, not ids. */
+         const unsigned zero_idx = 0;
+         const unsigned last_idx = wide - 1;
+
+         uint32_t comps[2];
+         unsigned n = 0;
+         comps[n++] =
+            sz_spv_composite_extract(t->m, int_type, queried, &zero_idx, 1);
+         if (tex->is_array) {
+            /* The layer count is the last component; index 1 is the height. */
+            comps[n++] =
+               sz_spv_composite_extract(t->m, int_type, queried, &last_idx, 1);
+         }
+
+         t->defs_id[tex->def.index] =
+            n == 1 ? comps[0]
+                   : sz_spv_composite_construct(
+                        t->m, sz_spv_type_vec(t->m, int_type, n), comps, n);
+         t->def_types[tex->def.index] = (struct sz_dtype){ SZ_BASE_INT, 32, n, 0 };
+         return;
+      }
+
       const uint32_t value =
          sz_spv_alu(t->m,
                     dim == SpvDimBuffer ? SpvOpImageQuerySize
@@ -2198,6 +2323,27 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
    case nir_intrinsic_ddy_coarse:
       sz_emit_derivative(t, intrin);
       return true;
+   case nir_intrinsic_emit_vertex:
+      /* OpEmitVertex takes no operands: it emits whatever the output variables
+       * currently hold, which is exactly GL's EmitVertex(). */
+      sz_spv_emit_vertex(t->m);
+      return true;
+
+   case nir_intrinsic_end_primitive:
+      sz_spv_end_primitive(t->m);
+      return true;
+
+   case nir_intrinsic_load_primitive_id: {
+      /* gl_PrimitiveIDIn, which Vulkan spells PrimitiveId. Declared on first
+       * use for the same reason the other builtins are. */
+      const uint32_t value = sz_load_builtin_int(t, SpvBuiltInPrimitiveId);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_INT, 32, 1, 0 };
+      return true;
+   }
+
    case nir_intrinsic_load_vertex_id:
    case nir_intrinsic_load_instance_id: {
       const SpvBuiltIn builtin = intrin->intrinsic == nir_intrinsic_load_vertex_id
@@ -2262,7 +2408,7 @@ sz_emit_instr(struct sz_translate *t, nir_instr *instr)
       return true;
    case nir_instr_type_undef: {
       nir_undef_instr *undef = nir_instr_as_undef(instr);
-      struct sz_dtype type;
+      struct sz_dtype type = { 0 };
       sz_guess_def_type(t, &undef->def, &type);
       t->defs_id[undef->def.index] = sz_spv_undef(t->m, sz_dtype_type(t, &type));
       t->def_types[undef->def.index] = type;
@@ -2336,7 +2482,7 @@ sz_const_as(struct sz_translate *t, const nir_load_const_instr *lconst,
 static bool
 sz_emit_phi(struct sz_translate *t, nir_phi_instr *phi)
 {
-   struct sz_dtype type;
+   struct sz_dtype type = { 0 };
    sz_guess_def_type(t, &phi->def, &type);
    const uint32_t type_id = sz_dtype_type(t, &type);
 
@@ -2901,6 +3047,9 @@ sz_nir_to_spirv(struct nir_shader *nir,
    case MESA_SHADER_VERTEX:
       model = SpvExecutionModelVertex;
       break;
+   case MESA_SHADER_GEOMETRY:
+      model = SpvExecutionModelGeometry;
+      break;
    case MESA_SHADER_FRAGMENT:
       model = SpvExecutionModelFragment;
       break;
@@ -2934,6 +3083,68 @@ sz_nir_to_spirv(struct nir_shader *nir,
    const uint32_t function = sz_spv_id(t.m);
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       sz_spv_execution_mode(t.m, function, SpvExecutionModeOriginUpperLeft);
+
+   /* A geometry shader has to declare both of its primitives and how many
+    * vertices it may emit, because the pipeline is compiled against them: Vulkan
+    * has no default and a missing mode is a validation error, while a wrong one
+    * silently assembles the wrong primitive. */
+   if (nir->info.stage == MESA_SHADER_GEOMETRY) {
+      /* The Geometry execution model is only valid with this capability. */
+      sz_spv_capability(t.m, SpvCapabilityGeometry);
+
+      SpvExecutionMode input, output;
+
+      switch (nir->info.gs.input_primitive) {
+      case MESA_PRIM_POINTS:
+         input = SpvExecutionModeInputPoints;
+         break;
+      case MESA_PRIM_LINES:
+         input = SpvExecutionModeInputLines;
+         break;
+      case MESA_PRIM_LINES_ADJACENCY:
+         input = SpvExecutionModeInputLinesAdjacency;
+         break;
+      case MESA_PRIM_TRIANGLES:
+         input = SpvExecutionModeTriangles;
+         break;
+      case MESA_PRIM_TRIANGLES_ADJACENCY:
+         input = SpvExecutionModeInputTrianglesAdjacency;
+         break;
+      default:
+         sz_fail(&t, "geometry input primitive %d is not supported",
+                 (int)nir->info.gs.input_primitive);
+         goto fail;
+      }
+
+      switch (nir->info.gs.output_primitive) {
+      case MESA_PRIM_POINTS:
+         output = SpvExecutionModeOutputPoints;
+         break;
+      case MESA_PRIM_LINE_STRIP:
+         output = SpvExecutionModeOutputLineStrip;
+         break;
+      case MESA_PRIM_TRIANGLE_STRIP:
+         output = SpvExecutionModeOutputTriangleStrip;
+         break;
+      default:
+         sz_fail(&t, "geometry output primitive %d is not supported",
+                 (int)nir->info.gs.output_primitive);
+         goto fail;
+      }
+
+      sz_spv_execution_mode(t.m, function, input);
+      sz_spv_execution_mode(t.m, function, output);
+      sz_spv_execution_mode_literal(t.m, function, SpvExecutionModeOutputVertices,
+                                    nir->info.gs.vertices_out);
+
+      /* Invocations is not optional: the pipeline creation rule is "the entry
+       * point must specify an invocation count greater than zero", so a shader
+       * that says nothing is rejected rather than defaulted to one
+       * (VUID-VkPipelineShaderStageCreateInfo-stage-00715). */
+      sz_spv_execution_mode_literal(
+         t.m, function, SpvExecutionModeInvocations,
+         MAX2(nir->info.gs.invocations, 1));
+   }
    /* Vulkan refuses to begin transform feedback for a pipeline whose last
     * pre-rasterization stage does not declare the Xfb execution mode
     * (VUID-vkCmdBeginTransformFeedbackEXT-None-04128). The per-variable

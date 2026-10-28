@@ -28,7 +28,7 @@
  * the layout cannot hold three stages and still stay inside the 32 descriptors
  * every device is guaranteed (see SZ_DESCRIPTOR_STAGES). */
 static const mesa_shader_stage sz_descriptor_stages[SZ_DESCRIPTOR_STAGES] = {
-   MESA_SHADER_VERTEX, MESA_SHADER_FRAGMENT,
+   MESA_SHADER_VERTEX, MESA_SHADER_GEOMETRY, MESA_SHADER_FRAGMENT,
 };
 
 static bool
@@ -381,17 +381,6 @@ sz_descriptor_db_init(struct sz_screen *screen)
 bool
 sz_descriptor_screen_init(struct sz_screen *screen, unsigned max_push_descriptors)
 {
-   /* VUID 00281: the layout's total descriptor count may not exceed
-    * maxPushDescriptors. The layout is fixed, so this is a screen-creation
-    * decision rather than something a draw can work around. */
-   if (max_push_descriptors != 0 &&
-       max_push_descriptors < SZ_DESCRIPTOR_UBO_BINDINGS) {
-      mesa_loge("SZ: the device pushes only %u descriptors, but the uniform "
-                "buffer layout needs %u", max_push_descriptors,
-                SZ_DESCRIPTOR_UBO_BINDINGS);
-      return false;
-   }
-
    if (!sz_descriptor_layout_create(screen, screen->descriptor_set_layout))
       return false;
 

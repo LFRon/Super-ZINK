@@ -62,12 +62,17 @@
  * Set 1 is a plain descriptor set and holds the combined image samplers, which
  * are updated and bound only when the sampler state itself changes.
  *
- * A third kind (shader buffers or images) takes a third set; more than 32 of one
- * kind is where VK_EXT_descriptor_buffer becomes the answer. */
+ * Three stages, because GL 3.2's geometry stage binds its own constant buffers
+ * and samples its own textures. That puts the two sets at 42 and 48 bindings,
+ * which is past the 32 a push descriptor set is guaranteed to hold -- so a
+ * device without VK_EXT_descriptor_buffer can no longer be driven, and says so
+ * at screen creation instead of failing at the first draw.
+ *
+ * A fourth kind (shader buffers or images) takes a third set. */
 #define SZ_DESCRIPTOR_SET_UBO 0
 #define SZ_DESCRIPTOR_SET_SAMPLERS 1
 #define SZ_DESCRIPTOR_SET_COUNT 2
-#define SZ_DESCRIPTOR_STAGES 2
+#define SZ_DESCRIPTOR_STAGES 3
 #define SZ_DESCRIPTOR_UBO_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_CONST_BUFFERS)
 #define SZ_DESCRIPTOR_SAMPLER_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
 
@@ -92,8 +97,10 @@ sz_descriptor_stage_index(mesa_shader_stage stage)
    switch (stage) {
    case MESA_SHADER_VERTEX:
       return 0;
-   case MESA_SHADER_FRAGMENT:
+   case MESA_SHADER_GEOMETRY:
       return 1;
+   case MESA_SHADER_FRAGMENT:
+      return 2;
    default:
       return SZ_DESCRIPTOR_STAGES;
    }

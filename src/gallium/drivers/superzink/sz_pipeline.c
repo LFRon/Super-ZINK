@@ -209,6 +209,8 @@ sz_pipeline_destroy_objects(struct sz_screen *screen, struct sz_gfx_pipeline *p)
     * pipeline itself belong to the one pipeline that was built with them. */
    if (p->vs != VK_NULL_HANDLE)
       screen->vk.DestroyShaderModule(screen->dev, p->vs, NULL);
+   if (p->gs != VK_NULL_HANDLE)
+      screen->vk.DestroyShaderModule(screen->dev, p->gs, NULL);
    if (p->fs != VK_NULL_HANDLE)
       screen->vk.DestroyShaderModule(screen->dev, p->fs, NULL);
    memset(p, 0, sizeof(*p));
@@ -296,6 +298,10 @@ sz_pipeline_module(struct sz_context *ctx, mesa_shader_stage stage)
    const struct sz_state *shader = ctx->state.shaders[stage];
 
    if (!shader || !shader->u.shader.spirv) {
+      /* No fallback for geometry: the caller only asks for a GS module when one
+       * is bound, so reaching here means the binding is broken. */
+      if (stage == MESA_SHADER_GEOMETRY)
+         return VK_NULL_HANDLE;
       return stage == MESA_SHADER_VERTEX ? sz_pipeline_bootstrap_vs(screen)
                                          : sz_pipeline_bootstrap_fs(screen);
    }
@@ -631,25 +637,45 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
    if (p->vs == VK_NULL_HANDLE || p->fs == VK_NULL_HANDLE)
       goto fail;
 
+   /* A geometry stage is part of the pipeline only when one is bound. There is
+    * no bootstrap fallback for it: an empty GS is exactly "no GS", and GL 3.2
+    * apps are free not to use one. */
+   p->gs = ctx->state.shaders[MESA_SHADER_GEOMETRY]
+              ? sz_pipeline_module(ctx, MESA_SHADER_GEOMETRY)
+              : VK_NULL_HANDLE;
+   if (p->gs == VK_NULL_HANDLE && ctx->state.shaders[MESA_SHADER_GEOMETRY])
+      goto fail;
+
    /* ADR-008/005c: the pipeline layout is the push-descriptor layout and is
     * created once per screen. It depends only on the descriptor set layout, so
     * a per-pipeline copy was pure overhead -- and creating one per rebuild was
     * a measurable part of the cost of a state change. */
    VkResult result;
 
-   const VkPipelineShaderStageCreateInfo stages[] = {
-      {
+   VkPipelineShaderStageCreateInfo stages[3];
+   unsigned stage_count = 0;
+
+   stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .stage = VK_SHADER_STAGE_VERTEX_BIT,
+      .module = p->vs,
+      .pName = "main",
+   };
+
+   if (p->gs != VK_NULL_HANDLE) {
+      stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage = VK_SHADER_STAGE_VERTEX_BIT,
-         .module = p->vs,
+         .stage = VK_SHADER_STAGE_GEOMETRY_BIT,
+         .module = p->gs,
          .pName = "main",
-      },
-      {
-         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-         .module = p->fs,
-         .pName = "main",
-      },
+      };
+   }
+
+   stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .module = p->fs,
+      .pName = "main",
    };
 
    /* Every element gets a description: a shader reading a location the pipeline
@@ -908,7 +934,7 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
                   ? VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT
                   : 0,
       .pNext = &rendering,
-      .stageCount = ARRAY_SIZE(stages),
+      .stageCount = stage_count,
       .pStages = stages,
       .pVertexInputState = &vertex_input,
       .pInputAssemblyState = &input_assembly,
@@ -957,6 +983,7 @@ sz_pipeline_key_from_state(struct sz_context *ctx, VkPrimitiveTopology topology,
    key->rasterizer = SZ_STATE_ID(ctx->state.rasterizer);
    key->dsa = SZ_STATE_ID(ctx->state.depth_stencil_alpha);
    key->vs = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_VERTEX]);
+   key->gs = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_GEOMETRY]);
    key->fs = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_FRAGMENT]);
 #undef SZ_STATE_ID
 
@@ -981,6 +1008,7 @@ sz_pipeline_key_equal(const struct sz_pipeline_key *a,
    return a->blend == b->blend && a->rasterizer == b->rasterizer &&
           a->dsa == b->dsa && a->vs == b->vs && a->fs == b->fs &&
           a->topology == b->topology && a->samples == b->samples &&
+          a->gs == b->gs &&
           a->color_count == b->color_count && a->depth == b->depth &&
           a->vertex_binding_count == b->vertex_binding_count &&
           a->vertex_attribute_count == b->vertex_attribute_count &&

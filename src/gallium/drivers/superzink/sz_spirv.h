@@ -95,6 +95,10 @@ void sz_spv_entry_point(struct sz_spv_module *m, SpvExecutionModel model,
                         const uint32_t *interface, unsigned interface_count);
 void sz_spv_execution_mode(struct sz_spv_module *m, uint32_t function,
                            SpvExecutionMode mode);
+/* Same, for the modes that carry a literal operand (OutputVertices,
+ * Invocations, LocalSize and friends). */
+void sz_spv_execution_mode_literal(struct sz_spv_module *m, uint32_t function,
+                                   SpvExecutionMode mode, uint32_t value);
 
 /* Annotations. */
 void sz_spv_decorate(struct sz_spv_module *m, uint32_t target,
@@ -134,6 +138,12 @@ void sz_spv_function_end(struct sz_spv_module *m);
 uint32_t sz_spv_load(struct sz_spv_module *m, uint32_t type, uint32_t ptr);
 void sz_spv_store(struct sz_spv_module *m, uint32_t ptr, uint32_t value);
 void sz_spv_branch(struct sz_spv_module *m, uint32_t target);
+
+/* Instructions that produce neither a result nor operands: OpEmitVertex and
+ * OpEndPrimitive. They act on the output variables as they stand, so there is
+ * nothing to pass. */
+void sz_spv_emit_vertex(struct sz_spv_module *m);
+void sz_spv_end_primitive(struct sz_spv_module *m);
 void sz_spv_branch_conditional(struct sz_spv_module *m, uint32_t condition,
                                uint32_t then_id, uint32_t else_id);
 void sz_spv_selection_merge(struct sz_spv_module *m, uint32_t merge,

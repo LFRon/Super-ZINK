@@ -711,6 +711,13 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
          screen->caps.transform_feedback
             ? MIN2(4u, screen->caps.max_transform_feedback_buffers)
             : 0;
+
+      /* GL 3.2 core requires a geometry stage. Vulkan's own floors are far
+       * above these numbers, so they are GL's minimums rather than a device
+       * query -- the stage works or it does not, and it does. */
+      caps->max_geometry_output_vertices = 256;
+      caps->max_geometry_total_output_components = 1024;
+      caps->max_gs_invocations = 32;
    }
 
    /* Shader limits. st_extensions.c reads max_instructions == 0 as "this stage
@@ -719,11 +726,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * GL_MAX_*_UNIFORM_COMPONENTS and GL_MAX_UNIFORM_BLOCK_SIZE, which is why it
     * is spelled in bytes here and in vec4s there.
     *
-    * Only the two stages the translator implements are advertised: a non-zero
-    * max_instructions for geometry, tessellation or compute makes the frontend
-    * expose them and makes cso_context call their bind_* entry points, and
-    * there is no compute translation yet. */
+    * The three stages the translator implements are advertised: a non-zero
+    * max_instructions for tessellation or compute makes the frontend expose
+    * them and makes cso_context call their bind_* entry points, and neither has
+    * a translation yet. */
    const mesa_shader_stage supported_stages[] = {MESA_SHADER_VERTEX,
+                                                 MESA_SHADER_GEOMETRY,
                                                  MESA_SHADER_FRAGMENT};
    for (unsigned i = 0; i < ARRAY_SIZE(supported_stages); i++) {
       /* shader_caps is const in pipe_screen because the state tracker only
