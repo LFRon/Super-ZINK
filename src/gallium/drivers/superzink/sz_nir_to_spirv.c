@@ -3319,7 +3319,22 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
    case nir_texop_txb:
       /* A bias is part of implicit-LOD sampling: GL's texture2D's optional bias
        * argument and texture2DProj's, plus implicit-LOD texture2D in a fragment
-       * shader that asked for it. */
+       * shader that asked for it.
+       *
+       * Implicit LOD exists in no other stage: spirv-val rejects the module with
+       * "ImplicitLod instructions require Fragment, GLCompute, MeshEXT or
+       * TaskEXT execution model", and a vertex shader that samples a texture
+       * (Minecraft's does) is legal GL. Outside a fragment shader the LOD is 0,
+       * which is what an implicit LOD means when there are no derivatives. */
+      if (t->nir->info.stage != MESA_SHADER_FRAGMENT) {
+         opcode = tex->is_shadow ? SpvOpImageSampleDrefExplicitLod
+                                 : SpvOpImageSampleExplicitLod;
+         mask |= SpvImageOperandsLodMask;
+         values[num_values++] = sz_spv_const_float32(t->m, 0.0f);
+         /* A bias has no meaning without derivatives, so it is not passed on:
+          * the LOD above is the whole of the answer. */
+         break;
+      }
       opcode = tex->is_shadow ? SpvOpImageSampleDrefImplicitLod
                               : SpvOpImageSampleImplicitLod;
       if (bias != NULL) {
