@@ -142,10 +142,25 @@ void sz_lower_nir(struct nir_shader *nir);
  * dimension becomes 2D and the coordinate gains a zero second component. */
 struct pipe_stream_output_info;
 
+/* What the translator needs to know about the device beyond the NIR itself.
+ *
+ * These are flags rather than the screen so the translator keeps no dependency
+ * on the driver's state, and so a shader can be translated in a test without a
+ * Vulkan device. */
+struct sz_translate_options {
+   /* No 1D depth images: a 1D shadow sampler is declared as 2D and sampled with
+    * a zero second coordinate. See sz_image_vk_type(). */
+   bool alias_1d_shadow;
+   /* VkPhysicalDeviceFeatures::shaderClipDistance / shaderCullDistance. Without
+    * them the ClipDistance / CullDistance builtins do not exist. */
+   bool clip_distance;
+   bool cull_distance;
+};
+
 bool sz_nir_to_spirv(struct nir_shader *nir,
                      const struct pipe_stream_output_info *so,
-                     bool alias_1d_shadow, uint32_t **out_words,
-                     size_t *out_size, char **error);
+                     const struct sz_translate_options *opts,
+                     uint32_t **out_words, size_t *out_size, char **error);
 
 /* SZ_DEBUG=spirv: writes a module to dumpNN_<suffix>.spv in the working
  * directory, next to the bootstrap shaders' dumps. */

@@ -557,14 +557,15 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
       sz_resource_zero_exported(screen, res);
 
    if (sz_debug_enabled(SZ_DEBUG_INFO)) {
-      mesa_logi("SZ: image %ux%ux%u %s, %u level%s, %u sample%s, %s%s -> "
-                "%" PRIu64 " bytes",
+      mesa_logi("SZ: image %ux%ux%u %s, %u level%s, %u sample%s, %s%s%s -> "
+                "%" PRIu64 " bytes, bind 0x%x, VkImage %p",
                 ci.extent.width, ci.extent.height, ci.extent.depth,
                 util_format_name(tmpl->format), ci.mipLevels,
                 ci.mipLevels == 1 ? "" : "s", ci.samples,
                 ci.samples == 1 ? "" : "s",
                 res->linear ? "linear" : "optimal",
-                dedicated_alloc ? " dedicated" : "", sz_bo_size(res->bo));
+                dedicated_alloc ? " dedicated" : "", exportable ? " export" : "",
+                sz_bo_size(res->bo), res->base.bind, (void *)res->image);
    }
 
    return &res->base;
@@ -655,6 +656,13 @@ sz_resource_destroy_now(struct sz_screen *screen, struct pipe_resource *pres)
     * than the memory handle it owns. */
    if (res->imported_memory != VK_NULL_HANDLE)
       screen->vk.FreeMemory(screen->dev, res->imported_memory, NULL);
+
+   if (sz_debug_enabled(SZ_DEBUG_INFO)) {
+      if (res->image != VK_NULL_HANDLE)
+         mesa_logi("SZ: destroy image %p", (void *)res->image);
+      else if (res->buffer != VK_NULL_HANDLE)
+         mesa_logi("SZ: destroy buffer %p", (void *)res->buffer);
+   }
 
    sz_bo_free(res->bo);
 

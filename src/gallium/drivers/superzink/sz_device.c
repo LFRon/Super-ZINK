@@ -616,6 +616,8 @@ sz_device_init(struct sz_screen *screen)
    };
    sz_query_features(screen, &features, &chained);
    sz_gate_features(screen, &features);
+   screen->have_shader_clip_distance = features.core.shaderClipDistance;
+   screen->have_shader_cull_distance = features.core.shaderCullDistance;
    /* `chained.pNext` now points at members of `features`, which is still in
     * scope, so it can be handed straight to vkCreateDevice. */
    chained.features = features.core;

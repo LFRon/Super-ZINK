@@ -680,9 +680,16 @@ sz_create_shader_state(struct pipe_context *pipe,
       nir_print_shader(state->u.shader.nir, stderr);
    }
 
+   struct sz_screen *screen = sz_context(pipe)->screen;
+   const struct sz_translate_options opts = {
+      .alias_1d_shadow = screen->need_2d_zs,
+      .clip_distance = screen->have_shader_clip_distance,
+      .cull_distance = screen->have_shader_cull_distance,
+   };
+
    char *error = NULL;
    if (!sz_nir_to_spirv(state->u.shader.nir, &state->u.shader.stream_output,
-                        sz_context(pipe)->screen->need_2d_zs, &state->u.shader.spirv,
+                        &opts, &state->u.shader.spirv,
                         &state->u.shader.spirv_words, &error)) {
       /* The caller reads error_message only when it asks for compile errors, and
        * frees it with free(), which is why this is strdup and not ralloc. */
@@ -821,9 +828,12 @@ static void
 sz_sampler_view_release(struct pipe_context *pipe,
                         struct pipe_sampler_view *view)
 {
-   /* The frontend signalling that it dropped its reference does not mean the
-    * driver may free the object: sampler_view_destroy is the only release point.
-    * Destroying here would double-free on the next unbind. */
+   /* Drops the reference the frontend held. It is not the same thing as an
+    * unbind -- no state is touched -- and a no-op here leaks the view and, with
+    * it, the reference it holds on its texture: the validation layer reports
+    * that as a VkImage still alive when the device is destroyed. */
+   struct pipe_sampler_view *v = view;
+   pipe_sampler_view_reference(&v, NULL);
 }
 
 static struct pipe_sampler_view *
@@ -856,6 +866,12 @@ sz_create_sampler_view(struct pipe_context *pipe, struct pipe_resource *texture,
     * leaves stack garbage in them, and referencing that garbage segfaults. */
    sv->base.texture = NULL;
    pipe_resource_reference(&sv->base.texture, texture);
+   /* The template's own reference count is whatever the frontend left on its
+    * stack: it is a recipe for a view, not a view. Copying it over means the
+    * release never reaches zero, so every sampler view leaks -- along with the
+    * reference it holds on the texture, which then never gets destroyed and is
+    * reported by the validation layer as a VkImage leaked at device teardown. */
+   pipe_reference_init(&sv->base.reference, 1);
 
    if (res->image == VK_NULL_HANDLE)
       return &sv->base;
@@ -1390,11 +1406,26 @@ sz_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
       return;
 
    sz_state_changed(ctx, SZ_DIRTY_DESCRIPTORS);
+
+   /* The views are reference counted and the caller keeps its own references,
+    * so the context needs one of its own: storing the pointer alone leaves it
+    * dangling the moment the state tracker drops the view, and nothing ever
+    * destroys the last reference -- which shows up as a VkImage leaked at device
+    * teardown, because a view that is never destroyed never releases its
+    * texture. */
    for (unsigned i = 0; i < num_views; i++) {
       const unsigned slot = start_slot + i;
       if (slot >= PIPE_MAX_SAMPLERS)
          break;
-      ctx->state.sampler_views[shader][slot] = views ? views[i] : NULL;
+      pipe_sampler_view_reference(&ctx->state.sampler_views[shader][slot],
+                                  views ? views[i] : NULL);
+   }
+
+   for (unsigned i = 0; i < unbind_num_trailing_slots; i++) {
+      const unsigned slot = start_slot + num_views + i;
+      if (slot >= PIPE_MAX_SAMPLERS)
+         break;
+      pipe_sampler_view_reference(&ctx->state.sampler_views[shader][slot], NULL);
    }
 }
 
@@ -2410,13 +2441,16 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
    }
 
+   /* A draw does not have to read a vertex attribute. A geometry-only program
+    * takes its vertices from gl_PrimitiveID, and a vertex shader may derive
+    * everything from gl_VertexID; Vulkan accepts an empty vertex input state, so
+    * the only draw that cannot be honoured is one whose declared elements have
+    * no buffer behind them -- Vulkan requires every binding a pipeline names to
+    * be bound. */
    const struct sz_state *ve = ctx->state.vertex_elements;
-   if (!ve || ve->u.ve.count == 0) {
-      sz_warn_once("draw without vertex elements, ignoring");
-      return;
-   }
+   const unsigned element_count = ve ? ve->u.ve.count : 0;
 
-   if (ctx->state.num_vertex_buffers == 0) {
+   if (element_count && ctx->state.num_vertex_buffers == 0) {
       sz_warn_once("draw without vertex buffers, ignoring");
       return;
    }
@@ -2971,12 +3005,14 @@ sz_context_destroy(struct pipe_context *pipe)
 
    pipe_resource_reference(&ctx->sampled_copy, NULL);
 
-   /* The constant buffers are the one piece of shadow state the context owns a
-    * reference to, so they are the one piece it has to drop. */
+   /* Constant buffers and sampler views are the shadow state the context owns a
+    * reference to, so they are what it has to drop. */
    for (unsigned sh = 0; sh < MESA_SHADER_STAGES; sh++) {
       for (unsigned i = 0; i < SZ_MAX_CONST_BUFFERS; i++)
          pipe_resource_reference(&ctx->state.constant_buffers[sh][i].buffer,
                                  NULL);
+      for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
+         pipe_sampler_view_reference(&ctx->state.sampler_views[sh][i], NULL);
    }
 
    for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++)

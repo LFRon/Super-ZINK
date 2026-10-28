@@ -327,6 +327,9 @@ struct sz_screen {
    /* Shaders used when a draw has no program bound (the driver's own self
     * tests). Created on first use, destroyed with the device. */
    VkShaderModule bootstrap_vs;
+   /* bootstrap_vs reads vertex attribute 0, which a draw without vertex
+    * elements cannot supply; this one has no inputs at all. */
+   VkShaderModule bootstrap_vs_empty;
    VkShaderModule bootstrap_fs;
 
    /* VK_EXT_multi_draw: how many draws one vkCmdDrawMultiEXT may carry. Zero
@@ -351,6 +354,13 @@ struct sz_screen {
     * is what every other Gallium-on-Vulkan driver does. The probe happens once
     * because the answer is a device property and sz_vk_format() is called from
     * hot paths (the pipeline key comparison among them). */
+   /* Device features the shader translator has to consult when it declares a
+    * builtin: the ClipDistance and CullDistance builtins do not exist without
+    * them. Taken from the feature snapshot after gating, so this is what the
+    * device was created with rather than what it advertised. */
+   bool have_shader_clip_distance;
+   bool have_shader_cull_distance;
+
    bool have_d24_unorm_s8_uint;
    bool have_x8_d24_unorm_pack32;
    bool have_d32_sfloat;

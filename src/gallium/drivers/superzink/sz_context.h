@@ -258,7 +258,11 @@ struct sz_context {
       /* Non-owning: the state tracker deletes every object it created through the
        * matching delete entry point, so the context never frees these. */
       void *sampler_states[MESA_SHADER_STAGES][PIPE_MAX_SAMPLERS];
-      void *sampler_views[MESA_SHADER_STAGES][PIPE_MAX_SAMPLERS];
+      /* Sampler views are reference counted, and the context keeps its own
+       * reference: the state tracker may drop its view while a recorded draw
+       * still names it. */
+      struct pipe_sampler_view *sampler_views[MESA_SHADER_STAGES]
+                                             [PIPE_MAX_SAMPLERS];
       void *shaders[MESA_SHADER_STAGES];
 
       /* Owned: the context holds a reference to every bound buffer, because

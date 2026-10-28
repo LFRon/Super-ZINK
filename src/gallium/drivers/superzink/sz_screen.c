@@ -720,6 +720,20 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_gs_invocations = 32;
    }
 
+   /* Varying slots, in vec4s. The translator places varyings at dense locations
+    * from zero, so this is also the number of locations it can use -- and the
+    * smallest of the three limits that have to agree: what the vertex stage may
+    * write, what a geometry stage may read, and what the fragment stage may read.
+    * A device can report 128 components of vertex output and only 64 of geometry
+    * input; advertising the larger one lets the GLSL linker pack a shader that
+    * then fails to link (or, worse, to build a pipeline).
+    *
+    * GL 3.2 requires 60 components, which Vulkan's 64-component floor covers. */
+   ((struct pipe_caps *)&screen->base.caps)->max_varyings =
+      MIN2(MIN2(MAX_VARYING, screen->props.limits.maxVertexOutputComponents / 4),
+           MIN2(screen->props.limits.maxGeometryInputComponents / 4,
+                screen->props.limits.maxFragmentInputComponents / 4));
+
    /* Shader limits. st_extensions.c reads max_instructions == 0 as "this stage
     * is unsupported" and zeroes every other limit, so a stage that links at all
     * needs it set. max_const_buffer0_size is what becomes both
@@ -744,8 +758,32 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       sc->max_tex_instructions = 65535;
       sc->max_tex_indirections = 65535;
       sc->max_control_flow_depth = 32;
-      sc->max_inputs = 16;
-      sc->max_outputs = 16;
+      /* Inputs and outputs are counted in vec4s by gl_program_constants: for the
+       * vertex stage the inputs are vertex attributes (16 locations, the GL
+       * minimum) and for the geometry stage they are the previous stage's
+       * outputs. The output count is the location space the translator places
+       * varyings in -- dense from zero, and no wider than the device allows. */
+      const VkPhysicalDeviceLimits *lim = &screen->props.limits;
+      const unsigned varyings = screen->base.caps.max_varyings;
+      switch (supported_stages[i]) {
+      case MESA_SHADER_VERTEX:
+         sc->max_inputs = 16;
+         sc->max_outputs = varyings;
+         break;
+      case MESA_SHADER_GEOMETRY:
+         sc->max_inputs = varyings;
+         /* A geometry shader writes its own gl_Position on top of the varyings
+          * it passes on, and GL 3.2 puts MAX_GEOMETRY_OUTPUT_COMPONENTS at 128 --
+          * 32 vec4s. Reporting 16 makes the GLSL constant
+          * gl_MaxGeometryOutputComponents 64, below what the spec requires. */
+         sc->max_outputs =
+            MIN2(MAX_VARYING, lim->maxGeometryOutputComponents / 4);
+         break;
+      default:
+         sc->max_inputs = MIN2(MAX_VARYING, lim->maxFragmentInputComponents / 4);
+         sc->max_outputs = 16;
+         break;
+      }
       sc->max_temps = 64;
       /* Exactly the size of the array the translator declares inside a uniform
        * block, so no shader can ask for a block the block type cannot hold. */

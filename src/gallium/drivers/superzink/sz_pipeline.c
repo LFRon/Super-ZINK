@@ -62,12 +62,14 @@ sz_pipeline_dump(const uint32_t *words, size_t size, const char *suffix)
  * only be in vertex fetch, the pipeline or the attachment path -- never in
  * algebra the test does not need. */
 static VkShaderModule
-sz_pipeline_bootstrap_vs(struct sz_screen *screen)
+sz_pipeline_bootstrap_vs(struct sz_screen *screen, bool with_input)
 {
    /* Created once: the self-tests draw without a program bound, and a module per
     * such draw would be pure churn. */
-   if (screen->bootstrap_vs != VK_NULL_HANDLE)
-      return screen->bootstrap_vs;
+   VkShaderModule *cached =
+      with_input ? &screen->bootstrap_vs : &screen->bootstrap_vs_empty;
+   if (*cached != VK_NULL_HANDLE)
+      return *cached;
 
    struct sz_spv_module *m = sz_spv_module_create();
    if (!m)
@@ -79,25 +81,38 @@ sz_pipeline_bootstrap_vs(struct sz_screen *screen)
    const uint32_t f32 = sz_spv_type_float32(m);
    const uint32_t v4 = sz_spv_type_vec(m, f32, 4);
 
-   const uint32_t input = sz_spv_variable(m,
-                                          sz_spv_type_ptr(m, SpvStorageClassInput, v4),
-                                          SpvStorageClassInput);
+   uint32_t input = 0;
+   if (with_input) {
+      input = sz_spv_variable(m,
+                              sz_spv_type_ptr(m, SpvStorageClassInput, v4),
+                              SpvStorageClassInput);
+      sz_spv_decorate(m, input, SpvDecorationLocation, 0);
+   }
    const uint32_t position =
       sz_spv_variable(m, sz_spv_type_ptr(m, SpvStorageClassOutput, v4),
                       SpvStorageClassOutput);
 
-   sz_spv_decorate(m, input, SpvDecorationLocation, 0);
    sz_spv_decorate_builtin(m, position, SpvBuiltInPosition);
 
    const uint32_t interface[] = { input, position };
    const uint32_t main_fn = sz_spv_id(m);
    sz_spv_entry_point(m, SpvExecutionModelVertex, main_fn, "main", interface,
-                      ARRAY_SIZE(interface));
+                      with_input ? ARRAY_SIZE(interface) : 1);
 
    sz_spv_function(m, main_fn, sz_spv_type_void(m),
                    sz_spv_type_function(m, sz_spv_type_void(m), NULL, 0));
    sz_spv_label(m);
-   const uint32_t value = sz_spv_load(m, v4, input);
+   uint32_t value = 0;
+   if (with_input) {
+      value = sz_spv_load(m, v4, input);
+   } else {
+      /* A draw with no vertex elements still needs a position for the stages
+       * after it; a geometry-only program never looks at one. */
+      const uint32_t zero = sz_spv_const_float32(m, 0.0f);
+      const uint32_t one = sz_spv_const_float32(m, 1.0f);
+      const uint32_t pos[4] = {zero, zero, zero, one};
+      value = sz_spv_const_composite(m, v4, pos, 4);
+   }
    sz_spv_store(m, position, value);
    sz_spv_return(m);
    sz_spv_function_end(m);
@@ -122,7 +137,7 @@ sz_pipeline_bootstrap_vs(struct sz_screen *screen)
    }
 
    sz_spv_module_destroy(m);
-   screen->bootstrap_vs = module;
+   *cached = module;
    return module;
 }
 
@@ -288,6 +303,19 @@ sz_pipeline_note_submit(struct sz_context *ctx)
    }
 }
 
+/* Whether the draw that created this pipeline reads any vertex attribute.
+ *
+ * A pipeline whose vertex input state is empty may not consume a vertex input
+ * builtin: validation rejects a vertex shader that reads a location the
+ * pipeline does not describe, so the bootstrap vertex shader has to come in a
+ * variant without one. */
+static bool
+sz_pipeline_has_vertex_input(const struct sz_context *ctx)
+{
+   const struct sz_state *ve = ctx->state.vertex_elements;
+   return ve && ve->u.ve.count > 0;
+}
+
 /* Returns a module for `stage`: the translated shader when one is bound, the
  * bootstrap shader otherwise. The bootstrap pair stays in use for the driver's
  * own selftest, which draws without a shader bound. */
@@ -302,8 +330,9 @@ sz_pipeline_module(struct sz_context *ctx, mesa_shader_stage stage)
        * is bound, so reaching here means the binding is broken. */
       if (stage == MESA_SHADER_GEOMETRY)
          return VK_NULL_HANDLE;
-      return stage == MESA_SHADER_VERTEX ? sz_pipeline_bootstrap_vs(screen)
-                                         : sz_pipeline_bootstrap_fs(screen);
+      return stage == MESA_SHADER_VERTEX
+                ? sz_pipeline_bootstrap_vs(screen, sz_pipeline_has_vertex_input(ctx))
+                : sz_pipeline_bootstrap_fs(screen);
    }
 
    VkShaderModule module = VK_NULL_HANDLE;
@@ -1190,6 +1219,9 @@ sz_pipeline_screen_finish(struct sz_screen *screen)
 {
    if (screen->bootstrap_vs != VK_NULL_HANDLE)
       screen->vk.DestroyShaderModule(screen->dev, screen->bootstrap_vs, NULL);
+   if (screen->bootstrap_vs_empty != VK_NULL_HANDLE)
+      screen->vk.DestroyShaderModule(screen->dev, screen->bootstrap_vs_empty,
+                                     NULL);
    if (screen->bootstrap_fs != VK_NULL_HANDLE)
       screen->vk.DestroyShaderModule(screen->dev, screen->bootstrap_fs, NULL);
    if (screen->pipeline_cache != VK_NULL_HANDLE)
@@ -1199,6 +1231,7 @@ sz_pipeline_screen_finish(struct sz_screen *screen)
                                        NULL);
 
    screen->bootstrap_vs = VK_NULL_HANDLE;
+   screen->bootstrap_vs_empty = VK_NULL_HANDLE;
    screen->bootstrap_fs = VK_NULL_HANDLE;
    screen->pipeline_cache = VK_NULL_HANDLE;
    screen->pipeline_layout = VK_NULL_HANDLE;

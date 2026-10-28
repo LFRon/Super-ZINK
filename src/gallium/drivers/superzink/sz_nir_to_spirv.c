@@ -39,10 +39,20 @@
 #include "sz_debug.h"
 #include "sz_spirv.h"
 
-/* Locations 0..15 hold the legacy varying slots (COL0, TEX0..TEX7, ...), so
- * generic varyings start above them. Both stages use the same offset, which is
- * all the interface matching Vulkan requires. */
-#define SZ_LOC_VAR_BASE 16
+/* The legacy varying slots (COL0, TEX0..TEX7, ...) are numbers 0..15 and the
+ * generic ones start at VARYING_SLOT_VAR0, so both families fit in the same
+ * 0..15 location range as long as one shader does not use both. A location may
+ * not be large: Vulkan limits a vertex stage's outputs to
+ * maxVertexOutputComponents / 4 = 16 locations, so a scheme that puts one
+ * family above the other loses half the range to the other half's reservations
+ * and then fails the limit outright -- a geometry shader reading four generic
+ * varyings would need locations 16..19 and be rejected.
+ *
+ * Both stages derive the location from the slot with the same arithmetic, which
+ * is what interface matching needs. A shader that mixes the two families has no
+ * collision-free mapping without per-pipeline slot assignment, and is reported
+ * instead of silently aliasing two varyings onto one location. */
+#define SZ_LOC_LEGACY_MAX 16
 
 #define SZ_MAX_VARIABLES 96
 
@@ -82,6 +92,9 @@ struct sz_translate {
    /* The screen has no 1D depth images, so a 1D shadow sampler is declared as 2D
     * and sampled with a zero second coordinate. See sz_image_vk_type(). */
    bool alias_1d_shadow;
+   /* VkPhysicalDeviceFeatures::shaderClipDistance / shaderCullDistance. */
+   bool clip_distance;
+   bool cull_distance;
 
    /* Indexed by nir_def::index. */
    struct sz_dtype *def_types;
@@ -94,10 +107,21 @@ struct sz_translate {
    /* Set once OpCapability DerivativeControl has been emitted. */
    bool derivative_control;
 
+   /* Which varying families this shader declares, so a shader that would alias
+    * a legacy slot onto a generic one is reported rather than mis-linked. */
+   bool used_legacy_varying;
+   bool used_generic_varying;
+
    struct {
       const nir_variable *var;
       uint32_t id;
       uint32_t pointee;
+      /* The type the variable was declared with. A load has to match its
+       * pointee, and the deref's own type can disagree with it: the frontend
+       * declares varyings as `vec4` and reinterprets them as `ivec4` on use,
+       * and it declares gl_FrontFacing as a 32-bit integer while SPIR-V wants a
+       * bool. */
+      struct sz_dtype type;
    } vars[SZ_MAX_VARIABLES];
    unsigned num_vars;
 
@@ -502,12 +526,89 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
          *has_builtin = true;
          return true;
       }
+
+      if (slot == VARYING_SLOT_FACE && frag) {
+         *builtin = SpvBuiltInFrontFacing;
+         *has_builtin = true;
+         return true;
+      }
+
+      /* gl_PrimitiveIDIn in a geometry shader, gl_PrimitiveID in a fragment
+       * shader: the same builtin, and both need the Geometry capability. */
+      if (slot == VARYING_SLOT_PRIMITIVE_ID) {
+         *builtin = SpvBuiltInPrimitiveId;
+         *has_builtin = true;
+         return true;
+      }
+
+      /* Clip and cull distances are arrays of floats with a builtin, not
+       * locations. The frontend keeps them merged into one array per family, so
+       * only the first slot of each is ever declared. */
+      if (slot == VARYING_SLOT_CLIP_DIST0 || slot == VARYING_SLOT_CLIP_DIST1) {
+         if (slot != VARYING_SLOT_CLIP_DIST0) {
+            sz_fail(t, "%s is not the first clip distance slot", var->name);
+            return false;
+         }
+         if (!t->clip_distance) {
+            sz_fail(t, "%s needs the shaderClipDistance feature, which this "
+                       "device does not report", var->name);
+            return false;
+         }
+         *builtin = SpvBuiltInClipDistance;
+         *has_builtin = true;
+         return true;
+      }
+
+      if (slot == VARYING_SLOT_CULL_DIST0 || slot == VARYING_SLOT_CULL_DIST1) {
+         if (slot != VARYING_SLOT_CULL_DIST0) {
+            sz_fail(t, "%s is not the first cull distance slot", var->name);
+            return false;
+         }
+         if (!t->cull_distance) {
+            sz_fail(t, "%s needs the shaderCullDistance feature, which this "
+                       "device does not report", var->name);
+            return false;
+         }
+         *builtin = SpvBuiltInCullDistance;
+         *has_builtin = true;
+         return true;
+      }
    } else {
       if (!frag) {
          if (slot == VARYING_SLOT_POS) {
             /* SpvBuiltInPosition is zero, so the builtin value cannot double as
              * its own "was set" flag. */
             *builtin = SpvBuiltInPosition;
+            *has_builtin = true;
+            return true;
+         }
+         if (slot == VARYING_SLOT_PRIMITIVE_ID) {
+            /* Writing gl_PrimitiveID is a geometry stage operation. */
+            if (!vertex) {
+               *builtin = SpvBuiltInPrimitiveId;
+               *has_builtin = true;
+               return true;
+            }
+         }
+
+         if (slot == VARYING_SLOT_CLIP_DIST0) {
+            if (!t->clip_distance) {
+               sz_fail(t, "%s needs the shaderClipDistance feature, which this "
+                          "device does not report", var->name);
+               return false;
+            }
+            *builtin = SpvBuiltInClipDistance;
+            *has_builtin = true;
+            return true;
+         }
+
+         if (slot == VARYING_SLOT_CULL_DIST0) {
+            if (!t->cull_distance) {
+               sz_fail(t, "%s needs the shaderCullDistance feature, which this "
+                          "device does not report", var->name);
+               return false;
+            }
+            *builtin = SpvBuiltInCullDistance;
             *has_builtin = true;
             return true;
          }
@@ -532,12 +633,14 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
    }
 
    if (slot >= VARYING_SLOT_VAR0) {
-      *location = slot - VARYING_SLOT_VAR0 + SZ_LOC_VAR_BASE;
+      *location = slot - VARYING_SLOT_VAR0;
+      t->used_generic_varying = true;
       return true;
    }
 
-   if (slot >= 0 && slot < SZ_LOC_VAR_BASE) {
+   if (slot >= 0 && slot < SZ_LOC_LEGACY_MAX) {
       *location = slot;
+      t->used_legacy_varying = true;
       return true;
    }
 
@@ -664,12 +767,37 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
          return false;
    }
 
+   /* gl_FrontFacing is a bool in SPIR-V whatever the frontend calls it. */
+   if (has_builtin && builtin == SpvBuiltInFrontFacing) {
+      type.base = SZ_BASE_BOOL;
+      type.bits = 1;
+      type.ncomp = 1;
+   }
+
    const uint32_t pointee = sz_dtype_type(t, &type);
    const uint32_t ptr_type = sz_spv_type_ptr(t->m, storage, pointee);
    const uint32_t id = sz_spv_variable(t->m, ptr_type, storage);
 
    if (has_builtin) {
       sz_spv_decorate_builtin(t->m, id, builtin);
+
+      /* A builtin is not usable on its own: PrimitiveId exists only with the
+       * Geometry capability, the two distance arrays only with theirs. Emitting
+       * the capability where the builtin is declared keeps the two from
+       * drifting. */
+      switch (builtin) {
+      case SpvBuiltInPrimitiveId:
+         sz_spv_capability(t->m, SpvCapabilityGeometry);
+         break;
+      case SpvBuiltInClipDistance:
+         sz_spv_capability(t->m, SpvCapabilityClipDistance);
+         break;
+      case SpvBuiltInCullDistance:
+         sz_spv_capability(t->m, SpvCapabilityCullDistance);
+         break;
+      default:
+         break;
+      }
    } else {
       sz_spv_decorate(t->m, id, SpvDecorationLocation, location);
       /* The GLSL linker packs several small varyings into one location, each at
@@ -688,7 +816,7 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
     * the decoration there. On an output the same decoration is *invalid*
     * (VUID-StandaloneSpirv-Flat-06201), which is why the check is on the storage
     * class rather than on the type alone. */
-   if (storage == SpvStorageClassInput &&
+   if (!has_builtin && storage == SpvStorageClassInput &&
        t->nir->info.stage == MESA_SHADER_FRAGMENT &&
        (type.base != SZ_BASE_FLOAT || var->data.interpolation == INTERP_MODE_FLAT))
       sz_spv_decorate_bare(t->m, id, SpvDecorationFlat);
@@ -696,6 +824,7 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
    t->vars[t->num_vars].var = var;
    t->vars[t->num_vars].id = id;
    t->vars[t->num_vars].pointee = pointee;
+   t->vars[t->num_vars].type = type;
    t->num_vars++;
 
    return true;
@@ -714,6 +843,21 @@ sz_find_variable(struct sz_translate *t, const nir_variable *var)
 /* ------------------------------------------------------------------------- */
 /* Derefs                                                                   */
 /* ------------------------------------------------------------------------- */
+
+/* The storage class a deref chain reads through, from the mode of the variable
+ * at its root. */
+static SpvStorageClass
+sz_deref_storage(const nir_deref_instr *deref)
+{
+   if (deref->modes & nir_var_shader_in)
+      return SpvStorageClassInput;
+   if (deref->modes & nir_var_shader_out)
+      return SpvStorageClassOutput;
+   if (deref->modes & (nir_var_uniform | nir_var_mem_ubo |
+                       nir_var_mem_ssbo | nir_var_mem_push_const))
+      return SpvStorageClassUniform;
+   return SpvStorageClassFunction;
+}
 
 /* Returns the SPIR-V id of the pointer `deref` denotes, or 0 on failure. */
 static uint32_t
@@ -771,11 +915,14 @@ sz_emit_deref(struct sz_translate *t, nir_deref_instr *deref)
       if (cast)
          index = cast;
 
-      const uint32_t ptr_type =
-         sz_spv_type_ptr(t->m, SpvStorageClassInput, sz_dtype_type(t, &elem_type));
-
       /* The storage class follows the parent variable, not the deref: a chain
-       * into a uniform or an input keeps that class. */
+       * into a uniform or an input keeps that class. Getting it wrong is a
+       * validation error -- an OpAccessChain whose result pointer class does not
+       * match its base pointer's. */
+      const uint32_t ptr_type =
+         sz_spv_type_ptr(t->m, sz_deref_storage(deref),
+                         sz_dtype_type(t, &elem_type));
+
       return sz_spv_access_chain(t->m, ptr_type, base, &index, 1);
    }
 
@@ -893,56 +1040,125 @@ sz_alu_source_as(struct sz_translate *t, const nir_alu_src *src,
       sz_fail(t, "ALU source has no defining instruction");
       return 0;
    }
-   const uint32_t base = sz_scalar_type(t, t->def_types[def->index].base,
-                                        t->def_types[def->index].bits);
    const unsigned n = def->num_components;
 
-   /* A constant has no type in NIR, only a bit pattern: the type it was given
-    * when it was emitted is a guess made from its uses. When the use this call
-    * serves wants a different one -- the same 0 used as the int arm of one select
-    * and the float arm of another -- the guess is the wrong side, and emitting it
-    * unchanged produces OpSelect with operands of two types, which SPIR-V
-    * rejects. */
+   /* The base a source is *declared* with need not be the base the use is
+    * defined on. Two cases produce that:
+    *
+    *  - NIR constants are untyped bit patterns, so the type picked when the
+    *    constant was emitted is a guess from its other uses. The same 0 used as
+    *    the int arm of one select and the float arm of another is right in one
+    *    of them and wrong in the other, and OpSelect with operands of two types
+    *    does not validate.
+    *  - Varyings are declared as `vec4` even when the shader declared them as
+    *    `ivec4`: the frontend keeps the IO declaration float and reinterprets on
+    *    use (`i2f32` of a float load). Feeding such a load to OpConvertSToF
+    *    unchanged is rejected ("Expected input to be int scalar or vector").
+    *
+    * A constant is re-materialised in the wanted base -- its stored bits are the
+    * number, so a bitcast would produce the float whose bits spell 3. A value is
+    * bitcast, which is what the frontend's reinterpretation means. */
+   const struct sz_dtype *from = &t->def_types[def->index];
    const nir_load_const_instr *lconst = t->consts[def->index];
+   struct sz_dtype typed = { 0 };
    uint32_t id = t->defs_id[def->index];
-   if (want && lconst && t->def_types[def->index].base != want->base &&
-       t->def_types[def->index].bits == want->bits &&
-       n == want->ncomp && want->ncomp == ncomp)
-      id = sz_const_as(t, lconst, want);
+
+   if (want && from->base != want->base && from->bits == want->bits) {
+      if (lconst) {
+         typed = *want;
+         typed.ncomp = n;
+         id = sz_const_as(t, lconst, &typed);
+         from = &typed;
+      }
+   }
+
+   const uint32_t base = sz_scalar_type(t, from->base, from->bits);
 
    bool identity = n == ncomp;
    for (unsigned i = 0; identity && i < n; i++)
       if (src->swizzle[i] != i)
          identity = false;
 
-   if (identity)
-      return id;
-
-   uint32_t comps[4];
-   for (unsigned i = 0; i < ncomp; i++) {
-      uint32_t comp = id;
-      if (n > 1) {
-         if (n != ncomp || src->swizzle[i] != i) {
-            const uint32_t indices[] = { src->swizzle[i] };
-            comp = sz_spv_composite_extract(t->m, base, id, indices, 1);
+   uint32_t result = id;
+   if (!identity) {
+      uint32_t comps[4];
+      for (unsigned i = 0; i < ncomp; i++) {
+         uint32_t comp = id;
+         if (n > 1) {
+            if (n != ncomp || src->swizzle[i] != i) {
+               const uint32_t indices[] = { src->swizzle[i] };
+               comp = sz_spv_composite_extract(t->m, base, id, indices, 1);
+            }
          }
+
+         comps[i] = comp;
       }
 
-      comps[i] = comp;
+      result = ncomp == 1
+                  ? comps[0]
+                  : sz_spv_composite_construct(t->m, sz_dtype_type(t, from), comps,
+                                               ncomp);
    }
 
-   if (ncomp == 1)
-      return comps[0];
+   if (want && !lconst && from->base != want->base && from->bits == want->bits) {
+      struct sz_dtype have = *from;
+      have.ncomp = ncomp;
+      struct sz_dtype to = *want;
+      to.ncomp = ncomp;
+      const uint32_t cast = sz_bitcast_to(t, result, &have, &to);
+      if (cast)
+         result = cast;
+   }
 
-   return sz_spv_composite_construct(t->m,
-                                     sz_dtype_type(t, &t->def_types[def->index]),
-                                     comps, ncomp);
+   return result;
 }
 
 static uint32_t
 sz_alu_source(struct sz_translate *t, const nir_alu_src *src, unsigned ncomp)
 {
    return sz_alu_source_as(t, src, NULL, ncomp);
+}
+
+/* Operand `j` of `op`, typed the way the opcode defines it.
+ *
+ * NIR gives every opcode an operand type: OpConvertSToF's operand is an integer
+ * even though its result is a float. A source whose emitted type disagrees is
+ * almost always a constant whose base was guessed from a different use, and
+ * feeding it in unchanged makes spirv-val reject the instruction ("Expected
+ * input to be int scalar or vector"). Only the base is corrected -- the width
+ * comes from the definition itself, because the alu type does not always carry
+ * one (comparison operands are declared `nir_type_int` with no size). */
+static uint32_t
+sz_alu_source_op(struct sz_translate *t, nir_op op, const nir_alu_src *src,
+                 unsigned j, const struct sz_dtype *dst, unsigned ncomp)
+{
+   const nir_def *def = src->src.ssa;
+   if (!def)
+      return sz_alu_source(t, src, ncomp);
+
+   struct sz_dtype want = *dst;
+   want.ncomp = ncomp;
+   want.bits = t->def_types[def->index].bits;
+   if (want.base == SZ_BASE_BOOL)
+      want.bits = 1;
+
+   switch (nir_alu_type_get_base_type(nir_op_infos[op].input_types[j])) {
+   case nir_type_int:
+      want.base = SZ_BASE_INT;
+      break;
+   case nir_type_uint:
+      want.base = SZ_BASE_UINT;
+      break;
+   case nir_type_bool:
+      want.base = SZ_BASE_BOOL;
+      want.bits = 1;
+      break;
+   default:
+      want.base = SZ_BASE_FLOAT;
+      break;
+   }
+
+   return sz_alu_source_as(t, src, &want, ncomp);
 }
 
 static uint32_t
@@ -1108,8 +1324,8 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
             continue;
 
          const uint32_t ops[] = {
-            sz_alu_source(t, &alu->src[0], dst.ncomp),
-            sz_alu_source(t, &alu->src[1], dst.ncomp),
+            sz_alu_source_op(t, op, &alu->src[0], 0, &dst, dst.ncomp),
+            sz_alu_source_op(t, op, &alu->src[1], 1, &dst, dst.ncomp),
          };
          const struct sz_dtype cmp = {
             .base = SZ_BASE_BOOL,
@@ -1176,12 +1392,24 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
          }
       }
 
+      /* Equality on bools arrives as `ieq`/`ine` -- GLSL's `==` on bvec lowers
+       * to the integer comparison -- but SPIR-V has no bitwise or integer
+       * comparison on a bool, only OpLogicalEqual/NotEqual. */
+      const bool bool_compare =
+         (op == nir_op_ieq || op == nir_op_ine) && alu->src[0].src.ssa &&
+         t->def_types[alu->src[0].src.ssa->index].base == SZ_BASE_BOOL;
+      if (bool_compare) {
+         spirv = op == nir_op_ieq ? SpvOpLogicalEqual : SpvOpLogicalNotEqual;
+      }
+
       /* Only the sources the op declares exist: the rest of nir_alu_src[] is
        * uninitialised, and reading it dereferences a NULL nir_def. */
       const unsigned nsrcs = MIN2(nir_op_infos[op].num_inputs, 3);
       uint32_t ops[3];
       for (unsigned j = 0; j < nsrcs; j++)
-         ops[j] = sz_alu_source(t, &alu->src[j], dst.ncomp);
+         ops[j] = bool_compare
+                     ? sz_alu_source(t, &alu->src[j], dst.ncomp)
+                     : sz_alu_source_op(t, op, &alu->src[j], j, &dst, dst.ncomp);
 
       if (op == nir_op_f2i1 || op == nir_op_i2i1) {
          /* "not equal to zero": a comparison, so the operand list is (a, 0). */
@@ -1205,7 +1433,7 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       const unsigned nsrcs = MIN2(nir_op_infos[op].num_inputs, 3);
       uint32_t ops[3];
       for (unsigned j = 0; j < nsrcs; j++)
-         ops[j] = sz_alu_source(t, &alu->src[j], dst.ncomp);
+         ops[j] = sz_alu_source_op(t, op, &alu->src[j], j, &dst, dst.ncomp);
 
       struct sz_dtype work = dst;
       /* FSqrt and friends are defined on floats; keep the declared type. */
@@ -1461,7 +1689,31 @@ sz_emit_load_deref(struct sz_translate *t, nir_intrinsic_instr *intrin)
    if (!sz_dtype_from_glsl(t, deref->type, &type))
       return;
 
-   const uint32_t loaded = sz_spv_load(t->m, sz_dtype_type(t, &type), ptr);
+   if (deref->deref_type == nir_deref_type_var) {
+      const int index = sz_find_variable(t, deref->var);
+      if (index >= 0)
+         type = t->vars[index].type;
+   }
+
+   uint32_t loaded = sz_spv_load(t->m, sz_dtype_type(t, &type), ptr);
+
+   /* A varying declared `vec4` whose value the shader treats as `ivec4` loads as
+    * float and is consumed as int. Left as it is, the first instruction that
+    * needs an integer operand rejects it, and a phi that mixes the two has no
+    * single type its operands satisfy -- OpPhi's incoming values must all match
+    * its result type. The reinterpretation happens where the value is produced,
+    * which is also where a bitcast dominates every use. */
+   struct sz_dtype guess = { 0 };
+   sz_guess_def_type(t, &intrin->def, &guess);
+   if (guess.base != type.base && guess.bits == type.bits &&
+       guess.ncomp == type.ncomp) {
+      const uint32_t cast = sz_bitcast_to(t, loaded, &type, &guess);
+      if (cast) {
+         loaded = cast;
+         type = guess;
+      }
+   }
+
    t->defs_id[intrin->def.index] = loaded;
    t->def_types[intrin->def.index] = type;
 }
@@ -3011,13 +3263,16 @@ sz_spv_verify_cfg(struct sz_translate *t, const uint32_t *words, size_t count,
 
 bool
 sz_nir_to_spirv(struct nir_shader *nir,
-                const struct pipe_stream_output_info *so, bool alias_1d_shadow,
-                uint32_t **words, size_t *word_count, char **error)
+                const struct pipe_stream_output_info *so,
+                const struct sz_translate_options *opts, uint32_t **words,
+                size_t *word_count, char **error)
 {
    struct sz_translate t = {
       .nir = nir,
       .so = so,
-      .alias_1d_shadow = alias_1d_shadow,
+      .alias_1d_shadow = opts->alias_1d_shadow,
+      .clip_distance = opts->clip_distance,
+      .cull_distance = opts->cull_distance,
       .error = error,
    };
 
@@ -3090,6 +3345,12 @@ sz_nir_to_spirv(struct nir_shader *nir,
       t.interfaces[t.num_interfaces++] = t.vars[t.num_vars - 1].id;
    }
 
+   if (t.used_legacy_varying && t.used_generic_varying) {
+      sz_fail(&t, "mixes legacy (`gl_TexCoord` style) and generic varyings, "
+                  "which would share locations");
+      goto fail;
+   }
+
    const uint32_t function = sz_spv_id(t.m);
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       sz_spv_execution_mode(t.m, function, SpvExecutionModeOriginUpperLeft);
@@ -3159,7 +3420,8 @@ sz_nir_to_spirv(struct nir_shader *nir,
     * pre-rasterization stage does not declare the Xfb execution mode
     * (VUID-vkCmdBeginTransformFeedbackEXT-None-04128). The per-variable
     * XfbBuffer/XfbStride/Offset decorations alone are not enough. */
-   if (nir->info.stage == MESA_SHADER_VERTEX && t.so && t.so->num_outputs > 0) {
+   if (nir->info.stage != MESA_SHADER_FRAGMENT && t.so &&
+       t.so->num_outputs > 0) {
       /* The Xfb execution mode is only valid with this capability declared. */
       sz_spv_capability(t.m, SpvCapabilityTransformFeedback);
       sz_spv_execution_mode(t.m, function, SpvExecutionModeXfb);
