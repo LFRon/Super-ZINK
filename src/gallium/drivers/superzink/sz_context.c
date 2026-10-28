@@ -1604,11 +1604,32 @@ sz_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
 {
    struct sz_context *ctx = sz_context(pipe);
 
+   /* Records the draws appended under the old bindings before they change. */
    sz_state_changed(ctx, SZ_DIRTY_VERTEX_BUFFERS);
 
    const unsigned n = MIN2(count, PIPE_MAX_ATTRIBS);
-   if (n)
-      memcpy(ctx->state.vertex_buffers, buffers, n * sizeof(*buffers));
+   for (unsigned i = 0; i < n; i++) {
+      struct pipe_vertex_buffer *dst = &ctx->state.vertex_buffers[i];
+
+      /* Drop the slot's old reference before the copy overwrites the pointer
+       * that names it. */
+      pipe_resource_reference(&dst->buffer.resource, NULL);
+
+      *dst = buffers[i];
+      /* The caller keeps its own reference and drops it as soon as it likes --
+       * cso's vbuf path does so right after the draw -- so a bare pointer copy
+       * leaves the state naming a freed resource, and the VkBuffer bound later
+       * is whatever the allocator left in its place. */
+      dst->buffer.resource = NULL;
+      if (!buffers[i].is_user_buffer)
+         pipe_resource_reference(&dst->buffer.resource,
+                                 buffers[i].buffer.resource);
+   }
+
+   /* Slots past `count` are unbound. */
+   for (unsigned i = n; i < ctx->state.num_vertex_buffers; i++)
+      pipe_resource_reference(&ctx->state.vertex_buffers[i].buffer.resource, NULL);
+
    ctx->state.num_vertex_buffers = n;
 }
 
@@ -2356,6 +2377,7 @@ sz_draw_flush(struct sz_context *ctx)
 
    ctx->dirty = 0;
    ctx->pending.count = 0;
+   pipe_resource_reference(&ctx->pending.index_resource, NULL);
 }
 
 static bool
@@ -2400,6 +2422,11 @@ sz_draw_append(struct sz_context *ctx, const struct pipe_draw_info *info,
       ctx->pending.topology = topology;
       ctx->pending.primitive_restart = info->primitive_restart;
       ctx->pending.index_buffer = index;
+      /* The index buffer in pipe_draw_info is only valid for the duration of the
+       * call, and this draw is queued rather than recorded, so the context needs
+       * a reference of its own until the flush has bound it. */
+      pipe_resource_reference(&ctx->pending.index_resource,
+                              index ? &index->base : NULL);
       ctx->pending.index_type = type;
       ctx->pending.index_offset = 0;
       /* The index binding is part of the batch, so it is re-emitted whenever a
@@ -3007,6 +3034,11 @@ sz_context_destroy(struct pipe_context *pipe)
 
    /* Constant buffers and sampler views are the shadow state the context owns a
     * reference to, so they are what it has to drop. */
+   for (unsigned i = 0; i < ctx->state.num_vertex_buffers; i++)
+      pipe_resource_reference(&ctx->state.vertex_buffers[i].buffer.resource,
+                              NULL);
+   pipe_resource_reference(&ctx->pending.index_resource, NULL);
+
    for (unsigned sh = 0; sh < MESA_SHADER_STAGES; sh++) {
       for (unsigned i = 0; i < SZ_MAX_CONST_BUFFERS; i++)
          pipe_resource_reference(&ctx->state.constant_buffers[sh][i].buffer,

@@ -221,6 +221,8 @@ struct sz_context {
       VkPrimitiveTopology topology;
       bool primitive_restart;
       struct sz_resource *index_buffer;
+      /* Holds the reference that keeps index_buffer alive until the flush. */
+      struct pipe_resource *index_resource;
       VkDeviceSize index_offset;
       VkIndexType index_type;
    } pending;

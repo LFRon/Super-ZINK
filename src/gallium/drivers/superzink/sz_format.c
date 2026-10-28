@@ -255,6 +255,15 @@ sz_format_supported_buffer(struct sz_screen *screen,
                            enum pipe_format format,
                            unsigned bindings)
 {
+   /* Vulkan's index types are 16 and 32 bits: there is no 8-bit index buffer to
+    * bind. GL does have one, so it is refused here and the util layer rewrites
+    * those indices to 16 bits before the draw (u_vbuf's rewrite_ubyte_ibs). The
+    * alternative -- reporting support and picking VK_INDEX_TYPE_UINT16 anyway --
+    * reads twice the bytes the app provided and draws wrong primitives, which is
+    * what a validation error about the index buffer's size was pointing at. */
+   if ((bindings & PIPE_BIND_INDEX_BUFFER) && format == PIPE_FORMAT_R8_UINT)
+      return false;
+
    const VkFormat vkformat = sz_vk_format(screen, format);
    if (vkformat == VK_FORMAT_UNDEFINED)
       return false;

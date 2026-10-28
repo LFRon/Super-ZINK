@@ -711,15 +711,17 @@ sz_screen_resource_destroy(struct pipe_screen *pscreen,
 
    sz_resource_reclaim(screen);
 
-   if (screen->num_retired_resources == SZ_MAX_RETIRED_RESOURCES) {
-      /* Every slot is held by a submission that has not finished. There is no
-       * way to make progress without waiting, so wait: the queue is idle
-       * afterwards and the whole table drains. */
-      sz_queue_wait_idle(&screen->batch_state);
-      sz_resource_reclaim(screen);
+   if (screen->num_retired_resources == screen->retired_resources_capacity) {
+      const unsigned capacity = MAX2(screen->retired_resources_capacity * 2, 64);
+      struct sz_retired_resource *grown =
+         realloc(screen->retired_resources, capacity * sizeof(*grown));
+      if (grown) {
+         screen->retired_resources = grown;
+         screen->retired_resources_capacity = capacity;
+      }
    }
 
-   if (screen->num_retired_resources < SZ_MAX_RETIRED_RESOURCES) {
+   if (screen->num_retired_resources < screen->retired_resources_capacity) {
       screen->retired_resources[screen->num_retired_resources].res = pres;
       screen->retired_resources[screen->num_retired_resources].value =
          retire_value;
@@ -727,7 +729,14 @@ sz_screen_resource_destroy(struct pipe_screen *pscreen,
       return;
    }
 
-   sz_resource_destroy_now(screen, pres);
+   /* Only reachable when the table could not grow. Waiting is the one thing that
+    * makes progress; the resource is then destroyed by the reclaim below rather
+    * than here, because the recording command buffer may still name it. */
+   sz_queue_wait_idle(&screen->batch_state);
+   sz_resource_reclaim(screen);
+   screen->retired_resources[screen->num_retired_resources].res = pres;
+   screen->retired_resources[screen->num_retired_resources].value = retire_value;
+   screen->num_retired_resources++;
 }
 
 void
@@ -736,6 +745,9 @@ sz_resource_reclaim_all(struct sz_screen *screen)
    for (unsigned i = 0; i < screen->num_retired_resources; i++)
       sz_resource_destroy_now(screen, screen->retired_resources[i].res);
    screen->num_retired_resources = 0;
+   free(screen->retired_resources);
+   screen->retired_resources = NULL;
+   screen->retired_resources_capacity = 0;
 }
 
 void *

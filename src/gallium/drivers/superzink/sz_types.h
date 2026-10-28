@@ -184,12 +184,6 @@ struct sz_bo_state;
 struct sz_bo;
 struct sz_resource;
 
-/* How many destroyed resources may wait for a submission to finish before a
- * destroy has to stall the queue to make room. Destroying a resource is common
- * (the constant-buffer uploader churns one per frame), so this is not a rare
- * path. */
-#define SZ_MAX_RETIRED_RESOURCES 64
-
 /* A pipe_resource the frontend has released while a submission that may still
  * read its VkBuffer/VkImage is in flight. `value` is the timeline value that
  * submission signals; once completed_value reaches it the resource is free to
@@ -231,9 +225,16 @@ struct sz_screen {
    struct sz_queue_state batch_state;
 
    /* Resources awaiting the timeline value in `value`. See
-    * sz_screen_resource_destroy(). */
-   struct sz_retired_resource retired_resources[SZ_MAX_RETIRED_RESOURCES];
+    * sz_screen_resource_destroy().
+    *
+    * Grown on demand rather than fixed: a recording that is still open cannot be
+    * waited for, so a full table used to fall through to destroying the resource
+    * immediately -- while the command buffer being recorded still named it. The
+    * churn is real (one vertex buffer per draw, one constant block per frame), so
+    * a fixed table only bounds how long until that happens. */
+   struct sz_retired_resource *retired_resources;
    unsigned num_retired_resources;
+   unsigned retired_resources_capacity;
 
    /* pipe_context::destroy has no way to reach the screen's flag, so the screen
     * tracks it here. See sz_screen_context_create(). */
