@@ -393,9 +393,18 @@ sz_format_supported(struct sz_screen *screen,
                   PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT |
                   PIPE_BIND_SHARED | PIPE_BIND_LINEAR | PIPE_BIND_BLENDABLE);
 
+   /* A buffer texture is asked about as `PIPE_BUFFER` with PIPE_BIND_SAMPLER_VIEW,
+    * and the answer comes from the buffer path alone: there is no VkImage behind
+    * it, so whether the *image* tiling can sample the format says nothing about
+    * it. Without this, R32G32B32_FLOAT -- which no AMD device can sample as an
+    * image but every one can fetch from a buffer -- is refused and
+    * ARB_texture_buffer_object_rgb32 never appears. */
+   const bool is_buffer_texture = target == PIPE_BUFFER;
+   const bool image_path = image_binding && !is_buffer_texture;
+
    /* A true image-only binding is decided by the image path; a buffer binding by
     * the buffer path. Callers that ask for both must satisfy both. */
-   if (image_binding &&
+   if (image_path &&
        !sz_format_supported_image(screen, format, target, sample_count, bindings))
       return false;
 

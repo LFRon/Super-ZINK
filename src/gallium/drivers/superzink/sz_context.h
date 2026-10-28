@@ -96,6 +96,10 @@ struct sz_sampler_view {
     * view of an RGBA texture as RED is a different view, not a different
     * resource. */
    VkImageView view;
+   /* A buffer texture has no image: its descriptor is a VkBufferView over the
+    * buffer's bytes, which is what a UNIFORM_TEXEL_BUFFER binding takes. Exactly
+    * one of the two is created per view. */
+   VkBufferView buffer_view;
 };
 
 struct sz_gfx_pipeline;

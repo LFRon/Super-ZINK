@@ -154,6 +154,10 @@ struct sz_translate {
       bool ms;
       /* OpTypeImage, kept so OpImageFetch and the query ops can name it. */
       uint32_t image_type;
+      /* What the OpLoad of this unit produced. A buffer texture loads its image
+       * directly; every other dimension loads a sampled image that still has to
+       * be split with OpImage. */
+      uint32_t loaded_type;
       /* The value OpLoad produced from the variable, which is what the sampling
        * ops take as their image operand. */
       uint32_t value;
@@ -208,6 +212,9 @@ static uint32_t sz_bitcast_to(struct sz_translate *t, uint32_t id,
                               const struct sz_dtype *from,
                               const struct sz_dtype *to);
 static bool sz_emit_phi(struct sz_translate *t, nir_phi_instr *phi);
+static uint32_t sz_intrin_source_as(struct sz_translate *t, const nir_src *src,
+                                    const struct sz_dtype *want,
+                                    unsigned ncomp);
 static void sz_retype_for_plan(struct sz_translate *t, nir_def *def, uint32_t *id,
                                struct sz_dtype *type);
 static nir_def *sz_instr_def(nir_instr *instr);
@@ -2275,21 +2282,39 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
    const uint32_t sampled_type = sz_scalar_type(t, base, 32);
    const uint32_t image_type = sz_spv_type_image(
       t->m, sampled_type, dim, depth, arrayed, ms, true);
-   const uint32_t sampled_image_type = sz_spv_type_sampled_image(t->m, image_type);
+
+   /* A buffer texture is not a combined image sampler. Its Vulkan descriptor is
+    * a UNIFORM_TEXEL_BUFFER -- a VkBufferView, with no sampler beside it -- and
+    * the SPIR-V side is therefore a bare OpTypeImage that OpImageFetch reads.
+    * Declaring a sampled image here would ask the descriptor set for a sampler
+    * the binding does not carry. */
+   const bool is_buffer = dim == SpvDimBuffer;
+   const uint32_t pointee_type = is_buffer
+                                    ? image_type
+                                    : sz_spv_type_sampled_image(t->m, image_type);
    const uint32_t ptr_type =
-      sz_spv_type_ptr(t->m, SpvStorageClassUniformConstant, sampled_image_type);
+      sz_spv_type_ptr(t->m, SpvStorageClassUniformConstant, pointee_type);
    const uint32_t var =
       sz_spv_variable(t->m, ptr_type, SpvStorageClassUniformConstant);
 
-   sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet,
-                   SZ_DESCRIPTOR_SET_SAMPLERS);
-   sz_spv_decorate(t->m, var, SpvDecorationBinding,
-                   sz_sampler_binding(t->nir->info.stage, index));
+   if (is_buffer) {
+      /* Dim Buffer is only legal with this capability. */
+      sz_spv_capability(t->m, SpvCapabilitySampledBuffer);
+      sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet,
+                      SZ_DESCRIPTOR_SET_TEXEL_BUFFERS);
+      sz_spv_decorate(t->m, var, SpvDecorationBinding,
+                      sz_texel_binding(t->nir->info.stage, index));
+   } else {
+      sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet,
+                      SZ_DESCRIPTOR_SET_SAMPLERS);
+      sz_spv_decorate(t->m, var, SpvDecorationBinding,
+                      sz_sampler_binding(t->nir->info.stage, index));
+   }
 
    /* A combined image sampler is read as a whole, so one OpLoad yields both
     * halves; the load is emitted once and its result reused by every instruction
-    * that samples this unit. */
-   const uint32_t value = sz_spv_load(t->m, sampled_image_type, var);
+    * that samples this unit. A buffer texture loads its image and nothing else. */
+   const uint32_t value = sz_spv_load(t->m, pointee_type, var);
 
    t->samplers[t->num_samplers].index = index;
    t->samplers[t->num_samplers].dim = dim;
@@ -2297,6 +2322,7 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
    t->samplers[t->num_samplers].depth = depth;
    t->samplers[t->num_samplers].ms = ms;
    t->samplers[t->num_samplers].image_type = image_type;
+   t->samplers[t->num_samplers].loaded_type = pointee_type;
    t->samplers[t->num_samplers].value = value;
    t->num_samplers++;
 
@@ -2377,6 +2403,7 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
    }
 
    const nir_def *coord = NULL, *bias = NULL, *lod = NULL, *dref = NULL;
+   const nir_src *coord_src = NULL;
    const nir_def *ddx = NULL, *ddy = NULL, *projector = NULL;
    const nir_def *offset = NULL, *ms_index = NULL;
 
@@ -2385,6 +2412,7 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
       switch (src->src_type) {
       case nir_tex_src_coord:
          coord = src->src.ssa;
+         coord_src = &src->src;
          break;
       case nir_tex_src_bias:
          bias = src->src.ssa;
@@ -2459,8 +2487,12 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
          break;
    const uint32_t image_type = t->samplers[slot].image_type;
 
+   /* A buffer texture's load already yielded the image; everything else holds a
+    * sampled image and extracts the image from it. */
    const uint32_t image =
-      sz_spv_alu(t->m, SpvOpImage, image_type, &sampled_image, 1);
+      image_type == t->samplers[slot].loaded_type
+         ? sampled_image
+         : sz_spv_alu(t->m, SpvOpImage, image_type, &sampled_image, 1);
 
    /* Everything that is not a query needs a coordinate; the queries are the
     * reason this check cannot be at the top. */
@@ -2623,7 +2655,18 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
       uint32_t ops[6];
       unsigned n = 0;
       ops[n++] = image;
-      ops[n++] = coord_value;
+
+      /* OpImageFetch wants a 32-bit *integer* coordinate, and NIR hands a fetch
+       * a float one (GL's texelFetch takes an int/ivec, and the frontend keeps
+       * the varying float-shaped). A buffer texture makes that visible: every
+       * other dimension accepts a float vector too, Dim Buffer does not. */
+      {
+         const unsigned ncomp = tex->coord_components;
+         struct sz_dtype want = { SZ_BASE_INT, 32, ncomp };
+         const uint32_t as_int =
+            sz_intrin_source_as(t, coord_src, &want, ncomp);
+         ops[n++] = as_int ? as_int : coord_value;
+      }
 
       if (tex->op == nir_texop_txf_ms) {
          const struct sz_dtype want = { SZ_BASE_INT, 32, 1 };

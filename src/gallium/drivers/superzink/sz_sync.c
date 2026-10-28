@@ -101,6 +101,18 @@ sz_sync_state_for(enum sz_access access, bool depth_stencil)
          .layout = VK_IMAGE_LAYOUT_UNDEFINED,
       };
 
+   case SZ_ACCESS_TEXEL_BUFFER:
+      /* A buffer texture is read through the same uniform-read path as a UBO:
+       * SPIR-V sees it as OpImageFetch on a DimBuffer image, and Vulkan counts
+       * that as a read access, not as a sampled-image read. */
+      return (struct sz_sync_state) {
+         .stages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+         .access = VK_ACCESS_2_UNIFORM_READ_BIT,
+         .layout = VK_IMAGE_LAYOUT_UNDEFINED,
+      };
+
    case SZ_ACCESS_PRESENT:
       return (struct sz_sync_state) {
          .stages = VK_PIPELINE_STAGE_2_NONE,

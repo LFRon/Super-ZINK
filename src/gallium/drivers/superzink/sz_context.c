@@ -768,6 +768,8 @@ sz_sampler_view_destroy(struct pipe_context *pipe,
 
    if (sv->view != VK_NULL_HANDLE)
       screen->vk.DestroyImageView(screen->dev, sv->view, NULL);
+   if (sv->buffer_view != VK_NULL_HANDLE)
+      screen->vk.DestroyBufferView(screen->dev, sv->buffer_view, NULL);
 
    pipe_resource_reference(&sv->base.texture, NULL);
    free(sv);
@@ -872,6 +874,30 @@ sz_create_sampler_view(struct pipe_context *pipe, struct pipe_resource *texture,
     * reference it holds on the texture, which then never gets destroyed and is
     * reported by the validation layer as a VkImage leaked at device teardown. */
    pipe_reference_init(&sv->base.reference, 1);
+
+   /* A buffer texture is a window onto a VkBuffer: a VkBufferView carries the
+    * format and the byte range, and a UNIFORM_TEXEL_BUFFER binding takes it
+    * directly. GL's glTexBufferRange is exactly the offset+size pair here. */
+   if (texture->target == PIPE_BUFFER) {
+      const VkBufferViewCreateInfo bv = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
+         .buffer = res->buffer,
+         .format = format,
+         .offset = templ->u.buf.offset,
+         .range = templ->u.buf.size ? templ->u.buf.size : VK_WHOLE_SIZE,
+      };
+      const VkResult r =
+         screen->vk.CreateBufferView(screen->dev, &bv, NULL, &sv->buffer_view);
+      if (r != VK_SUCCESS) {
+         /* A format that cannot be a texel buffer is not a format this driver can
+          * offer for a buffer texture; is_format_supported() says so, so reaching
+          * here means the application skipped that check. */
+         mesa_loge("SZ: vkCreateBufferView(%s) failed: %d",
+                   util_format_name(templ->format), r);
+         sv->buffer_view = VK_NULL_HANDLE;
+      }
+      return &sv->base;
+   }
 
    if (res->image == VK_NULL_HANDLE)
       return &sv->base;

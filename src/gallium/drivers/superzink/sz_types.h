@@ -151,6 +151,9 @@ struct sz_vk_entrypoints {
     * a buffer, which is the whole of GL_ARB_draw_indirect. */
    PFN_vkCmdDrawIndirect CmdDrawIndirect;
    PFN_vkCmdDrawIndexedIndirect CmdDrawIndexedIndirect;
+   /* Buffer textures: a texel buffer descriptor is a VkBufferView. */
+   PFN_vkCreateBufferView CreateBufferView;
+   PFN_vkDestroyBufferView DestroyBufferView;
    PFN_vkCmdClearAttachments CmdClearAttachments;
    /* VK_EXT_multi_draw. NULL when the extension is not enabled, which is the
     * only thing the draw stream checks before falling back to a loop of
@@ -268,6 +271,7 @@ struct sz_screen {
       bool enabled;
       VkDeviceSize ubo_size;
       VkDeviceSize sampler_size;
+      VkDeviceSize texel_size;
       struct {
          VkBuffer buffer;
          struct sz_bo *bo;

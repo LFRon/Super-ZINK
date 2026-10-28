@@ -1211,8 +1211,9 @@ bool
 sz_pipeline_screen_init(struct sz_screen *screen)
 {
    const VkDescriptorSetLayout set_layouts[SZ_DESCRIPTOR_SET_COUNT] = {
-      screen->descriptor_set_layout[0],
-      screen->descriptor_set_layout[1],
+      screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_UBO],
+      screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_SAMPLERS],
+      screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_TEXEL_BUFFERS],
    };
 
    /* No VkPipelineLayoutCreateFlagBits is needed: the push-descriptor bit lives

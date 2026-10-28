@@ -71,10 +71,16 @@
  * A fourth kind (shader buffers or images) takes a third set. */
 #define SZ_DESCRIPTOR_SET_UBO 0
 #define SZ_DESCRIPTOR_SET_SAMPLERS 1
-#define SZ_DESCRIPTOR_SET_COUNT 2
+/* Set 2 holds the texel buffers. They get a set of their own because
+ * VkDescriptorSetLayoutBinding has exactly one descriptor type, and a buffer
+ * texture is a VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER -- a VkBufferView, with no
+ * sampler and no image view, which a COMBINED_IMAGE_SAMPLER binding cannot hold. */
+#define SZ_DESCRIPTOR_SET_TEXEL_BUFFERS 2
+#define SZ_DESCRIPTOR_SET_COUNT 3
 #define SZ_DESCRIPTOR_STAGES 3
 #define SZ_DESCRIPTOR_UBO_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_CONST_BUFFERS)
 #define SZ_DESCRIPTOR_SAMPLER_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
+#define SZ_DESCRIPTOR_TEXEL_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
 
 /* How many distinct sampler-set contents to cache. Every draw that rebinds the
  * same textures and samplers hits an existing entry, so this is the number of
@@ -117,6 +123,13 @@ sz_descriptor_binding(mesa_shader_stage stage, unsigned slot)
  * constant buffers in one contiguous run. */
 static inline unsigned
 sz_sampler_binding(mesa_shader_stage stage, unsigned slot)
+{
+   return sz_descriptor_stage_index(stage) * SZ_MAX_SAMPLERS + slot;
+}
+
+/* The same numbering, in the texel-buffer set. */
+static inline unsigned
+sz_texel_binding(mesa_shader_stage stage, unsigned slot)
 {
    return sz_descriptor_stage_index(stage) * SZ_MAX_SAMPLERS + slot;
 }

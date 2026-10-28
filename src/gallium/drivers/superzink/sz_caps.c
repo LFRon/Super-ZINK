@@ -273,6 +273,8 @@ sz_caps_init(struct sz_caps *caps,
       caps->descriptor_size_uniform_buffer = desc.uniformBufferDescriptorSize;
       caps->descriptor_size_combined_image_sampler =
          desc.combinedImageSamplerDescriptorSize;
+      caps->descriptor_size_uniform_texel_buffer =
+         desc.uniformTexelBufferDescriptorSize;
    }
 
    /* ── resolve every listed capability ───────────────────────────────────── */

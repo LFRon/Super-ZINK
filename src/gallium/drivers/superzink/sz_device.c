@@ -563,6 +563,8 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdDrawIndexed, vkCmdDrawIndexed);
    SZ_DEV_PROC(CmdDrawIndirect, vkCmdDrawIndirect);
    SZ_DEV_PROC(CmdDrawIndexedIndirect, vkCmdDrawIndexedIndirect);
+   SZ_DEV_PROC(CreateBufferView, vkCreateBufferView);
+   SZ_DEV_PROC(DestroyBufferView, vkDestroyBufferView);
    SZ_DEV_PROC(CmdClearAttachments, vkCmdClearAttachments);
    /* NULL unless VK_EXT_multi_draw was enabled; the draw stream checks. */
    SZ_DEV_PROC(CmdDrawMultiEXT, vkCmdDrawMultiEXT);

@@ -656,6 +656,15 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * whether that is honest -- drawIndirectFirstInstance, because GL allows a
        * first instance in the argument buffer, and multiDrawIndirect, because one
        * call can describe several draws. */
+      /* Buffer textures. The descriptor is a VkBufferView (pool path) or an
+       * address+format (descriptor-buffer path), the SPIR-V side is OpTypeImage
+       * with Dim Buffer, and sz_format.c already asks the device whether each
+       * format can be a texel buffer. The offset alignment glTexBufferRange
+       * needs is the device's minTexelBufferOffsetAlignment, reported below. */
+      caps->texture_buffer_objects = true;
+      caps->max_texel_buffer_elements = 65536;
+      caps->texture_buffer_offset_alignment = 256;
+
       caps->draw_indirect =
          screen->caps.core_features.drawIndirectFirstInstance &&
          screen->caps.core_features.multiDrawIndirect;

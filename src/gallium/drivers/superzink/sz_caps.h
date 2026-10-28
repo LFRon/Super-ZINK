@@ -246,6 +246,7 @@ struct sz_caps {
    uint64_t descriptor_buffer_offset_alignment;
    size_t descriptor_size_uniform_buffer;
    size_t descriptor_size_combined_image_sampler;
+   size_t descriptor_size_uniform_texel_buffer;
 
    uint32_t instance_api_version;
    uint32_t device_api_version;
