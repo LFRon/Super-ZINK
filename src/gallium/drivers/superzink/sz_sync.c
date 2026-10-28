@@ -241,9 +241,67 @@ sz_resource_discard(struct sz_resource *res)
    res->undefined_contents = true;
 }
 
+
+/* The layout one mip level is in. `layout` is the answer unless that level was
+ * transitioned on its own and recorded in `levels`. */
+static VkImageLayout
+sz_level_layout(const struct sz_resource *res, unsigned level)
+{
+   if (res->levels && level <= res->base.last_level)
+      return res->levels[level];
+   return res->layout;
+}
+
+static void
+sz_level_set_layout(struct sz_resource *res, unsigned level, VkImageLayout layout)
+{
+   /* Only the "no overrides yet and none needed" case may return early. Once
+    * the array exists, a level returning to the default layout still has to be
+    * written: leaving the old value there makes the next transition claim a
+    * starting layout the image is not in, which is
+    * VUID-VkImageMemoryBarrier2-oldLayout-01197 and, worse, a barrier that
+    * does not actually wait for what it says it does. */
+   if (!res->levels && layout == res->layout)
+      return;
+
+   if (!res->levels) {
+      res->levels = calloc(res->base.last_level + 1, sizeof(*res->levels));
+      if (!res->levels)
+         return;
+      for (unsigned i = 0; i <= res->base.last_level; i++)
+         res->levels[i] = res->layout;
+   }
+
+   res->levels[level] = layout;
+}
+
+/* Whether every level is back in `res->layout`, which is when the array can go. */
+static void
+sz_levels_drop_if_uniform(struct sz_resource *res)
+{
+   if (!res->levels)
+      return;
+
+   for (unsigned i = 0; i <= res->base.last_level; i++)
+      if (res->levels[i] != res->layout)
+         return;
+
+   free(res->levels);
+   res->levels = NULL;
+}
+
 VkImageLayout
 sz_resource_access(struct sz_screen *screen, VkCommandBuffer cmd,
                    struct sz_resource *res, enum sz_access access)
+{
+   return sz_resource_access_levels(screen, cmd, res, access, 0,
+                                    VK_REMAINING_MIP_LEVELS);
+}
+
+VkImageLayout
+sz_resource_access_levels(struct sz_screen *screen, VkCommandBuffer cmd,
+                          struct sz_resource *res, enum sz_access access,
+                          unsigned base_level, unsigned level_count)
 {
    if (!res)
       return VK_IMAGE_LAYOUT_UNDEFINED;
@@ -313,7 +371,7 @@ sz_resource_access(struct sz_screen *screen, VkCommandBuffer cmd,
     * valid. Skipping is not merely an optimisation: a barrier whose source mask
     * is empty against a non-UNDEFINED old layout stalls the pipeline on some
     * drivers for no benefit. */
-   if (!res->undefined_contents && res->layout == dst.layout)
+   if (!res->undefined_contents && !res->levels && res->layout == dst.layout)
       return res->layout;
 
    VkImageLayout old_layout;
@@ -321,37 +379,78 @@ sz_resource_access(struct sz_screen *screen, VkCommandBuffer cmd,
    VkAccessFlags2 src_access;
    sz_sync_source(res, &old_layout, &src_stage, &src_access);
 
-   const VkImageMemoryBarrier2 barrier = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-      .srcStageMask = src_stage,
-      .srcAccessMask = src_access,
-      .dstStageMask = dst.stages,
-      .dstAccessMask = dst.access,
-      .oldLayout = old_layout,
-      .newLayout = dst.layout,
-      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = res->image,
-      .subresourceRange = {
-         .aspectMask = sz_format_aspect(res->base.format),
-         .baseMipLevel = 0,
-         .levelCount = VK_REMAINING_MIP_LEVELS,
-         .baseArrayLayer = 0,
-         .layerCount = sz_image_layer_count(res),
-      },
-   };
+   /* One barrier per run of consecutive levels that share a layout. A mipmap
+    * chain normally has exactly one run -- every level is in the same layout --
+    * but generating level N reads N-1 and writes N, and a single barrier
+    * covering the whole chain then tells the driver the wrong starting layout
+    * for one of them. That is not a validation error; it is a wrong picture, or
+    * a hang on a driver that trusts the claim. */
+   const VkImageAspectFlags aspect = sz_format_aspect(res->base.format);
 
-   const VkDependencyInfo dep = {
-      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-      .imageMemoryBarrierCount = 1,
-      .pImageMemoryBarriers = &barrier,
-   };
-   screen->vk.CmdPipelineBarrier2(cmd, &dep);
+   const unsigned last_level =
+      level_count == VK_REMAINING_MIP_LEVELS
+         ? res->base.last_level
+         : MIN2(base_level + level_count - 1, res->base.last_level);
 
-   res->layout = dst.layout;
+   for (unsigned level = base_level; level <= last_level; level++) {
+      if (sz_level_layout(res, level) == dst.layout)
+         continue;
+
+      /* A run is levels that are in the *same starting layout*, not merely
+       * levels that all need changing: the barrier states one oldLayout, and
+       * claiming TRANSFER_SRC for a level that is TRANSFER_DST is
+       * VUID-VkImageMemoryBarrier2-oldLayout-01197 and a barrier that does not
+       * wait for the write it was supposed to. */
+      uint32_t old = res->undefined_contents ? VK_IMAGE_LAYOUT_UNDEFINED
+                                             : sz_level_layout(res, level);
+      unsigned run_end = level;
+      while (run_end + 1 <= last_level &&
+             (res->undefined_contents
+                 ? VK_IMAGE_LAYOUT_UNDEFINED
+                 : sz_level_layout(res, run_end + 1)) == old &&
+             sz_level_layout(res, run_end + 1) != dst.layout)
+         run_end++;
+
+      const VkImageMemoryBarrier2 barrier = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+         .srcStageMask = src_stage,
+         .srcAccessMask = src_access,
+         .dstStageMask = dst.stages,
+         .dstAccessMask = dst.access,
+         .oldLayout = old,
+         .newLayout = dst.layout,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .image = res->image,
+         .subresourceRange = {
+            .aspectMask = aspect,
+            .baseMipLevel = level,
+            .levelCount = run_end - level + 1,
+            .baseArrayLayer = 0,
+            .layerCount = sz_image_layer_count(res),
+         },
+      };
+
+      const VkDependencyInfo dep = {
+         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+         .imageMemoryBarrierCount = 1,
+         .pImageMemoryBarriers = &barrier,
+      };
+      screen->vk.CmdPipelineBarrier2(cmd, &dep);
+
+      for (unsigned i = level; i <= run_end; i++)
+         sz_level_set_layout(res, i, dst.layout);
+      level = run_end;
+   }
+
+   /* A ranged transition says nothing about the levels it did not touch, so the
+    * whole-image answer only becomes `dst.layout` when every level is in it. */
+   if (base_level == 0 && last_level == res->base.last_level)
+      res->layout = dst.layout;
    res->undefined_contents = false;
+   sz_levels_drop_if_uniform(res);
 
-   return res->layout;
+   return sz_level_layout(res, base_level);
 }
 
 void

@@ -49,8 +49,15 @@ struct sz_resource {
     * arrive with the sampler-view work. */
    VkImageView view;
 
-   /* Current layout, or VK_IMAGE_LAYOUT_UNDEFINED for buffers. */
+   /* Current layout, or VK_IMAGE_LAYOUT_UNDEFINED for buffers.
+    *
+    * This is the layout of every mip level, and it is what almost every
+    * transition uses. A mipmap chain is the exception: generating level N reads
+    * level N-1 and writes level N, and the two are in different layouts at that
+    * moment. `levels` records the levels that differ from `layout` -- NULL until
+    * one does, so the common case costs no allocation and no lookups. */
    VkImageLayout layout;
+   VkImageLayout *levels;
 
    /* Buffers only, because images express the same information through their
     * layout. The last stage and access that wrote this buffer, used to emit a

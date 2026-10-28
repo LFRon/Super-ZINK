@@ -59,6 +59,19 @@ struct sz_sync_state {
 VkImageLayout sz_resource_access(struct sz_screen *screen, VkCommandBuffer cmd,
                                  struct sz_resource *res, enum sz_access access);
 
+/* The same, for part of a mip chain.
+ *
+ * Needed whenever one command both reads and writes the same image: generating
+ * a mip chain reads level 0 and writes level 1 onwards, and two whole-image
+ * transitions would leave the image in the last layout asked for, which is the
+ * wrong one for whichever half the barrier was not about. */
+VkImageLayout sz_resource_access_levels(struct sz_screen *screen,
+                                        VkCommandBuffer cmd,
+                                        struct sz_resource *res,
+                                        enum sz_access access,
+                                        unsigned base_level,
+                                        unsigned level_count);
+
 /* Marks the current contents as discardable. The next transition will use
  * VK_IMAGE_LAYOUT_UNDEFINED as its source layout, which lets tilers skip reading
  * back the old contents. Correct whenever the next use fully overwrites the

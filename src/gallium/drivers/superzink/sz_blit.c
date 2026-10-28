@@ -326,8 +326,16 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
       return;
    }
 
-   sz_resource_access(ctx->screen, cmd, src, SZ_ACCESS_TRANSFER_SRC);
-   sz_resource_access(ctx->screen, cmd, dst, SZ_ACCESS_TRANSFER_DST);
+   /* Level-ranged, because a mipmap generation reads level N-1 and writes level
+    * N of the *same* image: two whole-image transitions would leave it in
+    * whichever layout was asked for second, and the blit would then name the
+    * wrong one for the half it reads (VUID-VkBlitImageInfo2-srcImageLayout-00221).
+    * The same applies to the shared-image case where src and dst differ only in
+    * level. */
+   sz_resource_access_levels(ctx->screen, cmd, src, SZ_ACCESS_TRANSFER_SRC,
+                             info->src.level, 1);
+   sz_resource_access_levels(ctx->screen, cmd, dst, SZ_ACCESS_TRANSFER_DST,
+                             info->dst.level, 1);
 
    /* A resolve needs the same extent, a multisampled source and a
     * single-sampled destination. Everything else is a blit, which handles

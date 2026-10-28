@@ -664,6 +664,7 @@ sz_resource_destroy_now(struct sz_screen *screen, struct pipe_resource *pres)
    }
 
    sz_bo_free(res->bo);
+   free(res->levels);
 
    FREE(res);
 }

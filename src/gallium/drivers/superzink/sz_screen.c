@@ -670,6 +670,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* Not claimed yet: cube map arrays need the per-level layout tracking that
+       * sz_sync.c now has (and the image extent.depth fix), and with those the
+       * validation errors are gone -- but mipmap generation into one still writes
+       * the wrong face, so the capability would turn a clean refusal into a wrong
+       * picture. */
+
       /* Inverted conditional rendering. The predicate is resolved on the host
        * when glBeginConditionalRender is called and the inverted form is the
        * same comparison with the result flipped, which sz_render_condition has
