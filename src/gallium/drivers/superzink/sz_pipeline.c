@@ -809,10 +809,22 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
 
    const VkSampleCountFlagBits samples = sz_framebuffer_samples(fb);
 
+   /* Per-sample shading: glMinSampleShading reaches the driver as
+    * pipe_rasterizer_state::force_persample_interp, which st sets when
+    * GL_SAMPLE_SHADING is on and MinSampleShadingValue * samples > 1. Vulkan
+    * wants a fraction as well; Gallium does not carry one, so the rate is 1.0 --
+    * shade every sample. That is a superset of a lower request (the image is
+    * right, only slower), and it is exactly what GL asks for at the default
+    * value. A single-sampled target cannot shade per sample at all, and Vulkan
+    * rejects the combination, so the request is dropped there. */
+   const bool sample_shading =
+      rast_state && rast_state->force_persample_interp && samples > 1;
+
    const VkPipelineMultisampleStateCreateInfo multisample = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
       .rasterizationSamples = samples,
-      .sampleShadingEnable = VK_FALSE,
+      .sampleShadingEnable = sample_shading ? VK_TRUE : VK_FALSE,
+      .minSampleShading = 1.0f,
    };
 
    const bool has_depth = fb->zsbuf.texture != NULL;

@@ -346,7 +346,15 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
 
    if (resolve)
       sz_blit_resolve(ctx, cmd, info, src, dst, aspect);
-   else if (depth_copy)
+   else if (src_samples > 1 || dst_samples > 1) {
+      /* vkCmdBlitImage cannot read or write a multisampled image at all
+       * (VUID-VkBlitImageInfo2-srcImage-00233): the only operation that crosses
+       * that boundary is a resolve, and a resolve cannot scale or reinterpret.
+       * GL's own rules leave nothing else reachable here, so a request that
+       * arrives this way has no Vulkan command behind it. */
+      sz_warn_once("a multisampled blit that is not a same-size resolve");
+      return;
+   } else if (depth_copy)
       sz_blit_copy(ctx, cmd, info, src, dst, aspect);
    else
       sz_blit_image(ctx, cmd, info, src, dst, aspect);

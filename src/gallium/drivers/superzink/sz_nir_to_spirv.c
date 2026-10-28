@@ -2907,6 +2907,56 @@ sz_emit_derivative(struct sz_translate *t, nir_intrinsic_instr *intrin)
    t->def_types[intrin->def.index] = dst;
 }
 
+/* gl_SampleMaskIn is an array of int in SPIR-V, one element per 32 samples, and
+ * GL exposes it as a single int. Reading element zero is what gl_SampleMaskIn
+ * means on every device this driver runs on: Vulkan only reaches past 32 samples
+ * with the coverage reductions GL has no equivalent for. */
+static uint32_t
+sz_load_mask_element(struct sz_translate *t, uint32_t var, uint32_t array_type,
+                     uint32_t int_type)
+{
+   const uint32_t arr = sz_spv_load(t->m, array_type, var);
+   const uint32_t index = sz_spv_const_int32(t->m, 0);
+   return sz_spv_composite_extract(t->m, int_type, arr, &index, 1);
+}
+
+static uint32_t
+sz_load_sample_mask_in(struct sz_translate *t)
+{
+   const uint32_t int_type = sz_spv_type_int32(t->m);
+   const uint32_t array_type = sz_spv_type_array(t->m, int_type, 1);
+
+   /* Both sample builtins require this capability, and SPIR-V wants it declared
+    * before the decoration that names them. */
+   sz_spv_capability(t->m, SpvCapabilitySampleRateShading);
+
+   for (unsigned i = 0; i < t->num_int_builtins; i++) {
+      if (t->int_builtins[i].builtin == SpvBuiltInSampleMask)
+         return sz_load_mask_element(t, t->int_builtins[i].var, array_type,
+                                     int_type);
+   }
+
+   if (t->num_int_builtins == ARRAY_SIZE(t->int_builtins)) {
+      sz_fail(t, "too many integer builtins in one shader");
+      return 0;
+   }
+
+   const uint32_t ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassInput, array_type);
+   const uint32_t var = sz_spv_variable(t->m, ptr_type, SpvStorageClassInput);
+   sz_spv_decorate(t->m, var, SpvDecorationBuiltIn, SpvBuiltInSampleMask);
+   /* A fragment input of integer type has to be Flat whatever it is, builtin or
+    * not (VUID-StandaloneSpirv-Flat-04744). */
+   sz_spv_decorate_bare(t->m, var, SpvDecorationFlat);
+
+   t->interfaces[t->num_interfaces++] = var;
+   t->int_builtins[t->num_int_builtins].builtin = SpvBuiltInSampleMask;
+   t->int_builtins[t->num_int_builtins].var = var;
+   t->num_int_builtins++;
+
+   return sz_load_mask_element(t, var, array_type, int_type);
+}
+
 /* Loads a scalar integer builtin input, declaring it on first use.
  *
  * gl_VertexID and gl_InstanceID are the two GL builtins that need no state at
@@ -2932,6 +2982,10 @@ sz_load_builtin_int(struct sz_translate *t, SpvBuiltIn builtin)
       sz_spv_type_ptr(t->m, SpvStorageClassInput, int_type);
    const uint32_t var = sz_spv_variable(t->m, ptr_type, SpvStorageClassInput);
    sz_spv_decorate(t->m, var, SpvDecorationBuiltIn, builtin);
+   /* An integer fragment input has to be Flat whatever it names, gl_SampleID
+    * included (VUID-StandaloneSpirv-Flat-04744). */
+   if (t->nir->info.stage == MESA_SHADER_FRAGMENT)
+      sz_spv_decorate_bare(t->m, var, SpvDecorationFlat);
 
    t->interfaces[t->num_interfaces++] = var;
    t->int_builtins[t->num_int_builtins].builtin = builtin;
@@ -2963,6 +3017,25 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       sz_spv_end_primitive(t->m);
       return true;
 
+   case nir_intrinsic_load_sample_id: {
+      /* gl_SampleID. Reading the sample index is what makes per-sample shading
+       * meaningful, which is why the capability is gated on this working. */
+      sz_spv_capability(t->m, SpvCapabilitySampleRateShading);
+      const uint32_t value = sz_load_builtin_int(t, SpvBuiltInSampleId);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_INT, 32, 1 };
+      return true;
+   }
+   case nir_intrinsic_load_sample_mask_in: {
+      const uint32_t value = sz_load_sample_mask_in(t);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_INT, 32, 1 };
+      return true;
+   }
    case nir_intrinsic_load_primitive_id: {
       /* gl_PrimitiveIDIn, which Vulkan spells PrimitiveId. Declared on first
        * use for the same reason the other builtins are. */
