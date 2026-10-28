@@ -407,8 +407,13 @@ sz_pick_queue_families(struct sz_screen *screen, uint32_t *graphics,
                    families[i].timestampValidBits ? "" : " (no timestamps)");
       }
 
-      if (has_graphics && g < 0)
+      if (has_graphics && g < 0) {
          g = i;
+         /* Timestamps are a property of the queue, not of the device: a family
+          * without valid bits silently writes nothing. The graphics family is
+          * the one every submission goes through. */
+         screen->have_timestamps = families[i].timestampValidBits > 0;
+      }
       if (has_compute && c < 0)
          c = i;
       /* A transfer-only family is the only reason to use a third queue;
@@ -530,6 +535,7 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(DestroyQueryPool, vkDestroyQueryPool);
    SZ_DEV_PROC(ResetQueryPool, vkResetQueryPool);
    SZ_DEV_PROC(CmdBeginQuery, vkCmdBeginQuery);
+   SZ_DEV_PROC(CmdWriteTimestamp2, vkCmdWriteTimestamp2);
    SZ_DEV_PROC(CmdEndQuery, vkCmdEndQuery);
    SZ_DEV_PROC(GetQueryPoolResults, vkGetQueryPoolResults);
    SZ_DEV_PROC(CmdBindTransformFeedbackBuffersEXT, vkCmdBindTransformFeedbackBuffersEXT);

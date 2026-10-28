@@ -126,6 +126,7 @@ struct sz_vk_entrypoints {
    PFN_vkResetQueryPool ResetQueryPool;
    PFN_vkCmdBeginQuery CmdBeginQuery;
    PFN_vkCmdEndQuery CmdEndQuery;
+   PFN_vkCmdWriteTimestamp2 CmdWriteTimestamp2;
    PFN_vkGetQueryPoolResults GetQueryPoolResults;
 
    /* VK_EXT_transform_feedback (sz_context). NULL when not enabled. */
@@ -361,6 +362,10 @@ struct sz_screen {
     * device was created with rather than what it advertised. */
    bool have_shader_clip_distance;
    bool have_shader_cull_distance;
+
+   /* The graphics queue family reports a non-zero timestampValidBits, so
+    * vkCmdWriteTimestamp2 records a value there. */
+   bool have_timestamps;
 
    bool have_d24_unorm_s8_uint;
    bool have_x8_d24_unorm_pack32;

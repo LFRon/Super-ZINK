@@ -99,6 +99,11 @@ struct sz_translate {
    /* Indexed by nir_def::index. */
    struct sz_dtype *def_types;
    uint32_t *defs_id;
+   /* A base type a def must be emitted with, because a phi already claimed it.
+    * A phi is emitted at the head of its block, so the value arriving on a loop's
+    * back edge has no type yet; without a hint the two sides guess independently
+    * and can disagree, which OpPhi rejects. 0xff means "no hint". */
+   uint8_t *base_hint;
    /* Constants are untyped in NIR and typed in SPIR-V, so a def that reaches a
     * phi as a different base type needs its own typed constant; remembering the
     * instruction here is what makes that possible. */
@@ -469,12 +474,26 @@ sz_infer_def_base(nir_def *def, unsigned depth, enum sz_base *out)
 static bool
 sz_def_base_from_producer(const nir_def *def, enum sz_base *out)
 {
-   const nir_instr *producer = nir_def_instr_const(def);
-   if (!producer || producer->type != nir_instr_type_alu)
-      return false;
+   /* Some opcodes take their type from an operand rather than declaring one:
+    * OpSelect, the vector constructors and the plain moves. Follow the operand
+    * that carries it -- the condition of a select carries a bool, not the
+    * result's type -- and give up rather than guess after a few steps. */
+   for (unsigned depth = 0; depth < 4; depth++) {
+      const nir_instr *producer = nir_def_instr_const(def);
+      if (!producer || producer->type != nir_instr_type_alu)
+         return false;
 
-   const nir_alu_instr *alu = nir_instr_as_alu(producer);
-   return sz_base_from_alu_type(nir_op_infos[alu->op].output_type, out);
+      const nir_alu_instr *alu = nir_instr_as_alu(producer);
+      if (sz_base_from_alu_type(nir_op_infos[alu->op].output_type, out))
+         return true;
+
+      const unsigned index = alu->op == nir_op_bcsel ? 1 : 0;
+      if (nir_op_infos[alu->op].num_inputs <= index || !alu->src[index].src.ssa)
+         return false;
+      def = alu->src[index].src.ssa;
+   }
+
+   return false;
 }
 
 /* NIR does not record a base type on defs, so instructions that do not carry one
@@ -489,6 +508,10 @@ sz_guess_def_type(struct sz_translate *t, const nir_def *def,
    out->base = SZ_BASE_FLOAT;
    out->bits = def->bit_size;
    out->ncomp = def->num_components;
+
+   /* A phi already decided this def's base type. */
+   if (t->base_hint && t->base_hint[def->index] != 0xff)
+      out->base = (enum sz_base)t->base_hint[def->index];
 
    if (def->bit_size == 1) {
       out->base = SZ_BASE_BOOL;
@@ -848,6 +871,13 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
       if (var->data.location_frac != 0)
          sz_spv_decorate(t->m, id, SpvDecorationComponent,
                          var->data.location_frac);
+
+      /* Dual-source blending: the second colour output of a location is the
+       * same Location with Index 1, which is how `layout(index = 1)` and
+       * glBindFragDataLocationIndexed reach Vulkan. Without it both outputs
+       * claim location 0 outright and the module is rejected. */
+      if (var->data.index != 0)
+         sz_spv_decorate(t->m, id, SpvDecorationIndex, var->data.index);
    }
 
    if (storage == SpvStorageClassOutput)
@@ -2804,14 +2834,27 @@ sz_emit_phi(struct sz_translate *t, nir_phi_instr *phi)
       /* Asked of the NIR definition rather than of the type recorded when it was
        * emitted: a phi's incoming value routinely comes from later in the shader
        * (the back edge of a loop), so nothing has been recorded for it yet. */
-      struct sz_dtype have = { 0 };
-      sz_guess_def_type(t, src->src.ssa, &have);
-      enum sz_base produced;
-      if (sz_def_base_from_producer(src->src.ssa, &produced))
-         have.base = produced;
+      struct sz_dtype have = t->def_types[src->src.ssa->index];
+      if (have.bits == 0) {
+         /* Not emitted yet: it will be, later in the shader (a loop's back edge
+          * is defined in the body), so ask the NIR side and remember the answer
+          * for when it is. */
+         sz_guess_def_type(t, src->src.ssa, &have);
+         enum sz_base produced;
+         if (sz_def_base_from_producer(src->src.ssa, &produced))
+            have.base = produced;
+      }
       if (have.base != type.base && have.bits == type.bits &&
-          have.ncomp == type.ncomp)
-         type.base = have.base;
+          have.ncomp == type.ncomp) {
+         if (t->def_types[src->src.ssa->index].bits == 0) {
+            /* The phi decides, and the operand has to agree when it is finally
+             * emitted. */
+            t->base_hint[src->src.ssa->index] = type.base;
+         } else {
+            /* The operand is already in the module, so its type wins. */
+            type.base = have.base;
+         }
+      }
       break;
    }
 
@@ -3370,8 +3413,11 @@ sz_nir_to_spirv(struct nir_shader *nir,
    t.defs_id = calloc(num_defs, sizeof(*t.defs_id));
    t.def_types = calloc(num_defs, sizeof(*t.def_types));
    t.consts = calloc(num_defs, sizeof(*t.consts));
+   t.base_hint = malloc(num_defs);
+   if (t.base_hint)
+      memset(t.base_hint, 0xff, num_defs);
    t.interfaces = calloc(SZ_MAX_VARIABLES, sizeof(*t.interfaces));
-   if (!t.defs_id || !t.def_types || !t.consts || !t.interfaces) {
+   if (!t.defs_id || !t.def_types || !t.consts || !t.base_hint || !t.interfaces) {
       sz_fail(&t, "out of memory");
       goto fail;
    }
@@ -3531,6 +3577,7 @@ sz_nir_to_spirv(struct nir_shader *nir,
    *word_count = bytes / sizeof(*copy);
 
    free(t.defs_id);
+   free(t.base_hint);
    free(t.def_types);
    free(t.consts);
    free(t.interfaces);
@@ -3539,6 +3586,7 @@ sz_nir_to_spirv(struct nir_shader *nir,
 
 fail:
    free(t.defs_id);
+   free(t.base_hint);
    free(t.def_types);
    free(t.consts);
    free(t.interfaces);

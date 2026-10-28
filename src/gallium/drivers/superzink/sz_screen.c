@@ -598,6 +598,22 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * ones that match the colour width, so glXChooseVisual finds nothing. */
       caps->mixed_color_depth_bits = true;
 
+      /* Timer queries: vkCmdWriteTimestamp2 exists whenever the device reports a
+       * valid-bit count, and the query layer checks that before creating a pool. */
+      caps->query_timestamp = true;
+      caps->query_time_elapsed = true;
+
+      /* Per-instance vertex attributes: the binding rate is Vulkan's, and
+       * glVertexAttribDivisor's non-zero divisors all collapse onto it. A divisor
+       * above one therefore fetches per instance rather than every Nth, which no
+       * Vulkan device can express. */
+      caps->vertex_element_instance_divisor = true;
+
+      /* Swizzled sampler views: pipe_sampler_view carries the four component
+       * swizzles and the view is created with them, so nothing else is needed
+       * for GL's texture swizzle to work. */
+      caps->texture_swizzle = true;
+
       /* No fixed-function clip planes: Vulkan clips on the ClipDistance the
        * shader writes, and nothing else. Reporting zero is what makes the state
        * tracker lower an application's clip planes -- and gl_ClipVertex, which

@@ -607,7 +607,13 @@ sz_pipeline_vertex_input(struct sz_context *ctx,
          bindings[binding_count++] = (VkVertexInputBindingDescription) {
             .binding = vb,
             .stride = elem->src_stride,
-            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+            /* glVertexAttribDivisor(0) is a per-vertex attribute and anything
+             * else is per-instance; Vulkan has exactly those two rates, so a
+             * divisor above one is not distinguishable from one -- see the
+             * limitation noted in sz_screen.c. */
+            .inputRate = elem->instance_divisor
+                            ? VK_VERTEX_INPUT_RATE_INSTANCE
+                            : VK_VERTEX_INPUT_RATE_VERTEX,
          };
       }
 

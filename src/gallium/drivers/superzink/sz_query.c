@@ -17,15 +17,54 @@
  * The alternative, one big pool with rotating slots, needs a completion value
  * per slot to know when a slot may be reset; that is only worth it once
  * timestamp queries make queries cheap enough to issue by the thousand. */
+typedef bool (*sz_query_supported_fn)(const struct sz_screen *screen);
+
 static bool
-sz_query_pool_type(enum pipe_query_type type, VkQueryType *out)
+sz_query_occlusion_supported(const struct sz_screen *screen)
+{
+   return true;
+}
+
+/* A timestamp query counts when the device reports a non-zero valid-bit count
+ * and a period: without them vkCmdWriteTimestamp2 writes nothing useful. */
+static bool
+sz_query_timestamp_supported(const struct sz_screen *screen)
+{
+   return screen->have_timestamps &&
+          screen->props.limits.timestampPeriod > 0.0f;
+}
+
+static bool
+sz_query_pool_type(const struct sz_screen *screen, enum pipe_query_type type,
+                   VkQueryType *out, unsigned *count)
 {
    switch (type) {
    case PIPE_QUERY_OCCLUSION_COUNTER:
    case PIPE_QUERY_OCCLUSION_PREDICATE:
    case PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE:
       *out = VK_QUERY_TYPE_OCCLUSION;
-      return true;
+      *count = 1;
+      return sz_query_occlusion_supported(screen);
+
+   case PIPE_QUERY_TIMESTAMP:
+      *out = VK_QUERY_TYPE_TIMESTAMP;
+      *count = 1;
+      return sz_query_timestamp_supported(screen);
+
+   case PIPE_QUERY_TIMESTAMP_DISJOINT:
+      /* Nothing in Vulkan says a timestamp is contiguous or that the clock ran
+       * at a constant rate, so the disjoint result is reported as "not
+       * disjoint" with a period of one nanosecond per tick after conversion. */
+      *out = VK_QUERY_TYPE_TIMESTAMP;
+      *count = 1;
+      return sz_query_timestamp_supported(screen);
+
+   case PIPE_QUERY_TIME_ELAPSED:
+      /* Two timestamps, and the answer is their difference. */
+      *out = VK_QUERY_TYPE_TIMESTAMP;
+      *count = 2;
+      return sz_query_timestamp_supported(screen);
+
    default:
       return false;
    }
@@ -38,7 +77,9 @@ sz_create_query(struct pipe_context *pipe, unsigned query_type, unsigned index)
    struct sz_screen *screen = ctx->screen;
 
    VkQueryType vk_type;
-   if (!sz_query_pool_type((enum pipe_query_type)query_type, &vk_type)) {
+   unsigned count;
+   if (!sz_query_pool_type(screen, (enum pipe_query_type)query_type, &vk_type,
+                           &count)) {
       /* A NULL return is the API's way of saying "this query type is not
        * supported", and st turns it into a GL error rather than a crash. */
       return NULL;
@@ -47,7 +88,7 @@ sz_create_query(struct pipe_context *pipe, unsigned query_type, unsigned index)
    const VkQueryPoolCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
       .queryType = vk_type,
-      .queryCount = 1,
+      .queryCount = count,
    };
 
    VkQueryPool pool = VK_NULL_HANDLE;
@@ -65,6 +106,7 @@ sz_create_query(struct pipe_context *pipe, unsigned query_type, unsigned index)
    q->base.type = (enum pipe_query_type)query_type;
    q->type = (enum pipe_query_type)query_type;
    q->pool = pool;
+   q->count = count;
 
    (void)index;
    return &q->base;
@@ -91,6 +133,42 @@ sz_destroy_query(struct pipe_context *pipe, struct pipe_query *query)
    free(q);
 }
 
+/* Records one timestamp of a timer query.
+ *
+ * The stage is ALL_COMMANDS rather than something finer: the value orders the
+ * work around the query, and it is written outside a render pass (see the
+ * comment in sz_begin_query), where targeting every stage is legal. */
+static void
+sz_query_timestamp(struct sz_context *ctx, VkCommandBuffer cmd,
+                   struct sz_query *q, unsigned index)
+{
+   ctx->screen->vk.CmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                      q->pool, index);
+}
+
+/* Nanoseconds out of raw ticks: timestampPeriod is the number of nanoseconds one
+ * tick takes, as a float, and GL reports nanoseconds. */
+static uint64_t
+sz_query_ticks_to_ns(const struct sz_screen *screen, uint64_t ticks)
+{
+   return (uint64_t)((double)ticks * (double)screen->props.limits.timestampPeriod);
+}
+
+/* Makes a query writable again: after a result was read it is "available", and
+ * writing or beginning an available query is what VUID-vkCmdBeginQuery-None-00807
+ * and VUID-vkCmdWriteTimestamp2-None-03864 reject. Resetting is a host call, but
+ * it may only happen once the device is done with the previous use. */
+static void
+sz_query_prepare(struct sz_context *ctx, struct sz_query *q)
+{
+   if (q->pending)
+      sz_queue_wait_idle(&ctx->screen->batch_state);
+
+   ctx->screen->vk.ResetQueryPool(ctx->screen->dev, q->pool, 0, q->count);
+   q->pending = false;
+   q->has_result = false;
+}
+
 bool
 sz_begin_query(struct pipe_context *pipe, struct pipe_query *query)
 {
@@ -103,16 +181,8 @@ sz_begin_query(struct pipe_context *pipe, struct pipe_query *query)
    /* Queued draws belong before the query. */
    sz_draw_flush(ctx);
 
-   /* A query must be reset before it can be begun again: after a result was
-    * read it is "available", and starting an available query is what
-    * VUID-vkCmdBeginQuery-None-00807 rejects. Resetting is cheap (a host call),
-    * but it may only happen once the device is done with the previous use. */
-   if (q->pending)
-      sz_queue_wait_idle(&ctx->screen->batch_state);
-
-   ctx->screen->vk.ResetQueryPool(ctx->screen->dev, q->pool, 0, 1);
-   q->pending = false;
-   q->has_result = false;
+   sz_query_prepare(ctx, q);
+   q->begun = true;
 
    /* The query has to start outside a render pass: Vulkan requires begin and end
     * to be on the same side of the boundary, and the draws between them are
@@ -122,7 +192,21 @@ sz_begin_query(struct pipe_context *pipe, struct pipe_query *query)
    if (cmd == VK_NULL_HANDLE)
       return false;
 
-   ctx->screen->vk.CmdBeginQuery(cmd, q->pool, 0, 0);
+   switch (q->type) {
+   case PIPE_QUERY_TIME_ELAPSED:
+      /* The first of the two timestamps whose difference is the answer. */
+      sz_query_timestamp(ctx, cmd, q, 0);
+      break;
+   case PIPE_QUERY_TIMESTAMP:
+   case PIPE_QUERY_TIMESTAMP_DISJOINT:
+      /* A single timestamp is written by end_query -- glQueryCounter has no
+       * begin at all -- and the disjointness is a property of the device. */
+      break;
+   default:
+      ctx->screen->vk.CmdBeginQuery(cmd, q->pool, 0, 0);
+      break;
+   }
+
    return true;
 }
 
@@ -138,11 +222,32 @@ sz_end_query(struct pipe_context *pipe, struct pipe_query *query)
    /* Everything recorded between begin and end belongs to the query. */
    sz_draw_flush(ctx);
 
+   /* glQueryCounter writes a timestamp with no begin before it, and a query must
+    * be reset before it is written (VUID-vkCmdWriteTimestamp2-None-03864). */
+   if (!q->begun)
+      sz_query_prepare(ctx, q);
+   q->begun = false;
+
    VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
       return false;
 
-   ctx->screen->vk.CmdEndQuery(cmd, q->pool, 0);
+   switch (q->type) {
+   case PIPE_QUERY_TIMESTAMP:
+      sz_query_timestamp(ctx, cmd, q, 0);
+      break;
+   case PIPE_QUERY_TIME_ELAPSED:
+      sz_query_timestamp(ctx, cmd, q, 1);
+      break;
+   case PIPE_QUERY_TIMESTAMP_DISJOINT:
+      /* Nothing to record: the answer is a property of the device, not of the
+       * work between begin and end. */
+      break;
+   default:
+      ctx->screen->vk.CmdEndQuery(cmd, q->pool, 0);
+      break;
+   }
+
    q->pending = true;
    return true;
 }
@@ -160,16 +265,30 @@ sz_query_read(struct sz_context *ctx, struct sz_query *q, bool wait,
    if (wait)
       sz_queue_wait_idle(&ctx->screen->batch_state);
 
-   uint64_t value = q->value;
-   const VkResult result =
-      screen->vk.GetQueryPoolResults(screen->dev, q->pool, 0, 1, sizeof(value),
-                                     &value, sizeof(value),
-                                     VK_QUERY_RESULT_64_BIT);
+   uint64_t values[2] = { 0, 0 };
+   const VkResult result = screen->vk.GetQueryPoolResults(
+      screen->dev, q->pool, 0, q->count, sizeof(values), values,
+      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
    if (result == VK_NOT_READY)
       return false;
    if (result != VK_SUCCESS) {
       mesa_loge("SZ: vkGetQueryPoolResults failed: %d", result);
       return false;
+   }
+
+   uint64_t value;
+   switch (q->type) {
+   case PIPE_QUERY_TIME_ELAPSED:
+      /* Two timestamps around the work; the answer is how long it took. */
+      value = sz_query_ticks_to_ns(screen, values[1] - values[0]);
+      break;
+   case PIPE_QUERY_TIMESTAMP_DISJOINT:
+      /* Only "was the clock continuous" is read from it, and it always was. */
+      value = 0;
+      break;
+   default:
+      value = sz_query_ticks_to_ns(screen, values[0]);
+      break;
    }
 
    q->pending = false;
@@ -213,6 +332,12 @@ sz_get_query_result(struct pipe_context *pipe, struct pipe_query *query,
    case PIPE_QUERY_OCCLUSION_PREDICATE:
    case PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE:
       result->b = value != 0;
+      break;
+   case PIPE_QUERY_TIMESTAMP_DISJOINT:
+      /* A nanosecond per tick, and the clock never was discontinuous: Vulkan
+       * offers nothing that would tell us it had been. */
+      result->timestamp_disjoint.frequency = 1000000000;
+      result->timestamp_disjoint.disjoint = false;
       break;
    default:
       result->u64 = value;

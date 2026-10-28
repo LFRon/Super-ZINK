@@ -4,9 +4,10 @@
  *
  * Query objects.
  *
- * Only the two groups GL 3.0 needs are implemented: occlusion queries and the
- * conditional rendering built on top of them. Everything else (timestamps,
- * transform feedback statistics, pipeline statistics) arrives with the version
+ * Two groups are implemented: the occlusion queries and the conditional
+ * rendering built on top of them, and the timer queries, which are what
+ * ARB_timer_query -- and therefore GL 3.3 -- asks for. Everything else
+ * (transform feedback statistics, pipeline statistics) arrives with the version
  * that requires it, because each maps to a different VkQueryType and a
  * different result layout.
  */
@@ -29,6 +30,10 @@ struct sz_query {
 
    VkQueryPool pool;
 
+   /* A begin/end pair is open, so end_query must not reset the pool under it.
+    * glQueryCounter has no begin at all and goes straight to end_query. */
+   bool begun;
+
    /* A begin/end pair was recorded but its result has not been read yet, so the
     * pool may still be in use by the device. Resetting it has to wait. */
    bool pending;
@@ -40,6 +45,11 @@ struct sz_query {
 
    /* Last value read, so a repeated GL_QUERY_RESULT does not submit again. */
    uint64_t value;
+
+   /* Timer queries that are not a single timestamp record two: one at begin and
+    * one at end, and the result is the difference. `count` is how many slots the
+    * pool has. */
+   unsigned count;
 };
 
 /* Reads a query result as a 64-bit value. `wait` blocks until the result is
