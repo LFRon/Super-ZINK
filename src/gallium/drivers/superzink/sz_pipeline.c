@@ -734,11 +734,27 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
     * index through glPrimitiveRestartIndex is handled above the driver: cso's
     * vbuf rewrites the buffer when caps->emulate_nonfixed_primitive_restart is
     * set, so what arrives here is always the fixed index. */
+   /* GL restarts a list topology on the restart index like any other, Vulkan does
+    * not: for POINT_LIST, LINE_LIST, TRIANGLE_LIST and the two list-with-adjacency
+    * topologies it requires primitiveRestartEnable to be VK_FALSE unless
+    * primitiveTopologyListRestart is enabled
+    * (VUID-VkPipelineInputAssemblyStateCreateInfo-topology-06252). Turning it off
+    * there is the only legal answer when the device cannot do it. */
+   const bool list_topology =
+      topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ||
+      topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
+      topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+      topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY ||
+      topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+
+   const bool restart =
+      ctx->state.primitive_restart &&
+      (!list_topology || ctx->screen->caps.list_restart);
+
    const VkPipelineInputAssemblyStateCreateInfo input_assembly = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
       .topology = topology,
-      .primitiveRestartEnable =
-         ctx->state.primitive_restart ? VK_TRUE : VK_FALSE,
+      .primitiveRestartEnable = restart ? VK_TRUE : VK_FALSE,
    };
 
    /* Viewport and scissor are dynamic: GL changes them per draw and per viewport

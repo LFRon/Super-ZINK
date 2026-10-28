@@ -47,6 +47,7 @@
    X(logicOp)                                                                   \
    X(depthBiasClamp)                                                            \
    X(drawIndirectFirstInstance)                                                 \
+   X(multiDrawIndirect)                                                         \
    X(imageCubeArray)                                                            \
    X(fragmentStoresAndAtomics)                                                  \
    X(shaderImageGatherExtended)                                                 \
@@ -228,6 +229,7 @@ sz_feature_selection(const struct sz_screen *screen)
       .fragment_shading_rate = caps->fragment_shading_rate,
       .shader_image_int64 = caps->shader_image_int64_atomics,
       .multi_draw = caps->multi_draw,
+      .list_restart = caps->list_restart,
       .transform_feedback = caps->transform_feedback,
    };
 }
@@ -281,6 +283,7 @@ sz_gate_features(const struct sz_screen *screen, struct sz_vk_features *features
       features->f14.dynamicRenderingLocalRead &= caps->dynamic_rendering_local_read;
       features->f14.hostImageCopy &= caps->host_image_copy;
       features->f14.pushDescriptor &= caps->push_descriptor;
+
    } else {
       features->local_read.dynamicRenderingLocalRead &=
          caps->dynamic_rendering_local_read;
@@ -306,6 +309,7 @@ sz_gate_features(const struct sz_screen *screen, struct sz_vk_features *features
    features->image_int64.shaderImageInt64Atomics &=
       caps->shader_image_int64_atomics;
    features->multi_draw.multiDraw &= caps->multi_draw;
+   features->list_restart.primitiveTopologyListRestart &= caps->list_restart;
    features->transform_feedback.transformFeedback &= caps->transform_feedback;
 }
 
@@ -555,6 +559,8 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdBindIndexBuffer, vkCmdBindIndexBuffer);
    SZ_DEV_PROC(CmdDraw, vkCmdDraw);
    SZ_DEV_PROC(CmdDrawIndexed, vkCmdDrawIndexed);
+   SZ_DEV_PROC(CmdDrawIndirect, vkCmdDrawIndirect);
+   SZ_DEV_PROC(CmdDrawIndexedIndirect, vkCmdDrawIndexedIndirect);
    SZ_DEV_PROC(CmdClearAttachments, vkCmdClearAttachments);
    /* NULL unless VK_EXT_multi_draw was enabled; the draw stream checks. */
    SZ_DEV_PROC(CmdDrawMultiEXT, vkCmdDrawMultiEXT);

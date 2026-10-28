@@ -619,6 +619,15 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * nir_texop_lod, so the capability was simply never claimed. */
       caps->texture_query_lod = true;
 
+      /* GL_ARB_draw_indirect: the counts come out of a buffer through
+       * vkCmdDrawIndirect, which is core Vulkan. Two device features decide
+       * whether that is honest -- drawIndirectFirstInstance, because GL allows a
+       * first instance in the argument buffer, and multiDrawIndirect, because one
+       * call can describe several draws. */
+      caps->draw_indirect =
+         screen->caps.core_features.drawIndirectFirstInstance &&
+         screen->caps.core_features.multiDrawIndirect;
+
       /* No fixed-function clip planes: Vulkan clips on the ClipDistance the
        * shader writes, and nothing else. Reporting zero is what makes the state
        * tracker lower an application's clip planes -- and gl_ClipVertex, which

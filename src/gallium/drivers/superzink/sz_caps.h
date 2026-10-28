@@ -123,7 +123,13 @@
      q.multi_draw.multiDraw)                                                    \
    X(transform_feedback,           "transformFeedback",                          \
      "VK_EXT_transform_feedback",           SZ_CORE_NONE,                      \
-     q.transform_feedback.transformFeedback)
+     q.transform_feedback.transformFeedback)                                    \
+   /* Without this, Vulkan forbids primitive restart on the five list topologies   \
+    * (VUID-VkPipelineInputAssemblyStateCreateInfo-topology-06252), while GL        \
+    * applies glPrimitiveRestartIndex to them like any other topology. */          \
+   X(list_restart,                 "primitiveTopologyListRestart",               \
+     "VK_EXT_primitive_topology_list_restart", SZ_CORE_NONE,                   \
+     q.list_restart.primitiveTopologyListRestart)
 
 /* Every VkPhysicalDevice*Features structure Super-ZINK ever chains, in one
  * place. Querying (sz_caps_init) and enabling (sz_device_create) both go
@@ -155,6 +161,7 @@ struct sz_vk_features {
    VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsr;
    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64;
    VkPhysicalDeviceMultiDrawFeaturesEXT multi_draw;
+   VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart;
    VkPhysicalDeviceTransformFeedbackFeaturesEXT transform_feedback;
 
    /* Not a feature: VkPhysicalDeviceVulkan14Properties carries the two
@@ -178,6 +185,7 @@ struct sz_vk_feature_selection {
    bool fragment_shading_rate;
    bool shader_image_int64;
    bool multi_draw;
+   bool list_restart;
    bool transform_feedback;
 };
 

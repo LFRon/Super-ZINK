@@ -225,6 +225,20 @@ struct sz_context {
       struct pipe_resource *index_resource;
       VkDeviceSize index_offset;
       VkIndexType index_type;
+
+      /* An indirect batch is the only one in the ring: the vertex, instance and
+       * index counts come out of a buffer rather than the command stream, so
+       * there is nothing for the batcher to merge and no VkMultiDrawInfoEXT to
+       * merge it into. Every indirect draw flushes on its own. */
+      struct {
+         struct sz_resource *buffer;
+         /* Holds the reference that keeps `buffer` alive until the flush: the
+          * resource in pipe_draw_indirect_info is only valid for the call. */
+         struct pipe_resource *resource;
+         VkDeviceSize offset;
+         uint32_t stride;
+         uint32_t draw_count;
+      } indirect;
    } pending;
 
    /* Set for a draw that samples the very image it renders into. Vulkan leaves

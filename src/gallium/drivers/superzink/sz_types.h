@@ -147,6 +147,10 @@ struct sz_vk_entrypoints {
    PFN_vkCmdBindIndexBuffer CmdBindIndexBuffer;
    PFN_vkCmdDraw CmdDraw;
    PFN_vkCmdDrawIndexed CmdDrawIndexed;
+   /* Core 1.0, so no extension has to be enabled -- but the counts come out of
+    * a buffer, which is the whole of GL_ARB_draw_indirect. */
+   PFN_vkCmdDrawIndirect CmdDrawIndirect;
+   PFN_vkCmdDrawIndexedIndirect CmdDrawIndexedIndirect;
    PFN_vkCmdClearAttachments CmdClearAttachments;
    /* VK_EXT_multi_draw. NULL when the extension is not enabled, which is the
     * only thing the draw stream checks before falling back to a loop of

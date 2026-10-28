@@ -2024,6 +2024,22 @@ sz_emit_draws(struct sz_context *ctx, VkCommandBuffer cmd)
    ctx->screen->stats.draws += n;
    ctx->screen->stats.batches++;
 
+   /* An indirect batch is exactly one record: the counts live in the buffer, so
+    * there is no VkMultiDrawInfoEXT for them to travel in. */
+   if (ctx->pending.indirect.buffer) {
+      const VkBuffer buffer = ctx->pending.indirect.buffer->buffer;
+      const VkDeviceSize offset = ctx->pending.indirect.offset;
+      const uint32_t stride = ctx->pending.indirect.stride;
+      const uint32_t count = ctx->pending.indirect.draw_count;
+
+      if (ctx->pending.indexed)
+         ctx->screen->vk.CmdDrawIndexedIndirect(cmd, buffer, offset, count,
+                                                stride);
+      else
+         ctx->screen->vk.CmdDrawIndirect(cmd, buffer, offset, count, stride);
+      return;
+   }
+
    /* One call for the whole batch. The data is a plain host array: Vulkan copies
     * it into the command stream while recording, so there is nothing to keep
     * alive afterwards. */
@@ -2377,7 +2393,9 @@ sz_draw_flush(struct sz_context *ctx)
 
    ctx->dirty = 0;
    ctx->pending.count = 0;
+   ctx->pending.indirect.buffer = NULL;
    pipe_resource_reference(&ctx->pending.index_resource, NULL);
+   pipe_resource_reference(&ctx->pending.indirect.resource, NULL);
 }
 
 static bool
@@ -2455,6 +2473,64 @@ sz_draw_append(struct sz_context *ctx, const struct pipe_draw_info *info,
    }
 }
 
+/* One indirect draw, queued the same way a direct one is.
+ *
+ * Everything the pipeline needs -- topology, index type, primitive restart -- is
+ * known from the call; only the counts are not, and Vulkan reads those out of the
+ * buffer itself. That is also why the batch is flushed immediately: there is no
+ * count for the batcher to merge, and the buffer is only guaranteed to be alive
+ * for the duration of this call.
+ */
+static void
+sz_draw_append_indirect(struct sz_context *ctx, const struct pipe_draw_info *info,
+                        const struct pipe_draw_indirect_info *indirect,
+                        struct sz_resource *index, VkIndexType type)
+{
+   struct sz_resource *args = indirect->buffer ? sz_resource(indirect->buffer) : NULL;
+   if (!args || args->buffer == VK_NULL_HANDLE)
+      return;
+
+   sz_draw_flush(ctx);
+
+   const bool indexed = info->index_size != 0;
+
+   ctx->pending.indexed = indexed;
+   ctx->pending.topology = sz_topology(info->mode);
+   ctx->pending.primitive_restart = info->primitive_restart;
+   /* The pipeline key reads the shadow state, not the batch, so primitive
+    * restart has to be published there like any other state change. */
+   if (ctx->state.primitive_restart != info->primitive_restart) {
+      ctx->state.primitive_restart = info->primitive_restart;
+      ctx->dirty |= SZ_DIRTY_PIPELINE;
+   }
+   ctx->pending.index_buffer = index;
+   pipe_resource_reference(&ctx->pending.index_resource,
+                           index ? &index->base : NULL);
+   ctx->pending.index_type = type;
+   ctx->pending.index_offset = 0;
+   /* Instance and vertex counts come from the buffer, so these are never read;
+    * they are kept honest for the pipeline key. */
+   ctx->pending.instance_count = 1;
+   ctx->pending.start_instance = 0;
+
+   ctx->pending.indirect.buffer = args;
+   pipe_resource_reference(&ctx->pending.indirect.resource, &args->base);
+   ctx->pending.indirect.offset = indirect->offset;
+   /* A stride of zero means one draw command; Vulkan wants a real stride, and any
+    * value is legal when the count is one. */
+   ctx->pending.indirect.stride = indirect->stride ? indirect->stride
+                                                   : sizeof(uint32_t) * 4;
+   ctx->pending.indirect.draw_count = indirect->draw_count ? indirect->draw_count : 1;
+
+   ctx->pending.count = 1;
+   ctx->pending.draws[0].count = 0;
+   ctx->pending.draws[0].first = 0;
+   ctx->pending.draws[0].index_bias = 0;
+
+   ctx->dirty |= SZ_DIRTY_INDEX_BUFFER | SZ_DIRTY_PIPELINE;
+   sz_draw_flush(ctx);
+}
+
 static void
 sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset,
@@ -2463,8 +2539,14 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
 {
    struct sz_context *ctx = sz_context(pipe);
 
-   if (indirect || num_draws == 0) {
-      sz_warn_once("indirect draws are not implemented, ignoring");
+   if (num_draws == 0 && !indirect)
+      return;
+
+   if (indirect && indirect->indirect_draw_count) {
+      /* glMultiDrawElementsIndirectCount reads the draw count from a buffer too,
+       * which needs VK_KHR_draw_indirect_count. Refusing is correct: the counts
+       * would otherwise be taken from the caller's num_draws. */
+      sz_warn_once("indirect draws with a draw count are not implemented");
       return;
    }
 
@@ -2507,7 +2589,10 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                                    : VK_INDEX_TYPE_UINT16;
    }
 
-   sz_draw_append(ctx, info, draws, num_draws, index, type);
+   if (indirect)
+      sz_draw_append_indirect(ctx, info, indirect, index, type);
+   else
+      sz_draw_append(ctx, info, draws, num_draws, index, type);
 }
 
 static void
