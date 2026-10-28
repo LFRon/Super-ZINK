@@ -340,14 +340,14 @@ sz_spv_type_array(struct sz_spv_module *m, uint32_t element, unsigned count)
 
 uint32_t
 sz_spv_type_image(struct sz_spv_module *m, uint32_t sampled_type, SpvDim dim,
-                  bool depth, bool arrayed, bool ms, bool sampled)
+                  bool depth, bool arrayed, bool ms, unsigned sampled)
 {
    /* OpTypeImage's Dim, Depth, Arrayed, MS and Sampled operands are literal
     * numbers rather than ids, so they cannot share the three-word cache key
     * directly; they are packed into it instead. */
    const uint32_t flags = (uint32_t)dim | (depth ? 1u << 8 : 0) |
                           (arrayed ? 1u << 9 : 0) | (ms ? 1u << 10 : 0) |
-                          (sampled ? 1u << 11 : 0);
+                          ((sampled & 3u) << 11);
 
    uint32_t id = sz_spv_type_lookup(m, SpvOpTypeImage, sampled_type, flags, 0);
    if (id)
@@ -359,14 +359,18 @@ sz_spv_type_image(struct sz_spv_module *m, uint32_t sampled_type, SpvDim dim,
     * is what makes spirv-val accept the type; without it the module is invalid
     * and the Vulkan driver's parser is entitled to do anything, including
     * segfault. */
+   /* A storage image needs the Image* capability, a sampled image the Sampled*
+    * one; `sampled` is 1 or 2, so the test is against 1 rather than truthiness. */
+   const bool is_sampled = sampled == 1;
+
    switch (dim) {
    case SpvDim1D:
-      sz_spv_capability(m, sampled ? SpvCapabilitySampled1D
-                                    : SpvCapabilityImage1D);
+      sz_spv_capability(m, is_sampled ? SpvCapabilitySampled1D
+                                      : SpvCapabilityImage1D);
       break;
    case SpvDimBuffer:
-      sz_spv_capability(m, sampled ? SpvCapabilitySampledBuffer
-                                    : SpvCapabilityImageBuffer);
+      sz_spv_capability(m, is_sampled ? SpvCapabilitySampledBuffer
+                                      : SpvCapabilityImageBuffer);
       break;
    case SpvDimCube:
       if (arrayed)
@@ -382,8 +386,8 @@ sz_spv_type_image(struct sz_spv_module *m, uint32_t sampled_type, SpvDim dim,
       break;
    }
    if (ms && arrayed)
-      sz_spv_capability(m, sampled ? SpvCapabilitySampledImageArrayDynamicIndexing
-                                    : SpvCapabilityImageMSArray);
+      sz_spv_capability(m, is_sampled ? SpvCapabilitySampledImageArrayDynamicIndexing
+                                      : SpvCapabilityImageMSArray);
 
    /* Every texture in this driver is a sampled texture with an ordinary GL
     * format, so the format operand is Unknown: it only matters for storage

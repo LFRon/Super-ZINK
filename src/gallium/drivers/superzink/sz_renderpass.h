@@ -19,6 +19,12 @@
 #include "sz_types.h"
 
 /* True when the current framebuffer state can be described at all. */
+/* The image view for one subresource range of `res`, cached on the context.
+ * Shared with the storage-image descriptors, which address the same kind of
+ * range. */
+VkImageView sz_surface_view(struct sz_context *ctx, struct sz_resource *res,
+                            VkFormat format, const struct pipe_surface *surf);
+
 bool sz_renderpass_is_valid(struct sz_context *ctx);
 
 /* Transitions the attachments and starts dynamic rendering.

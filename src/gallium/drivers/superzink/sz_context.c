@@ -1679,12 +1679,82 @@ sz_set_shader_buffers(struct pipe_context *pipe, mesa_shader_stage shader,
 {
 }
 
+/* The VkImageView for a bound storage image, and the transition that makes the
+ * image readable and writable in a shader. The view is cached on the context
+ * like an attachment's, so a draw that rebinds the same image costs a lookup. */
+bool
+sz_shader_image_view(struct sz_context *ctx, VkCommandBuffer cmd,
+                     const struct pipe_image_view *img, VkImageView *out)
+{
+   if (!img || !img->resource)
+      return false;
+
+   struct sz_resource *res = sz_resource(img->resource);
+   if (res->image == VK_NULL_HANDLE)
+      return false;
+
+   /* GL images are read-write, so the layout is GENERAL rather than a read-only
+    * one; that is also the only layout a Vulkan storage image descriptor may
+    * name when the shader both loads and stores. */
+   sz_resource_access(ctx->screen, cmd, res, SZ_ACCESS_STORAGE);
+
+   const struct pipe_surface surf = {
+      .format = img->format,
+      .level = img->u.tex.level,
+      .first_layer = img->u.tex.first_layer,
+      .last_layer = img->u.tex.last_layer,
+   };
+   *out = sz_surface_view(ctx, res, sz_vk_format(ctx->screen, img->format),
+                          &surf);
+   return *out != VK_NULL_HANDLE;
+}
+
 static void
 sz_set_shader_images(struct pipe_context *pipe, mesa_shader_stage shader,
                      unsigned start_slot, unsigned count,
                      unsigned unbind_num_trailing_slots,
                      const struct pipe_image_view *images)
 {
+   struct sz_context *ctx = sz_context(pipe);
+
+   /* Recorded draws name whatever was bound when they were queued, so the
+    * bindings they used have to be submitted before any of them changes. */
+   sz_draw_flush(ctx);
+
+   for (unsigned i = 0; i < count; i++) {
+      const unsigned slot = start_slot + i;
+      if (slot >= SZ_MAX_IMAGES)
+         break;
+
+      struct pipe_image_view **dst = &ctx->state.shader_images[shader][slot];
+      if (*dst) {
+         pipe_resource_reference(&(*dst)->resource, NULL);
+         FREE(*dst);
+         *dst = NULL;
+      }
+
+      if (!images[i].resource)
+         continue;
+
+      struct pipe_image_view *copy = CALLOC_STRUCT(pipe_image_view);
+      if (!copy)
+         continue;
+      *copy = images[i];
+      pipe_resource_reference(&copy->resource, images[i].resource);
+      *dst = copy;
+   }
+
+   for (unsigned i = 0; i < unbind_num_trailing_slots; i++) {
+      const unsigned slot = start_slot + count + i;
+      if (slot >= SZ_MAX_IMAGES)
+         break;
+      struct pipe_image_view **dst = &ctx->state.shader_images[shader][slot];
+      if (*dst) {
+         pipe_resource_reference(&(*dst)->resource, NULL);
+         FREE(*dst);
+         *dst = NULL;
+      }
+   }
 }
 
 static void

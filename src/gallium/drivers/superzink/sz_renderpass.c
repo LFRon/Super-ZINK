@@ -49,7 +49,7 @@ sz_renderpass_is_valid(struct sz_context *ctx)
  * The views are cached on the context and dropped whenever the framebuffer
  * changes, because that is exactly when the set is no longer needed; the
  * objects themselves live until the image does. */
-static VkImageView
+VkImageView
 sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format,
                 const struct pipe_surface *surf)
 {

@@ -1260,6 +1260,7 @@ sz_pipeline_screen_init(struct sz_screen *screen)
       screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_UBO],
       screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_SAMPLERS],
       screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_TEXEL_BUFFERS],
+      screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_IMAGES],
    };
 
    /* No VkPipelineLayoutCreateFlagBits is needed: the push-descriptor bit lives

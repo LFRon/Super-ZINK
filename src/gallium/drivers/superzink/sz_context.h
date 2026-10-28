@@ -318,6 +318,9 @@ struct sz_context {
        * still names it. */
       struct pipe_sampler_view *sampler_views[MESA_SHADER_STAGES]
                                              [PIPE_MAX_SAMPLERS];
+      /* Same ownership story for the storage images: imageLoad/imageStore name
+       * the image through a descriptor this driver writes from here. */
+      struct pipe_image_view *shader_images[MESA_SHADER_STAGES][SZ_MAX_IMAGES];
       void *shaders[MESA_SHADER_STAGES];
 
       /* Owned: the context holds a reference to every bound buffer, because
@@ -361,6 +364,11 @@ void sz_context_submit(struct sz_context *ctx);
  * it first, which is what makes the batching correct: whatever a draw needs is
  * captured before anything else can change the state. */
 void sz_draw_flush(struct sz_context *ctx);
+
+/* The VkImageView a bound storage image needs, created and cached on first use.
+ * Also records the transition into the layout a read-write image needs. */
+bool sz_shader_image_view(struct sz_context *ctx, VkCommandBuffer cmd,
+                          const struct pipe_image_view *img, VkImageView *out);
 
 /* pipe_context is the first member, so the cast is the whole accessor. */
 static inline struct sz_context *

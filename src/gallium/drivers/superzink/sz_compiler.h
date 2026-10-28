@@ -42,6 +42,11 @@
  * stage has to fit in that. */
 #define SZ_MAX_SAMPLERS 16
 
+/* Storage images per stage. GL guarantees eight image units, which is what
+ * GL_MAX_IMAGE_UNITS reports; they live in a descriptor set of their own because
+ * VK_DESCRIPTOR_TYPE_STORAGE_IMAGE is a third descriptor type. */
+#define SZ_MAX_IMAGES 8
+
 /* Size of the array the translator declares inside a uniform block, in 32-bit
  * words. The block has no declared member types -- the load applies one -- so
  * the array exists only to give SPIR-V a type with an ArrayStride. It cannot be
@@ -76,11 +81,16 @@
  * texture is a VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER -- a VkBufferView, with no
  * sampler and no image view, which a COMBINED_IMAGE_SAMPLER binding cannot hold. */
 #define SZ_DESCRIPTOR_SET_TEXEL_BUFFERS 2
-#define SZ_DESCRIPTOR_SET_COUNT 3
+/* Set 3 holds the storage images: the images a shader reads and writes through
+ * imageLoad/imageStore/imageAtomic. VK_DESCRIPTOR_TYPE_STORAGE_IMAGE is a third
+ * descriptor type, so it needs a third set. */
+#define SZ_DESCRIPTOR_SET_IMAGES 3
+#define SZ_DESCRIPTOR_SET_COUNT 4
 #define SZ_DESCRIPTOR_STAGES 3
 #define SZ_DESCRIPTOR_UBO_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_CONST_BUFFERS)
 #define SZ_DESCRIPTOR_SAMPLER_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
 #define SZ_DESCRIPTOR_TEXEL_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
+#define SZ_DESCRIPTOR_IMAGE_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_IMAGES)
 
 /* How many distinct sampler-set contents to cache. Every draw that rebinds the
  * same textures and samplers hits an existing entry, so this is the number of
@@ -132,6 +142,13 @@ static inline unsigned
 sz_texel_binding(mesa_shader_stage stage, unsigned slot)
 {
    return sz_descriptor_stage_index(stage) * SZ_MAX_SAMPLERS + slot;
+}
+
+/* The same numbering, in the storage-image set. */
+static inline unsigned
+sz_image_binding(mesa_shader_stage stage, unsigned slot)
+{
+   return sz_descriptor_stage_index(stage) * SZ_MAX_IMAGES + slot;
 }
 
 /* The options for one shader stage. The returned pointer stays valid for the

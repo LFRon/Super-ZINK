@@ -63,11 +63,14 @@ uint32_t sz_spv_type_array(struct sz_spv_module *m, uint32_t element,
                            unsigned count);
 /* OpTypeImage. `sampled_type` is the type of one texel component as the shader
  * reads it, `dim` the dimensionality, and the flags map straight onto the
- * operands of the same name. Not cached by the three-word key alone: the
- * literal operands are packed into it. */
+ * operands of the same name. `sampled` is the operand of that name and takes
+ * three values, not two: 1 is a sampled image (read through a sampler), 2 is a
+ * storage image (read and written by imageLoad/imageStore), and Vulkan rejects
+ * any other value. Not cached by the three-word key alone: the literal operands
+ * are packed into it. */
 uint32_t sz_spv_type_image(struct sz_spv_module *m, uint32_t sampled_type,
                            SpvDim dim, bool depth, bool arrayed, bool ms,
-                           bool sampled);
+                           unsigned sampled);
 /* OpTypeSampledImage, the type a combined image sampler variable holds. */
 uint32_t sz_spv_type_sampled_image(struct sz_spv_module *m, uint32_t image);
 uint32_t sz_spv_type_ptr(struct sz_spv_module *m, SpvStorageClass storage,

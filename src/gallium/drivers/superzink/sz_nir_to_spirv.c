@@ -164,6 +164,16 @@ struct sz_translate {
    } samplers[SZ_MAX_SAMPLERS];
    unsigned num_samplers;
 
+   /* Storage images, declared on first use like the samplers: a GL image
+    * uniform is a descriptor, and one that the shader never touches still names
+    * a binding the layout has to have. */
+   struct {
+      unsigned index;
+      uint32_t image_type;
+      uint32_t value;
+   } images[SZ_MAX_IMAGES];
+   unsigned num_images;
+
    uint32_t *interfaces;
    unsigned num_interfaces;
 
@@ -856,6 +866,43 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
       t->nir->info.stage != MESA_SHADER_FRAGMENT && var->name &&
       strncmp(var->name, "gl_", 3) == 0;
 
+   /* An image uniform reaches here in either nir_var_image or nir_var_uniform
+    * depending on how the frontend filed it; both are the same thing. */
+   const bool is_image_var =
+      var->type && glsl_type_is_image(glsl_without_array(var->type));
+
+   if (is_image_var) {
+      /* An image uniform is a descriptor, declared by sz_image_get() when an
+       * image instruction first names it, and one descriptor per image unit.
+       * The deref instructions that lead to it are still emitted on their own,
+       * though, and a deref needs a variable to point at. A Private int array
+       * of the same length is that variable: nothing ever reads it, it is legal
+       * in every storage class, and it keeps an unused deref from failing the
+       * whole shader. */
+      const unsigned elements = glsl_type_is_array(var->type)
+                                   ? glsl_get_length(var->type)
+                                   : 1;
+      const uint32_t int_type = sz_spv_type_int32(t->m);
+      const uint32_t array_type =
+         elements > 1 ? sz_spv_type_array(t->m, int_type, elements) : int_type;
+      const uint32_t ptr_type =
+         sz_spv_type_ptr(t->m, SpvStorageClassPrivate, array_type);
+      const uint32_t id =
+         sz_spv_variable(t->m, ptr_type, SpvStorageClassPrivate);
+
+      t->vars[t->num_vars].var = var;
+      t->vars[t->num_vars].id = id;
+      t->vars[t->num_vars].pointee = array_type;
+      t->vars[t->num_vars].storage = SpvStorageClassPrivate;
+      t->vars[t->num_vars].type = (struct sz_dtype){.base = SZ_BASE_INT,
+                                                    .bits = 32, .ncomp = 1,
+                                                    .array_len =
+                                                       elements > 1 ? elements
+                                                                    : 0};
+      t->num_vars++;
+      return true;
+   }
+
    switch (var->data.mode) {
    case nir_var_shader_in:
       /* A geometry shader receives it as an input; the value is dead there too,
@@ -1015,6 +1062,11 @@ sz_deref_storage(const nir_deref_instr *deref)
       return SpvStorageClassInput;
    if (deref->modes & nir_var_shader_out)
       return SpvStorageClassOutput;
+   /* An image's deref chain points at the Private placeholder
+    * sz_declare_variable built for it, not at the descriptor, so the access
+    * chain has to stay in that storage class. */
+   if (deref->modes & nir_var_image)
+      return SpvStorageClassPrivate;
    if (deref->modes & (nir_var_uniform | nir_var_mem_ubo |
                        nir_var_mem_ssbo | nir_var_mem_push_const))
       return SpvStorageClassUniform;
@@ -1060,8 +1112,14 @@ sz_emit_deref(struct sz_translate *t, nir_deref_instr *deref)
          return 0;
 
       struct sz_dtype elem_type = { 0 };
-      if (!sz_dtype_from_glsl(t, deref->type, &elem_type))
+      if (glsl_type_is_image(glsl_without_array(deref->type))) {
+         /* An element of an image array. The placeholder sz_declare_variable
+          * built for it is a Private int array, since an image type has no
+          * pointer form outside UniformConstant. */
+         elem_type = (struct sz_dtype){SZ_BASE_INT, 32, 1, 0};
+      } else if (!sz_dtype_from_glsl(t, deref->type, &elem_type)) {
          return 0;
+      }
       elem_type.array_len = 0;
 
       uint32_t index = sz_def_value(t, deref->arr.index.ssa);
@@ -2306,6 +2364,195 @@ sz_def_value(struct sz_translate *t, const nir_def *def)
    return id;
 }
 
+
+/* The image value a storage-image deref names, declaring the descriptor the
+ * first time the image unit appears in the shader.
+ *
+ * A GL image uniform is neither a sampler nor a combined image sampler: the
+ * shader reads and writes it through imageLoad/imageStore with no sampler
+ * involved, which is SPIR-V's OpTypeImage with Sampled = 2. The texel component
+ * type still has to be spelled out, because it decides how a value coming back
+ * from OpImageRead is converted.
+ *
+ * The format operand is Unknown. vkCreateImageView fixes the format, and GL
+ * lets the same shader be used with images of different formats, so the only
+ * thing a module-wide constant could say here is a lie. Reading and writing an
+ * image whose format the module does not name needs
+ * shaderStorageImageReadWithoutFormat / WriteWithoutFormat, which this driver
+ * enables, and the two capabilities those features back are what makes
+ * spirv-val accept the module.
+ */
+static uint32_t
+sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
+             uint32_t *out_image_type)
+{
+   nir_variable *var = nir_deref_instr_get_variable((nir_deref_instr *)deref);
+   if (!var || var->data.mode != nir_var_image) {
+      sz_fail(t, "image instruction without an image variable");
+      return 0;
+   }
+
+   /* One descriptor per image unit, so an element of an image array is a
+    * different unit. A constant index is resolved here; a dynamic one cannot be,
+    * because the units are separate bindings rather than a descriptor array, and
+    * is treated as element zero -- which is what an application gets today and
+    * is at least well defined. */
+   unsigned index = var->data.binding;
+   for (const nir_deref_instr *d = deref; d;
+        d = nir_deref_instr_parent(d)) {
+      if (d->deref_type != nir_deref_type_array)
+         continue;
+      if (nir_src_is_const(d->arr.index))
+         index += (unsigned)nir_src_as_int(d->arr.index);
+      break;
+   }
+
+   /* GL leaves an out-of-bounds array subscript undefined, and the one thing
+    * the specification cannot be read to allow is failing to compile. Clamping
+    * the unit keeps the shader translatable and reads a unit the application
+    * did bind, which is as safe an answer as is on offer. */
+   if (index >= SZ_MAX_IMAGES)
+      index = var->data.binding;
+
+   const struct glsl_type *type = glsl_without_array(var->type);
+   SpvDim dim;
+   if (!sz_sampler_dim(t, glsl_get_sampler_dim(type), &dim)) {
+      sz_fail(t, "unsupported image dimension for `%s`", var->name);
+      return 0;
+   }
+
+   /* The component type comes from the sampler type: image2D is float,
+    * uimage2D is unsigned and iimage2D signed. */
+   enum glsl_base_type base = glsl_get_sampler_result_type(type);
+   enum sz_base sz_base;
+   switch (base) {
+   case GLSL_TYPE_UINT:
+      sz_base = SZ_BASE_UINT;
+      break;
+   case GLSL_TYPE_INT:
+      sz_base = SZ_BASE_INT;
+      break;
+   default:
+      sz_base = SZ_BASE_FLOAT;
+      break;
+   }
+
+   const uint32_t sampled_type = sz_scalar_type(t, sz_base, 32);
+   const uint32_t image_type = sz_spv_type_image(
+      t->m, sampled_type, dim, false, glsl_sampler_type_is_array(type), false,
+      2);
+
+   for (unsigned i = 0; i < t->num_images; i++) {
+      if (t->images[i].index != index)
+         continue;
+      *out_image_type = t->images[i].image_type;
+      return t->images[i].value;
+   }
+
+   /* A storage image with an unspecified format, read or written. */
+   sz_spv_capability(t->m, SpvCapabilityStorageImageReadWithoutFormat);
+   sz_spv_capability(t->m, SpvCapabilityStorageImageWriteWithoutFormat);
+
+   const uint32_t ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassUniformConstant, image_type);
+   const uint32_t id =
+      sz_spv_variable(t->m, ptr_type, SpvStorageClassUniformConstant);
+   sz_spv_decorate(t->m, id, SpvDecorationDescriptorSet,
+                   SZ_DESCRIPTOR_SET_IMAGES);
+   sz_spv_decorate(t->m, id, SpvDecorationBinding,
+                   sz_image_binding(t->nir->info.stage, index));
+
+   t->interfaces[t->num_interfaces++] = id;
+   const uint32_t value = sz_spv_load(t->m, image_type, id);
+
+   if (t->num_images == ARRAY_SIZE(t->images)) {
+      sz_fail(t, "too many storage images in one shader");
+      return 0;
+   }
+   t->images[t->num_images].index = index;
+   t->images[t->num_images].image_type = image_type;
+   t->images[t->num_images].value = value;
+   t->num_images++;
+
+   *out_image_type = image_type;
+   return value;
+}
+
+/* The integer coordinate vector an image operation addresses. GL hands NIR
+ * floats or ints depending on the op, and Vulkan accepts only integers. */
+static uint32_t
+sz_image_coord(struct sz_translate *t, const nir_def *def)
+{
+   struct sz_dtype type = t->def_types[def->index];
+   const struct sz_dtype want = {SZ_BASE_INT, 32, type.ncomp ? type.ncomp : 1, 0};
+   const uint32_t value = sz_def_value(t, def);
+   if (value == 0)
+      return 0;
+   const uint32_t cast = sz_bitcast_to(t, value, &type, &want);
+   if (cast)
+      return cast;
+   return value;
+}
+
+
+/* The three operands every SPIR-V atomic needs beyond its data: memory scope and
+ * the two semantics masks. GL's imageAtomics and memoryBarrier impose no finer
+ * scope than the whole device, and the ordering they ask for is exactly
+ * acquire/release over image memory plus the buffer memory the same barrier
+ * covers, so both are device-wide and spelled once. */
+static uint32_t
+sz_memory_scope(struct sz_translate *t)
+{
+   return sz_spv_const_int32(t->m, 1 /* SpvScopeDevice */);
+}
+
+static uint32_t
+sz_memory_semantics(struct sz_translate *t)
+{
+   /* AcquireRelease | ImageMemory | UniformMemory | AtomicCounterMemory */
+   return sz_spv_const_int32(t->m, 0x8u | 0x800u | 0x40u | 0x400u);
+}
+
+/* imageAtomic*, mapped onto OpImageTexelAtomic*. Those return the previous
+ * value, which is what GL returns too. */
+/* imageAtomic*, mapped onto OpAtomic*. Vulkan has no dedicated image atomic
+ * opcodes: the address is made with OpImageTexelPointer and the atomic itself is
+ * the ordinary OpAtomic* on the resulting Image-storage pointer. */
+static SpvOp
+sz_image_atomic_op(nir_atomic_op op, bool *is_cmpxchg)
+{
+   *is_cmpxchg = false;
+   switch (op) {
+   case nir_atomic_op_iadd:
+      return SpvOpAtomicIAdd;
+   case nir_atomic_op_isub:
+      return SpvOpAtomicISub;
+   case nir_atomic_op_imin:
+      return SpvOpAtomicSMin;
+   case nir_atomic_op_umin:
+      return SpvOpAtomicUMin;
+   case nir_atomic_op_imax:
+      return SpvOpAtomicSMax;
+   case nir_atomic_op_umax:
+      return SpvOpAtomicUMax;
+   case nir_atomic_op_iand:
+      return SpvOpAtomicAnd;
+   case nir_atomic_op_ior:
+      return SpvOpAtomicOr;
+   case nir_atomic_op_ixor:
+      return SpvOpAtomicXor;
+   case nir_atomic_op_xchg:
+      return SpvOpAtomicExchange;
+   case nir_atomic_op_cmpxchg:
+      *is_cmpxchg = true;
+      return SpvOpAtomicCompareExchange;
+   default:
+      /* The float atomics need SPV_EXT_shader_atomic_float, which this driver
+       * does not enable; the rest GL has no syntax for. */
+      return SpvOpNop;
+   }
+}
+
 /* The sampled image value for `tex`'s texture unit, declaring the descriptor
  * variable the first time the unit appears in the shader. */
 static uint32_t
@@ -3325,6 +3572,168 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_INT, 32, 1 };
       return true;
    }
+   case nir_intrinsic_image_deref_load: {
+      /* imageLoad. OpImageRead takes the image and an integer coordinate and
+       * returns the texel as the component type the module declared. */
+      nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+      uint32_t image_type = 0;
+      const uint32_t image = deref ? sz_image_get(t, deref, &image_type) : 0;
+      if (image == 0)
+         return false;
+
+      const uint32_t coord = sz_image_coord(t, intrin->src[1].ssa);
+      if (coord == 0)
+         return false;
+
+      struct sz_dtype type = {0};
+      sz_guess_def_type(t, &intrin->def, &type);
+      const uint32_t result_type = sz_dtype_type(t, &type);
+
+      uint32_t ops[2];
+      unsigned n = 0;
+      ops[n++] = image;
+      ops[n++] = coord;
+      t->defs_id[intrin->def.index] =
+         sz_spv_alu(t->m, SpvOpImageRead, result_type, ops, n);
+      t->def_types[intrin->def.index] = type;
+      return true;
+   }
+   case nir_intrinsic_image_deref_store: {
+      /* imageStore. */
+      nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+      uint32_t image_type = 0;
+      const uint32_t image = deref ? sz_image_get(t, deref, &image_type) : 0;
+      if (image == 0)
+         return false;
+
+      const uint32_t coord = sz_image_coord(t, intrin->src[1].ssa);
+      if (coord == 0)
+         return false;
+
+      const uint32_t value = sz_def_value(t, intrin->src[3].ssa);
+      if (value == 0)
+         return false;
+
+      const uint32_t ops[] = {image, coord, value};
+      /* OpImageWrite has no result id and no result type: the plain
+       * instruction is what belongs in the stream. */
+      sz_spv_raw_function_op(t->m, SpvOpImageWrite, ops, 3);
+      return true;
+   }
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_levels:
+   case nir_intrinsic_image_deref_samples: {
+      /* imageSize/imageSamples. Vulkan answers all three through
+       * OpImageQuerySize (through the Lod variant for levels), and GL wants an
+       * ivec whose component count matches the image's dimensionality. */
+      nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+      uint32_t image_type = 0;
+      const uint32_t image = deref ? sz_image_get(t, deref, &image_type) : 0;
+      if (image == 0)
+         return false;
+
+      struct sz_dtype type = {0};
+      sz_guess_def_type(t, &intrin->def, &type);
+      const uint32_t result_type = sz_dtype_type(t, &type);
+
+      uint32_t value;
+      if (intrin->intrinsic == nir_intrinsic_image_deref_size) {
+         const uint32_t ops[] = {image};
+         value = sz_spv_alu(t->m, SpvOpImageQuerySize, result_type, ops, 1);
+      } else if (intrin->intrinsic == nir_intrinsic_image_deref_levels) {
+         const uint32_t ops[] = {image};
+         value = sz_spv_alu(t->m, SpvOpImageQueryLevels, result_type, ops, 1);
+      } else {
+         const uint32_t ops[] = {image};
+         value = sz_spv_alu(t->m, SpvOpImageQuerySamples, result_type, ops, 1);
+      }
+
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = type;
+      return true;
+   }
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap: {
+      nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+      uint32_t image_type = 0;
+      const uint32_t image = deref ? sz_image_get(t, deref, &image_type) : 0;
+      if (image == 0)
+         return false;
+
+      const uint32_t coord = sz_image_coord(t, intrin->src[1].ssa);
+      if (coord == 0)
+         return false;
+
+      struct sz_dtype type = {0};
+      sz_guess_def_type(t, &intrin->def, &type);
+      const uint32_t scalar = sz_scalar_type(t, type.base, type.bits);
+      const uint32_t result_type = sz_dtype_type(t, &type);
+
+      bool cmpxchg = false;
+      const nir_atomic_op op = (nir_atomic_op)nir_intrinsic_atomic_op(intrin);
+      const SpvOp spv_op = sz_image_atomic_op(op, &cmpxchg);
+      if (spv_op == SpvOpNop) {
+         sz_fail(t, "image atomic operation %d needs a capability this device "
+                    "does not enable", (int)op);
+         return false;
+      }
+
+      /* OpImageTexelPointer needs the Image capability and yields a pointer in
+       * the Image storage class; the third operand is the sample index, which a
+       * storage image does not have. */
+      sz_spv_capability(t->m, SpvCapabilityImageBasic);
+      const uint32_t ptr_type =
+         sz_spv_type_ptr(t->m, SpvStorageClassImage, scalar);
+      const uint32_t sample = sz_spv_const_int32(t->m, 0);
+      const uint32_t texel_ops[] = {image, coord, sample};
+      const uint32_t ptr =
+         sz_spv_alu(t->m, SpvOpImageTexelPointer, ptr_type, texel_ops, 3);
+
+      const uint32_t want = scalar;
+      const uint32_t value =
+         sz_bitcast_to(t, sz_def_value(t, intrin->src[2].ssa),
+                       &t->def_types[intrin->src[2].ssa->index],
+                       &(struct sz_dtype){type.base, type.bits, 1, 0});
+      if (value == 0)
+         return false;
+
+      uint32_t ops[6];
+      unsigned n = 0;
+      ops[n++] = ptr;
+      ops[n++] = sz_memory_scope(t);
+      if (cmpxchg) {
+         const uint32_t compare =
+            sz_bitcast_to(t, sz_def_value(t, intrin->src[3].ssa),
+                          &t->def_types[intrin->src[3].ssa->index],
+                          &(struct sz_dtype){type.base, type.bits, 1, 0});
+         if (compare == 0)
+            return false;
+         /* CompareExchange takes two semantics masks: on success and on
+          * failure. GL asks for the same ordering either way. */
+         ops[n++] = sz_memory_semantics(t);
+         ops[n++] = sz_memory_semantics(t);
+         ops[n++] = value;
+         ops[n++] = compare;
+      } else {
+         ops[n++] = sz_memory_semantics(t);
+         ops[n++] = value;
+      }
+
+      t->defs_id[intrin->def.index] =
+         sz_spv_alu(t->m, spv_op, result_type, ops, n);
+      t->def_types[intrin->def.index] = type;
+      (void)want;
+      return true;
+   }
+   case nir_intrinsic_barrier: {
+      /* memoryBarrier() and its narrower siblings all arrive here: the frontend
+       * records the scope it wants and the variable modes it covers, and this
+       * emits the OpMemoryBarrier that backs them. A control barrier has
+       * nothing to synchronise without a compute stage. */
+      const uint32_t ops[] = {sz_memory_scope(t), sz_memory_semantics(t)};
+      sz_spv_result_only(t->m, SpvOpMemoryBarrier, ops, 2);
+      return true;
+   }
    case nir_intrinsic_load_ubo:
       sz_emit_load_ubo(t, intrin, false);
       return true;
@@ -4113,8 +4522,12 @@ sz_nir_to_spirv(struct nir_shader *nir,
        * are descriptors: they are declared on first access instead, which is
        * what lets the load decide the layout, and their variables stay in the
        * NIR after being lowered away and are simply unused. */
+      /* Images belong here too: their deref instructions are emitted like any
+       * other, and sz_declare_variable gives them the placeholder they need.
+       * The descriptor itself is declared by sz_image_get() on first use. */
       if (var->data.mode != nir_var_shader_in &&
-          var->data.mode != nir_var_shader_out)
+          var->data.mode != nir_var_shader_out &&
+          var->data.mode != nir_var_image)
          continue;
 
       if (!sz_declare_variable(&t, var))

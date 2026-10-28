@@ -279,6 +279,7 @@ struct sz_screen {
       VkDeviceSize ubo_size;
       VkDeviceSize sampler_size;
       VkDeviceSize texel_size;
+      VkDeviceSize image_size;
       struct {
          VkBuffer buffer;
          struct sz_bo *bo;

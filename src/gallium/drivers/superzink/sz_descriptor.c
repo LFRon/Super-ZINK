@@ -141,6 +141,37 @@ sz_descriptor_layout_create(struct sz_screen *screen, VkDescriptorSetLayout *out
       goto fail;
    }
 
+   /* Set 3: the storage images. A GL image uniform is an image the shader may
+    * read and write without a sampler, which is VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    * the format is part of the view, so unlike a sampled image the descriptor
+    * needs nothing else. */
+   VkDescriptorSetLayoutBinding image_bindings[SZ_DESCRIPTOR_IMAGE_BINDINGS];
+
+   for (unsigned s = 0; s < ARRAY_SIZE(sz_descriptor_stages); s++) {
+      const mesa_shader_stage stage = sz_descriptor_stages[s];
+      const VkShaderStageFlags flags = sz_descriptor_stage_flags(stage);
+      for (unsigned i = 0; i < SZ_MAX_IMAGES; i++) {
+         const unsigned binding = sz_image_binding(stage, i);
+         image_bindings[binding] = (VkDescriptorSetLayoutBinding) {
+            .binding = binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = flags,
+         };
+      }
+   }
+
+   ci.bindingCount = SZ_DESCRIPTOR_IMAGE_BINDINGS;
+   ci.pBindings = image_bindings;
+
+   result = screen->vk.CreateDescriptorSetLayout(screen->dev, &ci, NULL,
+                                                 &out[SZ_DESCRIPTOR_SET_IMAGES]);
+   if (result != VK_SUCCESS) {
+      mesa_loge("SZ: vkCreateDescriptorSetLayout(storage images) failed: %d",
+                result);
+      goto fail;
+   }
+
    /* The descriptor-buffer path needs no pool at all: descriptors go straight
     * into a mapped buffer and are selected by offset. */
    if (screen->caps.descriptor_buffer)
@@ -291,8 +322,12 @@ sz_descriptor_db_init(struct sz_screen *screen)
    screen->vk.GetDescriptorSetLayoutSizeEXT(
       screen->dev, screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_TEXEL_BUFFERS],
       &screen->db.texel_size);
+   screen->vk.GetDescriptorSetLayoutSizeEXT(
+      screen->dev, screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_IMAGES],
+      &screen->db.image_size);
 
-   if (!screen->db.ubo_size || !screen->db.sampler_size || !screen->db.texel_size) {
+   if (!screen->db.ubo_size || !screen->db.sampler_size ||
+       !screen->db.texel_size || !screen->db.image_size) {
       mesa_loge("SZ: a descriptor set layout reports size zero");
       return false;
    }
@@ -304,6 +339,7 @@ sz_descriptor_db_init(struct sz_screen *screen)
    screen->db.ubo_size = align64(screen->db.ubo_size, align);
    screen->db.sampler_size = align64(screen->db.sampler_size, align);
    screen->db.texel_size = align64(screen->db.texel_size, align);
+   screen->db.image_size = align64(screen->db.image_size, align);
 
    /* Sized so that running out is not a practical concern: a batch is flushed
     * on every state change, and one draw costs a few hundred bytes here. */
@@ -886,11 +922,13 @@ sz_descriptor_db_emit(struct sz_context *ctx, VkCommandBuffer cmd)
    VkDeviceSize sampler_offset = align64(ubo_offset + screen->db.ubo_size, align);
    VkDeviceSize texel_offset =
       align64(sampler_offset + screen->db.sampler_size, align);
+   VkDeviceSize image_offset = align64(texel_offset + screen->db.texel_size,
+                                       align);
 
-   if (texel_offset + screen->db.texel_size > screen->db.ring[slot].size)
+   if (image_offset + screen->db.image_size > screen->db.ring[slot].size)
       return false;
 
-   screen->db.ring[slot].used = texel_offset + screen->db.texel_size;
+   screen->db.ring[slot].used = image_offset + screen->db.image_size;
 
    uint8_t *const mapped = screen->db.ring[slot].mapped;
    const size_t ubo_size = screen->caps.descriptor_size_uniform_buffer;
@@ -1023,6 +1061,41 @@ sz_descriptor_db_emit(struct sz_context *ctx, VkCommandBuffer cmd)
       }
    }
 
+   /* ── storage images ──────────────────────────────────────────────────── */
+   for (unsigned s = 0; s < ARRAY_SIZE(sz_descriptor_stages); s++) {
+      const mesa_shader_stage stage = sz_descriptor_stages[s];
+      const VkDescriptorSetLayout image_layout =
+         screen->descriptor_set_layout[SZ_DESCRIPTOR_SET_IMAGES];
+
+      for (unsigned i = 0; i < SZ_MAX_IMAGES; i++) {
+         const struct pipe_image_view *view = ctx->state.shader_images[stage][i];
+         if (!view || !view->resource)
+            continue;
+
+         VkImageView image_view;
+         if (!sz_shader_image_view(ctx, cmd, view, &image_view))
+            continue;
+
+         VkDeviceSize binding_offset = 0;
+         screen->vk.GetDescriptorSetLayoutBindingOffsetEXT(
+            screen->dev, image_layout, sz_image_binding(stage, i),
+            &binding_offset);
+
+         const VkDescriptorImageInfo image = {
+            .imageView = image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         };
+         const VkDescriptorGetInfoEXT info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+            .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .data.pStorageImage = &image,
+         };
+         screen->vk.GetDescriptorEXT(
+            screen->dev, &info, screen->caps.descriptor_size_storage_image,
+            mapped + image_offset + binding_offset);
+      }
+   }
+
    const VkDescriptorBufferBindingInfoEXT binding = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT,
       .address = screen->db.ring[slot].address,
@@ -1036,10 +1109,11 @@ sz_descriptor_db_emit(struct sz_context *ctx, VkCommandBuffer cmd)
     * pBufferIndices[0..count-1], and a shorter array is a stack overread that
     * shows up as pBufferIndices[2] being several billion
     * (VUID-vkCmdSetDescriptorBufferOffsetsEXT-pBufferIndices-08064). */
-   const uint32_t buffer_indices[SZ_DESCRIPTOR_SET_COUNT] = { 0, 0, 0 };
+   const uint32_t buffer_indices[SZ_DESCRIPTOR_SET_COUNT] = { 0, 0, 0, 0 };
    const VkDeviceSize offsets[SZ_DESCRIPTOR_SET_COUNT] = { ubo_offset,
                                                            sampler_offset,
-                                                           texel_offset };
+                                                           texel_offset,
+                                                           image_offset };
    screen->vk.CmdSetDescriptorBufferOffsetsEXT(
       cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, screen->pipeline_layout,
       SZ_DESCRIPTOR_SET_UBO, SZ_DESCRIPTOR_SET_COUNT, buffer_indices, offsets);

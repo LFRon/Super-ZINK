@@ -725,6 +725,21 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* Storage images are translated -- sz_image_get(), the image_deref_*
+       * intrinsics, OpImageTexelPointer-backed imageAtomics and memoryBarrier
+       * all exist, and the descriptor set is in place -- but
+       * ARB_shader_image_load_store is deliberately not advertised yet.
+       * Measured on this driver: arb_shader_image_load_store is 575 pass, 4 fail,
+       * 14 crash. What is missing is specific:
+       *   - a dynamic index into an image array. The layout gives each unit its
+       *     own binding, so an index that is not a compile-time constant cannot
+       *     select one; the translator uses the base unit instead.
+       *   - a 3D image bound as a single layer. The view is built for the whole
+       *     image, so the shader sees every layer.
+       * Advertising the extension on top of those would promise behaviour this
+       * driver does not have, so the flag stays off until they are gone. */
+      caps->image_store_formatted = false;
+
       /* glCopyImageSubData. The flag names the hardest case -- a copy that
        * converts between a compressed and a plain format -- and st grants
        * ARB_copy_image on it alone. Copies that only differ in swizzle are
@@ -996,6 +1011,7 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       struct pipe_shader_caps *sc =
          (struct pipe_shader_caps *)&screen->base.shader_caps[supported_stages[i]];
 
+      sc->max_shader_images = SZ_MAX_IMAGES;
       sc->max_instructions = 65535;
       sc->max_alu_instructions = 65535;
       sc->max_tex_instructions = 65535;
