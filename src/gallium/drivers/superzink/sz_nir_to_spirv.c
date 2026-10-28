@@ -62,6 +62,13 @@
  * the end of it. */
 #define SZ_MAX_INTERFACES (SZ_MAX_VARIABLES * 2)
 
+/* First Location used by a patch varying. GL numbers them from zero separately
+ * from the per-vertex varyings; SPIR-V shares one space, so they are offset past
+ * the sixteen per-vertex locations a GL 4.x tessellation shader typically uses
+ * and still finish below the 32 that maxTessellationControlOutputComponents
+ * (128 components) allows. */
+#define SZ_PATCH_LOCATION_BASE 16
+
 /* Gallium's floor for constant buffer slots per stage: the same number the
  * descriptor set layout declares. */
 #define SZ_MAX_UBOS 16
@@ -783,12 +790,16 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
       }
    }
 
-   /* Patch varyings have a location space of their own, and it starts at zero:
-    * VARYING_SLOT_PATCH0 is where GL_LAYOUT_PATCH starts, well above the
-    * generic varyings. Subtracting VARYING_SLOT_VAR0 from a patch slot instead
-    * produced locations past 32, which Vulkan rejects. */
+   /* Patch varyings. GL gives them a location space of their own starting at
+    * zero, but SPIR-V does not: the Patch decoration changes the rate, not the
+    * numbering, so a patch varying and an ordinary one at the same Location
+    * collide. A tessellation control shader that writes `out vec4 a[]` and
+    * `patch out vec4 b` would decorate both at Location 0 and the compiler would
+    * keep one of them -- which is exactly the wrong-value failure the tests
+    * show. Patch varyings therefore start at SZ_PATCH_LOCATION_BASE, leaving the
+    * lower locations to the per-vertex ones. */
    if (slot >= VARYING_SLOT_PATCH0) {
-      *location = slot - VARYING_SLOT_PATCH0;
+      *location = SZ_PATCH_LOCATION_BASE + (slot - VARYING_SLOT_PATCH0);
       t->used_generic_varying = true;
       return true;
    }
