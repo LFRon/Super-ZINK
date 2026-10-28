@@ -688,6 +688,15 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
             *has_builtin = true;
             return true;
          }
+         /* gl_SampleMask[] is the coverage mask the shader may narrow with
+          * per-sample shading. Vulkan's SampleMask builtin is the same array of
+          * int, so it needs no translation beyond the slot mapping. */
+         if (slot == FRAG_RESULT_SAMPLE_MASK) {
+            *builtin = SpvBuiltInSampleMask;
+            *has_builtin = true;
+            return true;
+         }
+
          if (slot == FRAG_RESULT_COLOR) {
             *location = 0;
             return true;

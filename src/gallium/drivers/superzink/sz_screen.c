@@ -720,6 +720,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* ARB_sample_shading: per-sample fragment shading. gl_SampleID,
+       * gl_SamplePosition, gl_SampleMaskIn and gl_SampleMask[] all translate
+       * (see sz_load_sample_id() and the FRAG_RESULT_SAMPLE_MASK slot), and the
+       * sampleRateShading feature is enabled because the driver needs it. */
+      caps->sample_shading = true;
+
       /* glViewportIndexedf and friends: GL 4.1 wants sixteen viewport slots, the
        * viewport state is dynamic, and sz_emit_viewport() writes every slot per
        * batch. gl_ViewportIndex is the ViewportIndex builtin the translator
