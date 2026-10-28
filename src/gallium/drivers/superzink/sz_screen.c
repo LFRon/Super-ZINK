@@ -661,6 +661,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * with Dim Buffer, and sz_format.c already asks the device whether each
        * format can be a texel buffer. The offset alignment glTexBufferRange
        * needs is the device's minTexelBufferOffsetAlignment, reported below. */
+      /* Not claimed although Vulkan's robustBufferAccess would back it:
+       * piglit's arb_robustness group turns a clean skip into a hang on
+       * arb_robustness_client-mem-bounds, which reads out of bounds from client
+       * memory -- a path this driver does not implement at all. */
+
       caps->texture_buffer_objects = true;
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
