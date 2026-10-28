@@ -670,6 +670,17 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* Inverted conditional rendering. The predicate is resolved on the host
+       * when glBeginConditionalRender is called and the inverted form is the
+       * same comparison with the result flipped, which sz_render_condition has
+       * done since it was written. */
+      caps->conditional_render_inverted = true;
+
+      /* Query results into a buffer: glGetQueryObjectui64v with a buffer bound
+       * is served by the state tracker through PIPE_BIND_QUERY_BUFFER, and the
+       * result copy is an ordinary transfer. */
+      caps->query_buffer_object = true;
+
       /* Transform feedback pause and resume. Gallium has no pause entry point:
        * the state tracker implements glPauseTransformFeedback by unbinding the
        * targets, so a driver supports it exactly when binding zero targets stops
