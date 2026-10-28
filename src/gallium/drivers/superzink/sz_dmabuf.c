@@ -257,7 +257,13 @@ sz_screen_resource_get_handle(struct pipe_screen *pscreen,
     * fences exist, "the frame was submitted" is not "the frame was rendered", so
     * the only correct thing to hand out is a buffer nobody is writing. This is
     * the FIFO part of the phase: it costs one stall per presented frame and
-    * disappears when pipe_fence_handle gets a timeline value. */
+    * disappears when pipe_fence_handle gets a timeline value.
+    *
+    * This is also the whole of the present_wait fallback. That extension would
+    * let the driver ask the presentation engine when a frame is on screen
+    * instead of stalling; VK_KHR_present_wait is not core in any version, so a
+    * 1.3 (or a 1.4) device may not have it, and the wait below is then the
+    * correct behaviour rather than a degraded one. See SZ_CAP_OPTIONAL_LIST. */
    sz_queue_wait_idle(&screen->batch_state);
 
    const VkImageSubresource subresource = {

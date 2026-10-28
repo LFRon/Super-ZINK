@@ -90,9 +90,6 @@
    X(push_descriptor,              "pushDescriptor",                            \
      "VK_KHR_push_descriptor",              VK_API_VERSION_1_4,                \
      cap_push_descriptor)                                                        \
-   X(present_wait,                 "presentWait",                               \
-     "VK_KHR_present_wait",                 SZ_CORE_NONE,                      \
-     q.present_wait.presentWait)                                                 \
    X(graphics_pipeline_library,    "graphicsPipelineLibrary",                   \
      "VK_EXT_graphics_pipeline_library",    SZ_CORE_NONE,                      \
      q.gpl.graphicsPipelineLibrary)
@@ -132,7 +129,20 @@
     * applies glPrimitiveRestartIndex to them like any other topology. */          \
    X(list_restart,                 "primitiveTopologyListRestart",               \
      "VK_EXT_primitive_topology_list_restart", SZ_CORE_NONE,                   \
-     q.list_restart.primitiveTopologyListRestart)
+     q.list_restart.primitiveTopologyListRestart)                               \
+   /* VK_KHR_present_wait is not core in any Vulkan version -- not in 1.3 and    \
+    * not in 1.4 -- so a device at the floor version may not have it, and        \
+    * lavapipe in particular advertises 1.4 without it. What it buys is a        \
+    * cheap "wait until this frame is on screen"; what this driver does without  \
+    * it is what it already does for every frame, because presentation goes out  \
+    * through a dma-buf and the export blocks in sz_queue_wait_idle() until the   \
+    * GPU is done (sz_dmabuf.c, sz_resource_get_handle). Requiring it therefore   \
+    * rejected devices that run perfectly. It stays a capability so the          \
+    * extension is enabled and the feature is taken when the device offers       \
+    * them, and the pacing falls back to the blocking wait when it does not. */  \
+   X(present_wait,                 "presentWait",                               \
+     "VK_KHR_present_wait",                 SZ_CORE_NONE,                      \
+     q.present_wait.presentWait)
 
 /* Every VkPhysicalDevice*Features structure Super-ZINK ever chains, in one
  * place. Querying (sz_caps_init) and enabling (sz_device_create) both go
