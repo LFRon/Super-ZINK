@@ -2886,15 +2886,22 @@ sz_texture_subdata(struct pipe_context *pipe, struct pipe_resource *res,
    if (!map)
       return;
 
-   const struct util_format_description *desc = util_format_description(res->format);
-   const unsigned bw = desc ? desc->block.width : 1;
-   const unsigned bh = desc ? desc->block.height : 1;
-
+   /* Neither side carries an offset here. The transfer hands out the box, not
+    * the level, so the destination starts at 0,0,0; and the caller's pointer is
+    * already the first texel of the sub-image -- st_TexSubImage applies
+    * GL_UNPACK_SKIP_PIXELS/ROWS/IMAGE_HEIGHT before calling in. Passing box->x
+    * and box->y as source offsets as well walked the read forward by
+    * box->y * stride bytes into an array that only holds the sub-image, which is
+    * what crashed Minecraft: every sprite of a texture atlas is uploaded at a
+    * nonzero y into a client buffer sized for the sprite alone.
+    *
+    * Width and height stay in texels: util_copy_rect() rounds them up to whole
+    * blocks itself, so pre-dividing them would copy a block-compressed box once
+    * instead of once per block. */
    util_copy_box((uint8_t *)map, res->format, transfer->stride,
                  transfer->layer_stride, 0, 0, 0,
-                 DIV_ROUND_UP(box->width, bw), DIV_ROUND_UP(box->height, bh),
-                 box->depth, (const uint8_t *)data, stride, layer_stride,
-                 box->x / bw, box->y / bh, box->z);
+                 box->width, box->height, box->depth,
+                 (const uint8_t *)data, stride, layer_stride, 0, 0, 0);
 
    sz_transfer_unmap(pipe, transfer);
 }
