@@ -208,6 +208,9 @@ static uint32_t sz_bitcast_to(struct sz_translate *t, uint32_t id,
                               const struct sz_dtype *from,
                               const struct sz_dtype *to);
 static bool sz_emit_phi(struct sz_translate *t, nir_phi_instr *phi);
+static void sz_retype_for_plan(struct sz_translate *t, nir_def *def, uint32_t *id,
+                               struct sz_dtype *type);
+static nir_def *sz_instr_def(nir_instr *instr);
 static void sz_emit_cf_list_from(struct sz_translate *t, struct exec_list *list,
                                  nir_cf_node *after, uint32_t fallthrough,
                                  nir_loop *loop);
@@ -439,7 +442,12 @@ sz_infer_def_base(nir_def *def, unsigned depth, enum sz_base *out)
       } else if (parent->type == nir_instr_type_intrinsic) {
          nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(parent);
 
-         if (intrin->intrinsic != nir_intrinsic_store_deref ||
+         /* Both spellings write through a deref to a variable and both keep
+          * their value in src[1]. store_output is the one that matters for a
+          * fragment colour: it is what `icolor = uvec4(r)` becomes, and without
+          * it the only statement about r's base type is lost. */
+         if ((intrin->intrinsic != nir_intrinsic_store_deref &&
+              intrin->intrinsic != nir_intrinsic_store_output) ||
              src != &intrin->src[1])
             continue;
 
@@ -1344,37 +1352,10 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
             base = inferred;
       }
 
-      /* Integers have one canonical signedness here, for the reason given
-       * below the table lookup. */
-      dst.base = base == SZ_BASE_INT ? SZ_BASE_UINT : base;
+      dst.base = base;
    } else if (!sz_base_from_alu_type(nir_op_infos[op].output_type, &dst.base)) {
       sz_fail(t, "NIR op `%s` has no SPIR-V mapping", nir_op_infos[op].name);
       return;
-   }
-
-   /* Integer arithmetic is emitted unsigned even where the opcode table says
-    * signed. Those ops are bit-identical either way and SPIR-V only asks that
-    * the result and its operands agree, which the operand coercion below
-    * arranges; emitting one canonical signedness is what keeps an OpPhi valid
-    * when NIR merges an "int" arm with a "uint" one, since a phi cannot convert
-    * its incoming values -- a conversion there would have to live in the merge
-    * block, where the arm's definition need not dominate. Ops whose signedness
-    * *is* the instruction (the signed conversions, the signed division and
-    * remainder, the signed min/max) keep the type the table declares. */
-   switch (op) {
-   case nir_op_iadd:
-   case nir_op_isub:
-   case nir_op_imul:
-   case nir_op_ineg:
-   case nir_op_iand:
-   case nir_op_ior:
-   case nir_op_ixor:
-   case nir_op_inot:
-   case nir_op_b2i32:
-      dst.base = SZ_BASE_UINT;
-      break;
-   default:
-      break;
    }
 
    /* A one-bit result is a bool, whatever the opcode table calls it: the
@@ -1616,6 +1597,145 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
    sz_fail(t, "NIR op `%s` has no SPIR-V mapping", nir_op_infos[op].name);
 }
 
+
+/* The base type an OpPhi arm has to be phrased in, decided before anything is
+ * emitted.
+ *
+ * An OpPhi cannot convert its arms, and an arm's block is gone by the time the
+ * phi is reached, so the only place an arm can be converted is its own producer
+ * -- which means the phi's type has to be known *before* the producer runs. The
+ * blocks are emitted in layout order and SSA destruction builds a `switch`'s arm
+ * chain in that same order, so "wait and see which arm arrives first" does not
+ * work: the float arm is translated long before the integer arms meant to
+ * outvote it exist.
+ *
+ * So the decision is taken here instead, as a fixpoint over the whole function.
+ * Evidence, strongest first: what consumes the phi (the destination variable
+ * states the type outright, and `uvec4(r)` written to a uvec4 output is the
+ * usual case), then an arm that already has an answer, then an arm whose
+ * producer declares one. Chains of phis collapse because each round writes the
+ * answer back into base_hint[], which every producer consults.
+ */
+static bool
+sz_arm_declares_base(const struct sz_translate *t, const nir_def *arm,
+                     enum sz_base *out)
+{
+   if (!arm || arm->bit_size <= 1)
+      return false;
+
+   const uint8_t hint = t->base_hint[arm->index];
+   if (hint != 0xff && (enum sz_base)hint != SZ_BASE_BOOL) {
+      *out = (enum sz_base)hint;
+      return true;
+   }
+
+   const nir_instr *producer = nir_def_instr_const(arm);
+   if (!producer || producer->type != nir_instr_type_alu)
+      return false;
+
+   /* mov, vecN and bcsel declare nothing of their own. */
+   const nir_op op = nir_instr_as_alu(producer)->op;
+   if (sz_alu_is_passthrough(op))
+      return false;
+
+   enum sz_base declared;
+   if (!sz_base_from_alu_type(nir_op_infos[op].output_type, &declared) ||
+       declared == SZ_BASE_BOOL)
+      return false;
+
+   *out = declared;
+   return true;
+}
+
+static void
+sz_plan_phi_arms(struct sz_translate *t, nir_function_impl *impl)
+{
+   for (unsigned iter = 0; iter < 16; iter++) {
+      bool changed = false;
+
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_phi)
+               continue;
+            nir_phi_instr *phi = nir_instr_as_phi(instr);
+
+            enum sz_base base;
+            if (!sz_infer_def_base(&phi->def, 0, &base) ||
+                base == SZ_BASE_BOOL) {
+               bool have = false;
+               nir_foreach_phi_src (src, phi) {
+                  if (sz_arm_declares_base(t, src->src.ssa, &base)) {
+                     have = true;
+                     break;
+                  }
+               }
+               if (!have)
+                  continue;
+            }
+
+            if (t->base_hint[phi->def.index] != (uint8_t)base) {
+               t->base_hint[phi->def.index] = (uint8_t)base;
+               changed = true;
+            }
+
+            nir_foreach_phi_src (src, phi) {
+               const nir_def *arm = src->src.ssa;
+               if (!arm || arm->bit_size <= 1 || t->consts[arm->index])
+                  continue;
+               if (t->base_hint[arm->index] == 0xff) {
+                  t->base_hint[arm->index] = (uint8_t)base;
+                  changed = true;
+               }
+            }
+         }
+      }
+
+      if (!changed)
+         break;
+   }
+}
+
+/* Phrase a finished value in the base type the plan asked for.
+ *
+ * The value's own instruction cannot produce another base and its block closes
+ * as soon as it is emitted, so a bitcast here is the last chance. */
+static void
+sz_retype_for_plan(struct sz_translate *t, nir_def *def, uint32_t *id,
+                   struct sz_dtype *type)
+{
+   if (!*id || def->bit_size <= 1 || type->base == SZ_BASE_BOOL)
+      return;
+
+   const uint8_t hint = t->base_hint[def->index];
+   if (hint == 0xff || (enum sz_base)hint == type->base)
+      return;
+
+   struct sz_dtype to = *type;
+   to.base = (enum sz_base)hint;
+   const uint32_t cast = sz_bitcast_to(t, *id, type, &to);
+   if (!cast)
+      return;
+
+   *id = cast;
+   *type = to;
+}
+
+/* The def an instruction produces, if any. A phi is left out: its own emitter
+ * already places it in the plan, and retyping it would be circular. */
+static nir_def *
+sz_instr_def(nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_alu:
+      return &nir_instr_as_alu(instr)->def;
+   case nir_instr_type_intrinsic:
+      return &nir_instr_as_intrinsic(instr)->def;
+   case nir_instr_type_tex:
+      return &nir_instr_as_tex(instr)->def;
+   default:
+      return NULL;
+   }
+}
 
 /* ------------------------------------------------------------------------- */
 /* Instructions                                                             */
@@ -2814,9 +2934,8 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
 }
 
 static bool
-sz_emit_instr(struct sz_translate *t, nir_instr *instr)
+sz_emit_instr_inner(struct sz_translate *t, nir_instr *instr)
 {
-
    switch (instr->type) {
    case nir_instr_type_alu:
       sz_emit_alu(t, nir_instr_as_alu(instr));
@@ -2858,6 +2977,19 @@ sz_emit_instr(struct sz_translate *t, nir_instr *instr)
               (int)instr->type);
       return false;
    }
+}
+
+static bool
+sz_emit_instr(struct sz_translate *t, nir_instr *instr)
+{
+   if (!sz_emit_instr_inner(t, instr))
+      return false;
+
+   nir_def *def = sz_instr_def(instr);
+   if (def)
+      sz_retype_for_plan(t, def, &t->defs_id[def->index],
+                         &t->def_types[def->index]);
+   return true;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3522,6 +3654,8 @@ sz_nir_to_spirv(struct nir_shader *nir,
       sz_fail(&t, "out of memory");
       goto fail;
    }
+
+   sz_plan_phi_arms(&t, impl);
 
    SpvExecutionModel model;
    switch (nir->info.stage) {
