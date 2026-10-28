@@ -1000,9 +1000,19 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * max_instructions for tessellation or compute makes the frontend expose
     * them and makes cso_context call their bind_* entry points, and neither has
     * a translation yet. */
+   /* The tessellation stages are translated but not advertised. Both are wired
+    * up -- execution models, execution modes, patch varyings, the six builtins
+    * and VkPipelineTessellationStateCreateInfo -- and a shader that draws simple
+    * patches works, but measured on this driver
+    * arb_tessellation_shader is only 83 pass, 173 fail and 1541 crash. A stage
+    * that segfaults the driver on four shaders out of five must not be
+    * advertised, and st reads max_instructions == 0 as "this stage does not
+    * exist". The crashes are the next thing to fix, not something to paper
+    * over: the first one is in a tessellation control shader that uses a
+    * built-in function, and reproduces with
+    *   generated_tests/spec/arb_tessellation_shader/execution/
+    *   built-in-functions/tcs-abs-float.shader_test */
    const mesa_shader_stage supported_stages[] = {MESA_SHADER_VERTEX,
-                                                 MESA_SHADER_TESS_CTRL,
-                                                 MESA_SHADER_TESS_EVAL,
                                                  MESA_SHADER_GEOMETRY,
                                                  MESA_SHADER_FRAGMENT};
    for (unsigned i = 0; i < ARRAY_SIZE(supported_stages); i++) {

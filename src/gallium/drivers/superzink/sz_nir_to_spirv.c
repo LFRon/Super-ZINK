@@ -55,6 +55,12 @@
 #define SZ_LOC_LEGACY_MAX 16
 
 #define SZ_MAX_VARIABLES 96
+/* The entry point's interface list holds every declared varying *plus* every
+ * builtin declared on demand, so it can be longer than the variable table. It
+ * used to be allocated with the variable count, and a tessellation shader --
+ * two interface blocks, patch varyings and half a dozen builtins -- wrote past
+ * the end of it. */
+#define SZ_MAX_INTERFACES (SZ_MAX_VARIABLES * 2)
 
 /* Gallium's floor for constant buffer slots per stage: the same number the
  * descriptor set layout declares. */
@@ -306,6 +312,16 @@ sz_base_from_alu_type(nir_alu_type type, enum sz_base *out)
    default:
       return false;
    }
+}
+
+/* Appends one id to the entry point's interface list, which SPIR-V 1.4 requires
+ * to name every global the entry point can reach. */
+static void
+sz_interface_add(struct sz_translate *t, uint32_t id)
+{
+   if (t->num_interfaces < SZ_MAX_INTERFACES)
+      t->interfaces[t->num_interfaces] = id;
+   t->num_interfaces++;
 }
 
 static uint32_t
@@ -1964,7 +1980,7 @@ sz_ubo_array_ptr(struct sz_translate *t, unsigned index)
 
    /* SPIR-V 1.4 and later want every global the entry point reaches in its
     * interface list, uniform blocks included. */
-   t->interfaces[t->num_interfaces++] = var;
+   sz_interface_add(t, var);
 
    return array_ptr;
 }
@@ -2462,7 +2478,7 @@ sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
    sz_spv_decorate(t->m, id, SpvDecorationBinding,
                    sz_image_binding(t->nir->info.stage, index));
 
-   t->interfaces[t->num_interfaces++] = id;
+   sz_interface_add(t, id);
    const uint32_t value = sz_spv_load(t->m, image_type, id);
 
    if (t->num_images == ARRAY_SIZE(t->images)) {
@@ -2647,7 +2663,7 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
    t->samplers[t->num_samplers].value = value;
    t->num_samplers++;
 
-   t->interfaces[t->num_interfaces++] = var;
+   sz_interface_add(t, var);
 
    return value;
 }
@@ -3300,7 +3316,7 @@ sz_load_builtin_vec(struct sz_translate *t, SpvBuiltIn builtin, unsigned ncomp)
    sz_spv_decorate(t->m, var, SpvDecorationBuiltIn, builtin);
    sz_spv_capability(t->m, SpvCapabilityTessellation);
 
-   t->interfaces[t->num_interfaces++] = var;
+   sz_interface_add(t, var);
    return sz_spv_load(t->m, type, var);
 }
 
@@ -3320,7 +3336,7 @@ sz_load_sample_position(struct sz_translate *t)
    const uint32_t var = sz_spv_variable(t->m, ptr_type, SpvStorageClassInput);
    sz_spv_decorate(t->m, var, SpvDecorationBuiltIn, SpvBuiltInSamplePosition);
 
-   t->interfaces[t->num_interfaces++] = var;
+   sz_interface_add(t, var);
    return sz_spv_load(t->m, vec2, var);
 }
 
@@ -3353,7 +3369,7 @@ sz_load_sample_mask_in(struct sz_translate *t)
     * not (VUID-StandaloneSpirv-Flat-04744). */
    sz_spv_decorate_bare(t->m, var, SpvDecorationFlat);
 
-   t->interfaces[t->num_interfaces++] = var;
+   sz_interface_add(t, var);
    t->int_builtins[t->num_int_builtins].builtin = SpvBuiltInSampleMask;
    t->int_builtins[t->num_int_builtins].var = var;
    t->num_int_builtins++;
@@ -3391,7 +3407,7 @@ sz_load_builtin_int(struct sz_translate *t, SpvBuiltIn builtin)
    if (t->nir->info.stage == MESA_SHADER_FRAGMENT)
       sz_spv_decorate_bare(t->m, var, SpvDecorationFlat);
 
-   t->interfaces[t->num_interfaces++] = var;
+   sz_interface_add(t, var);
    t->int_builtins[t->num_int_builtins].builtin = builtin;
    t->int_builtins[t->num_int_builtins].var = var;
    t->num_int_builtins++;
@@ -4479,7 +4495,7 @@ sz_nir_to_spirv(struct nir_shader *nir,
    t.base_hint = malloc(num_defs);
    if (t.base_hint)
       memset(t.base_hint, 0xff, num_defs);
-   t.interfaces = calloc(SZ_MAX_VARIABLES, sizeof(*t.interfaces));
+   t.interfaces = calloc(SZ_MAX_INTERFACES, sizeof(*t.interfaces));
    if (!t.defs_id || !t.def_types || !t.consts || !t.base_hint || !t.interfaces) {
       sz_fail(&t, "out of memory");
       goto fail;
@@ -4682,7 +4698,7 @@ sz_nir_to_spirv(struct nir_shader *nir,
     * are only declared once a load asks for one. The module reorders its
     * sections, so the instruction still lands before the functions. */
    sz_spv_entry_point(t.m, model, function, "main", t.interfaces,
-                      t.num_interfaces);
+                      MIN2(t.num_interfaces, SZ_MAX_INTERFACES));
 
    size_t bytes = 0;
    const uint32_t *module = sz_spv_finalize(t.m, &bytes);
