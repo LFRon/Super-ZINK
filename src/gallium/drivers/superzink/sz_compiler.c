@@ -82,6 +82,20 @@ static const struct nir_shader_compiler_options sz_nir_options_default = {
 
    /* Zero frontend optimisation: D8. */
    .max_unroll_iterations = 0,
+
+   /* Indirect indexing of an interface array is translated as an SPIR-V access
+    * chain with a dynamic index, which is exactly what SPIR-V allows. Telling
+    * the frontend so keeps it from rewriting each of those loads and stores into
+    * an if-else tree over the whole array: a tessellation control shader reads
+    * `gl_in[gl_InvocationID]`, and lowering that to a chain of comparisons turns
+    * one access chain into one branch per patch vertex. The set below is the
+    * same one zink reports, and the stages it names are the ones whose inputs or
+    * outputs GL indexes indirectly in practice -- tessellation (gl_in/gl_out by
+    * invocation) and the fragment stage (input arrays by index). */
+   .support_indirect_inputs = BITFIELD_BIT(MESA_SHADER_TESS_CTRL) |
+                              BITFIELD_BIT(MESA_SHADER_TESS_EVAL) |
+                              BITFIELD_BIT(MESA_SHADER_FRAGMENT),
+   .support_indirect_outputs = (uint8_t)BITFIELD_MASK(MESA_SHADER_STAGES),
 };
 
 const struct nir_shader_compiler_options *
