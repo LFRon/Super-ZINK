@@ -720,6 +720,13 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* glCopyImageSubData. The flag names the hardest case -- a copy that
+       * converts between a compressed and a plain format -- and st grants
+       * ARB_copy_image on it alone. Copies that only differ in swizzle are
+       * rewritten to a common canonical format by st, and resource_copy_region
+       * then does a plain vkCmdCopyImage, which is all Vulkan can do anyway. */
+      caps->copy_between_compressed_and_plain_formats = true;
+
       /* ARB_gpu_shader_fp64: the translator's type machinery is width
        * parametric (sz_scalar_type takes a bit count), so a double is
        * OpTypeFloat 64 and the arithmetic opcodes are the same ones. Probing. */
