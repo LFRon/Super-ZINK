@@ -598,6 +598,16 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * ones that match the colour width, so glXChooseVisual finds nothing. */
       caps->mixed_color_depth_bits = true;
 
+      /* No fixed-function clip planes: Vulkan clips on the ClipDistance the
+       * shader writes, and nothing else. Reporting zero is what makes the state
+       * tracker lower an application's clip planes -- and gl_ClipVertex, which
+       * only exists to feed them -- into ClipDistance writes, which this driver
+       * translates. Reporting the u_screen default of one is worse than saying
+       * nothing: st concludes the hardware provides them, leaves gl_ClipVertex in
+       * the shader, and every compat shader that uses it fails to translate.
+       * MaxClipPlanes stays at GL's 8 either way (st only overrides it above 1). */
+      caps->clip_planes = 0;
+
       /* Separate RGB/alpha blend equations are ordinary Vulkan state: every
        * attachment carries srcColorBlendFactor/colorBlendOp next to the alpha
        * pair, which is exactly what Gallium's blend state asks for. st/mesa

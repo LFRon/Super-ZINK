@@ -116,6 +116,7 @@ struct sz_translate {
       const nir_variable *var;
       uint32_t id;
       uint32_t pointee;
+      SpvStorageClass storage;
       /* The type the variable was declared with. A load has to match its
        * pointee, and the deref's own type can disagree with it: the frontend
        * declares varyings as `vec4` and reinterprets them as `ivec4` on use,
@@ -726,12 +727,35 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
    bool has_builtin = false;
    unsigned location = 0;
 
+   /* gl_ClipVertex exists only to feed the fixed-function clip planes, and this
+    * driver has none (see caps->clip_planes). The state tracker rewrites it into
+    * ClipDistance stores whenever a plane is enabled, so what reaches here is the
+    * variant where the value is never read -- but it still has stores, and the
+    * interface has no location to give it: the legacy slots already reach 16 and
+    * a vertex stage has 16 locations. Private storage takes the stores somewhere
+    * harmless: unlike Function it is legal at module scope, and unlike Output it
+    * needs no decoration and is not part of the entry point's interface. */
+   /* The name is what distinguishes it from a user varying that shares the
+    * number: a vertex attribute's location is a VERT_ATTRIB_* value, and
+    * VERT_ATTRIB_GENERIC0 is 16 -- the same number as VARYING_SLOT_CLIP_VERTEX, so
+    * a shader whose second attribute lives there would otherwise be mangled. GL's
+    * own rule is the same one the linker uses: a builtin's name starts with
+    * "gl_". */
+   const bool dead_clip_vertex =
+      var->data.location == VARYING_SLOT_CLIP_VERTEX &&
+      t->nir->info.stage != MESA_SHADER_FRAGMENT && var->name &&
+      strncmp(var->name, "gl_", 3) == 0;
+
    switch (var->data.mode) {
    case nir_var_shader_in:
-      storage = SpvStorageClassInput;
+      /* A geometry shader receives it as an input; the value is dead there too,
+       * and an input with no interface location is just as invalid. */
+      storage = dead_clip_vertex ? SpvStorageClassPrivate
+                                 : SpvStorageClassInput;
       break;
    case nir_var_shader_out:
-      storage = SpvStorageClassOutput;
+      storage = dead_clip_vertex ? SpvStorageClassPrivate
+                                 : SpvStorageClassOutput;
       break;
    case nir_var_function_temp:
       /* nir_lower_vars_to_ssa() should have removed these; a leftover means the
@@ -762,7 +786,7 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
    if (!sz_dtype_from_glsl(t, var->type, &type))
       return false;
 
-   if (storage != SpvStorageClassFunction) {
+   if (storage != SpvStorageClassPrivate) {
       if (!sz_varying_location(t, var, &builtin, &has_builtin, &location))
          return false;
    }
@@ -798,7 +822,7 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
       default:
          break;
       }
-   } else {
+   } else if (storage != SpvStorageClassPrivate) {
       sz_spv_decorate(t->m, id, SpvDecorationLocation, location);
       /* The GLSL linker packs several small varyings into one location, each at
        * its own component (`location_frac`). Without the Component decoration
@@ -809,7 +833,8 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
                          var->data.location_frac);
    }
 
-   sz_decorate_stream_output(t, var, id);
+   if (storage == SpvStorageClassOutput)
+      sz_decorate_stream_output(t, var, id);
 
    /* Flat is meaningful only on fragment stage inputs: an integer varying
     * carries no interpolation because it cannot be blended, and SPIR-V requires
@@ -824,6 +849,7 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
    t->vars[t->num_vars].var = var;
    t->vars[t->num_vars].id = id;
    t->vars[t->num_vars].pointee = pointee;
+   t->vars[t->num_vars].storage = storage;
    t->vars[t->num_vars].type = type;
    t->num_vars++;
 
@@ -3342,6 +3368,10 @@ sz_nir_to_spirv(struct nir_shader *nir,
 
       if (!sz_declare_variable(&t, var))
          goto fail;
+      /* Every global variable the entry point can reach belongs in its
+       * interface list: SPIR-V 1.4 made that the rule for all storage classes,
+       * not just Input and Output, and leaving a Private one out is a validation
+       * error ("is used by entry point but is not listed as an interface"). */
       t.interfaces[t.num_interfaces++] = t.vars[t.num_vars - 1].id;
    }
 
