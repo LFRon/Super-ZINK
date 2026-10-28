@@ -151,6 +151,12 @@ sz_lower_nir(struct nir_shader *nir)
     * callee's locals -- now the caller's locals -- into SSA as well. */
    nir_lower_vars_to_ssa(nir);
 
+   /* frexp() is two NIR ops (a significand and an exponent) and there is no
+    * SPIR-V pair that returns them separately; the GLSL dialect's FrexpStruct
+    * returns a struct, which this translator has no reason to grow a struct type
+    * for. The pass rewrites both ops into arithmetic instead. */
+   nir_lower_frexp(nir);
+
    /* GL clip space has z in [-1, 1] and Vulkan's viewport expects [0, 1]. The Y
     * axis is handled by the viewport's negative height, but z has no viewport
     * equivalent, so the last pre-rasterisation stage rescales it: z' = (z + w) /

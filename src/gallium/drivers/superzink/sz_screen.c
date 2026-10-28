@@ -583,8 +583,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * look like a driver bug rather than a missing feature. */
    {
       struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
-      caps->glsl_feature_level = 330;
-      caps->glsl_feature_level_compatibility = 330;
+      caps->glsl_feature_level = 400;
+      caps->glsl_feature_level_compatibility = 400;
       caps->max_texture_2d_size = 16384;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
@@ -613,6 +613,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * swizzles and the view is created with them, so nothing else is needed
        * for GL's texture swizzle to work. */
       caps->texture_swizzle = true;
+
+      /* textureLod in a shader maps onto OpImageQueryLod, which is what
+       * GL_ARB_texture_query_lod exposes. The instruction is already emitted for
+       * nir_texop_lod, so the capability was simply never claimed. */
+      caps->texture_query_lod = true;
 
       /* No fixed-function clip planes: Vulkan clips on the ClipDistance the
        * shader writes, and nothing else. Reporting zero is what makes the state

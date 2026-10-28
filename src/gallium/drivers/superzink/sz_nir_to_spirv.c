@@ -2777,6 +2777,83 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
    t->def_types[tex->def.index] = result_type;
 }
 
+
+/* interpolateAtCentroid/Sample/Offset -- GLSL 4.00's interpolateAt* family.
+ *
+ * The GLSL dialect carries all three, and each takes a pointer to the fragment
+ * input rather than its value: that is the whole point of the feature, since the
+ * value a plain load reads is the one interpolated at the pixel centre. A
+ * backend that cannot interpolate at a chosen point cannot fake these.
+ *
+ * The shapes SPIR-V wants are narrower than NIR's: the sample index must be a
+ * 32-bit int and the offset a vec2 of 32-bit floats, so anything else is
+ * reinterpreted on the way in.
+ */
+/* sz_alu_source_as() takes an nir_alu_src, which carries a component swizzle;
+ * an intrinsic's source does not, and a zero-initialised swizzle reads as "take
+ * component 0 four times" -- which silently turns a vec2 into (vec2, float). */
+static uint32_t
+sz_intrin_source_as(struct sz_translate *t, const nir_src *src,
+                    const struct sz_dtype *want, unsigned ncomp)
+{
+   nir_alu_src alu_src = { .src = *src };
+   for (unsigned i = 0; i < 4; i++)
+      alu_src.swizzle[i] = i;
+   return sz_alu_source_as(t, &alu_src, want, ncomp);
+}
+
+static void
+sz_emit_interpolate(struct sz_translate *t, nir_intrinsic_instr *intrin)
+{
+   nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+   if (!deref) {
+      sz_fail(t, "interp_deref without a deref source");
+      return;
+   }
+
+   const uint32_t ptr = sz_emit_deref(t, deref);
+   if (!ptr)
+      return;
+
+   struct sz_dtype type = { 0 };
+   if (!sz_dtype_from_glsl(t, deref->type, &type))
+      return;
+
+   sz_spv_capability(t->m, SpvCapabilityInterpolationFunction);
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_interp_deref_at_centroid: {
+      const uint32_t ops[] = { ptr };
+      t->defs_id[intrin->def.index] =
+         sz_emit_ext(t, GLSLstd450InterpolateAtCentroid, &type, ops, 1);
+      break;
+   }
+   case nir_intrinsic_interp_deref_at_sample: {
+      struct sz_dtype want = { SZ_BASE_INT, 32, 1 };
+      const uint32_t sample =
+         sz_intrin_source_as(t, &intrin->src[1], &want, 1);
+      const uint32_t ops[] = { ptr, sample };
+      t->defs_id[intrin->def.index] =
+         sz_emit_ext(t, GLSLstd450InterpolateAtSample, &type, ops, 2);
+      break;
+   }
+   case nir_intrinsic_interp_deref_at_offset: {
+      struct sz_dtype want = { SZ_BASE_FLOAT, 32, 2 };
+      const uint32_t offset =
+         sz_intrin_source_as(t, &intrin->src[1], &want, 2);
+      const uint32_t ops[] = { ptr, offset };
+      t->defs_id[intrin->def.index] =
+         sz_emit_ext(t, GLSLstd450InterpolateAtOffset, &type, ops, 2);
+      break;
+   }
+   default:
+      sz_fail(t, "unsupported interpolate intrinsic");
+      return;
+   }
+
+   t->def_types[intrin->def.index] = type;
+}
+
 /* Screen-space derivatives. They are intrinsics rather than ALU ops in this
  * Mesa, and the fine/coarse forms need the DerivativeControl capability. */
 static void
@@ -2922,6 +2999,11 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       return false;
    case nir_intrinsic_load_deref:
       sz_emit_load_deref(t, intrin);
+      return true;
+   case nir_intrinsic_interp_deref_at_centroid:
+   case nir_intrinsic_interp_deref_at_sample:
+   case nir_intrinsic_interp_deref_at_offset:
+      sz_emit_interpolate(t, intrin);
       return true;
    case nir_intrinsic_store_deref:
       sz_emit_store_deref(t, intrin);
