@@ -4020,6 +4020,45 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
    case nir_intrinsic_store_deref:
       sz_emit_store_deref(t, intrin);
       return true;
+
+   /* discard, and the same thing spelled as an explicit terminate.
+    *
+    * nir_intrinsic_terminate_if does not end its NIR block -- the instructions
+    * after it are still emitted, and Minecraft's core GUI shader has its colour
+    * store there -- so the SPIR-V form is a structured selection whose taken arm
+    * is OpKill and whose merge block carries on. OpKill is a terminator in
+    * SPIR-V, which is why it gets a label of its own, and the merge block is the
+    * one the following instructions go into.
+    *
+    * The unconditional forms use the same shape with a constant condition
+    * instead of an inline OpKill: an intrinsic does not have to be the last
+    * thing in its NIR block, so relying on the block being terminated here would
+    * be wrong the moment one is not. */
+   case nir_intrinsic_terminate_if:
+   case nir_intrinsic_terminate: {
+      const bool conditional = intrin->intrinsic == nir_intrinsic_terminate_if;
+      uint32_t condition;
+      if (conditional) {
+         const struct sz_dtype want = {SZ_BASE_BOOL, 1, 1, 0};
+         condition = sz_intrin_source_as(t, &intrin->src[0], &want, 1);
+         if (condition == 0)
+            return false;
+      } else {
+         condition = sz_spv_const_bool(t->m, true);
+      }
+
+      const uint32_t kill = sz_spv_id(t->m);
+      const uint32_t merge = sz_spv_id(t->m);
+
+      sz_spv_selection_merge(t->m, merge, SpvSelectionControlMaskNone);
+      sz_spv_branch_conditional(t->m, condition, kill, merge);
+      sz_spv_label_id(t->m, kill);
+      sz_spv_raw_function_op(t->m, SpvOpKill, NULL, 0);
+      sz_spv_label_id(t->m, merge);
+      t->block_open = true;
+      return true;
+   }
+
    default:
       sz_fail(t, "intrinsic `%s` is not supported yet",
               nir_intrinsic_infos[intrin->intrinsic].name);
