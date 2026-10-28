@@ -3158,9 +3158,48 @@ sz_transfer_flush_region(struct pipe_context *pipe,
    /* The whole box is copied at unmap, so there is nothing to flush early. */
 }
 
+/* glTextureBarrier (NV_texture_barrier).
+ *
+ * The promise GL makes is that a draw which samples a texture a *previous* draw
+ * rendered into sees that draw's results, and that this needs no explicit
+ * synchronisation from the application. Vulkan makes the opposite promise by
+ * default -- a read-after-write within one command buffer is a hazard the
+ * application has to barrier -- so the barrier is what upholds GL's rule.
+ *
+ * The draws are already ordered by being recorded in one command buffer, so the
+ * only thing missing is the execution and memory dependency between the colour
+ * writes and the sampled reads. A full barrier is coarse, and deliberately so:
+ * the flags Gallium passes describe which textures the application *promises*
+ * it will only read or write, and getting that bookkeeping subtly wrong produces
+ * exactly the intermittent corruption the barrier exists to prevent. */
 static void
 sz_texture_barrier(struct pipe_context *pipe, unsigned flags)
 {
+   struct sz_context *ctx = sz_context(pipe);
+
+   /* Anything queued has to land first: the barrier has to separate the draws
+    * it is between, not the ones already merged into a batch. */
+   sz_draw_flush(ctx);
+
+   VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
+   if (cmd == VK_NULL_HANDLE)
+      return;
+
+   sz_memory_barrier(ctx->screen, cmd,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                        VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
+
+   (void)flags;
 }
 
 static void

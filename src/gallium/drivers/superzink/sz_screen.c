@@ -632,10 +632,31 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->texture_query_samples = true;
       caps->fs_fine_derivative = true;
       caps->polygon_offset_clamp = true;
-      /* Not claimed, although the mechanism looks present:
-       *  - caps->cull_distance makes st keep gl_CullDistance in the shader, and
-       *    the builtin is declared, but piglit's arb_cull_distance renders
-       *    unclipped (8 failures), so something in the chain is still wrong;
+      /* glTextureBarrier: sz_texture_barrier() flushes the batch and emits the
+       * colour-write-to-sampled-read dependency GL's rule requires and Vulkan
+       * does not give by default. */
+      caps->texture_barrier = true;
+
+      /* A framebuffer with no attachments at all, which GL 3.0 allows for
+       * depth-less, colour-less rendering (occlusion queries and gl_FragDepth
+       * side effects). Dynamic rendering accepts an empty attachment list, and
+       * the width/height the application sets are what the render area uses. */
+      caps->framebuffer_no_attachment = true;
+
+      /* Array components in a varying: `layout(location = 0) out vec4 a[2]` may
+       * occupy locations 0 and 1, and a small array may start at a non-zero
+       * component. The translator has emitted the Component decoration from
+       * location_frac since 3.2. */
+      caps->shader_array_components = true;
+
+      /* Not claimed:
+       *  - caps->cull_distance: glsl's linker calls
+       *    nir_merge_clip_cull_distance_vars() unconditionally, which folds
+       *    gl_CullDistance into gl_ClipDistance past clip_distance_array_size --
+       *    one array holding both. Vulkan has two separate builtins, so the
+       *    translator has to split them, which it does not yet. Claiming it
+       *    renders every primitive culled because the values land in the clip
+       *    array and are read as clip distances;
        *  - caps->sampler_view_target makes ARB_texture_view's format
        *    reinterpretation legal, and viewing an RGBA8 texture as RGBA32F needs
        *    compatibility rules this driver has none of (536 failures). */
