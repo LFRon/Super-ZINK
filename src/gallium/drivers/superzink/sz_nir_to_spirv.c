@@ -597,6 +597,19 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
          return true;
       }
 
+      /* gl_TessLevelOuter/Inner. A tessellation control shader writes them and
+       * a tessellation evaluation shader reads them back; with
+       * glsl_tess_levels_as_inputs the read side sees the same varying slot the
+       * write side used, so one mapping covers both. */
+      if (slot == VARYING_SLOT_TESS_LEVEL_OUTER ||
+          slot == VARYING_SLOT_TESS_LEVEL_INNER) {
+         *builtin = slot == VARYING_SLOT_TESS_LEVEL_OUTER
+                       ? SpvBuiltInTessLevelOuter
+                       : SpvBuiltInTessLevelInner;
+         *has_builtin = true;
+         return true;
+      }
+
       /* Clip and cull distances are arrays of floats with a builtin, not
        * locations. The frontend keeps them merged into one array per family, so
        * only the first slot of each is ever declared. */
@@ -645,6 +658,18 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
                *has_builtin = true;
                return true;
             }
+         }
+
+         /* gl_TessLevelOuter/Inner, written by the control stage. They are
+          * patch varyings in GL, but Vulkan spells them as builtins, so the
+          * Patch decoration must not be added on top. */
+         if (slot == VARYING_SLOT_TESS_LEVEL_OUTER ||
+             slot == VARYING_SLOT_TESS_LEVEL_INNER) {
+            *builtin = slot == VARYING_SLOT_TESS_LEVEL_OUTER
+                          ? SpvBuiltInTessLevelOuter
+                          : SpvBuiltInTessLevelInner;
+            *has_builtin = true;
+            return true;
          }
 
          if (slot == VARYING_SLOT_CLIP_DIST0) {
@@ -910,6 +935,13 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
       case SpvBuiltInViewportIndex:
          sz_spv_capability(t->m, SpvCapabilityMultiViewport);
          break;
+      case SpvBuiltInTessLevelOuter:
+      case SpvBuiltInTessLevelInner:
+      case SpvBuiltInTessCoord:
+      case SpvBuiltInInvocationId:
+      case SpvBuiltInPatchVertices:
+         sz_spv_capability(t->m, SpvCapabilityTessellation);
+         break;
       default:
          break;
       }
@@ -929,6 +961,12 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
        * claim location 0 outright and the module is rejected. */
       if (var->data.index != 0)
          sz_spv_decorate(t->m, id, SpvDecorationIndex, var->data.index);
+
+      /* A patch varying lives once per patch rather than once per vertex, and
+       * SPIR-V says so with a decoration instead of a different storage class.
+       * Without it a TES reads one vertex's copy of the value. */
+      if (var->data.patch)
+         sz_spv_decorate_bare(t->m, id, SpvDecorationPatch);
    }
 
    if (storage == SpvStorageClassOutput)
@@ -2999,6 +3037,26 @@ sz_load_mask_element(struct sz_translate *t, uint32_t var, uint32_t array_type,
    return sz_spv_composite_extract(t->m, int_type, arr, &index, 1);
 }
 
+/* A float builtin of `ncomp` components, declared on first use like the integer
+ * ones. gl_TessCoord is this shape, and so are the two tessellation level
+ * arrays when the frontend leaves them as system values. */
+static uint32_t
+sz_load_builtin_vec(struct sz_translate *t, SpvBuiltIn builtin, unsigned ncomp)
+{
+   const uint32_t float_type = sz_spv_type_float32(t->m);
+   const uint32_t type = ncomp == 1
+                            ? float_type
+                            : sz_spv_type_vec(t->m, float_type, ncomp);
+   const uint32_t ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassInput, type);
+   const uint32_t var = sz_spv_variable(t->m, ptr_type, SpvStorageClassInput);
+   sz_spv_decorate(t->m, var, SpvDecorationBuiltIn, builtin);
+   sz_spv_capability(t->m, SpvCapabilityTessellation);
+
+   t->interfaces[t->num_interfaces++] = var;
+   return sz_spv_load(t->m, type, var);
+}
+
 /* gl_SamplePosition and gl_SampleMask[] are the two remaining sample builtins:
  * the first is a vec2 float input, the second an int array output that the
  * fragment shader may write to kill individual samples. */
@@ -3199,6 +3257,62 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       return true;
    }
 
+   case nir_intrinsic_load_invocation_id: {
+      const uint32_t value = sz_load_builtin_int(t, SpvBuiltInInvocationId);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_INT, 32, 1, 0};
+      return true;
+   }
+   case nir_intrinsic_load_patch_vertices_in: {
+      const uint32_t value = sz_load_builtin_int(t, SpvBuiltInPatchVertices);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_INT, 32, 1, 0};
+      return true;
+   }
+   case nir_intrinsic_load_tess_coord: {
+      const uint32_t value = sz_load_builtin_vec(t, SpvBuiltInTessCoord, 3);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_FLOAT, 32, 3, 0};
+      return true;
+   }
+   case nir_intrinsic_load_tess_coord_xy: {
+      const uint32_t vec3 = sz_load_builtin_vec(t, SpvBuiltInTessCoord, 3);
+      if (vec3 == 0)
+         return false;
+      const uint32_t vec2 = sz_spv_type_vec(t->m, sz_spv_type_float32(t->m), 2);
+      uint32_t comps[2];
+      for (unsigned i = 0; i < 2; i++) {
+         const uint32_t index = sz_spv_const_int32(t->m, i);
+         comps[i] = sz_spv_composite_extract(t->m, sz_spv_type_float32(t->m),
+                                             vec3, &index, 1);
+      }
+      t->defs_id[intrin->def.index] =
+         sz_spv_composite_construct(t->m, vec2, comps, 2);
+      t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_FLOAT, 32, 2, 0};
+      return true;
+   }
+   case nir_intrinsic_load_tess_level_outer: {
+      const uint32_t value = sz_load_builtin_vec(t, SpvBuiltInTessLevelOuter, 4);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_FLOAT, 32, 4, 0};
+      return true;
+   }
+   case nir_intrinsic_load_tess_level_inner: {
+      const uint32_t value = sz_load_builtin_vec(t, SpvBuiltInTessLevelInner, 2);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_FLOAT, 32, 2, 0};
+      return true;
+   }
    case nir_intrinsic_load_vertex_id:
    case nir_intrinsic_load_instance_id: {
       const SpvBuiltIn builtin = intrin->intrinsic == nir_intrinsic_load_vertex_id
@@ -3975,6 +4089,12 @@ sz_nir_to_spirv(struct nir_shader *nir,
    case MESA_SHADER_FRAGMENT:
       model = SpvExecutionModelFragment;
       break;
+   case MESA_SHADER_TESS_CTRL:
+      model = SpvExecutionModelTessellationControl;
+      break;
+   case MESA_SHADER_TESS_EVAL:
+      model = SpvExecutionModelTessellationEvaluation;
+      break;
    default:
       sz_fail(&t, "shader stage %d is not supported yet", (int)nir->info.stage);
       goto fail;
@@ -4077,6 +4197,59 @@ sz_nir_to_spirv(struct nir_shader *nir,
          t.m, function, SpvExecutionModeInvocations,
          MAX2(nir->info.gs.invocations, 1));
    }
+   /* Tessellation. The pipeline is compiled against every one of these modes:
+    * Vulkan has no defaults, a missing one is a validation error, and a wrong
+    * one silently tessellates into the wrong surface. */
+   if (nir->info.stage == MESA_SHADER_TESS_CTRL ||
+       nir->info.stage == MESA_SHADER_TESS_EVAL) {
+      sz_spv_capability(t.m, SpvCapabilityTessellation);
+
+      if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
+         /* The size of the patch this stage emits. */
+         sz_spv_execution_mode_literal(
+            t.m, function, SpvExecutionModeOutputVertices,
+            MAX2(nir->info.tess.tcs_vertices_out, 1));
+      } else {
+         SpvExecutionMode prim;
+         switch (nir->info.tess._primitive_mode) {
+         case TESS_PRIMITIVE_TRIANGLES:
+            prim = SpvExecutionModeTriangles;
+            break;
+         case TESS_PRIMITIVE_QUADS:
+            prim = SpvExecutionModeQuads;
+            break;
+         case TESS_PRIMITIVE_ISOLINES:
+            prim = SpvExecutionModeIsolines;
+            break;
+         default:
+            sz_fail(&t, "tessellation primitive mode %d is not supported",
+                    (int)nir->info.tess._primitive_mode);
+            goto fail;
+         }
+         sz_spv_execution_mode(t.m, function, prim);
+
+         SpvExecutionMode spacing;
+         switch (nir->info.tess.spacing) {
+         case TESS_SPACING_FRACTIONAL_ODD:
+            spacing = SpvExecutionModeSpacingFractionalOdd;
+            break;
+         case TESS_SPACING_FRACTIONAL_EVEN:
+            spacing = SpvExecutionModeSpacingFractionalEven;
+            break;
+         default:
+            spacing = SpvExecutionModeSpacingEqual;
+            break;
+         }
+         sz_spv_execution_mode(t.m, function, spacing);
+         sz_spv_execution_mode(t.m, function,
+                               nir->info.tess.ccw
+                                  ? SpvExecutionModeVertexOrderCcw
+                                  : SpvExecutionModeVertexOrderCw);
+         if (nir->info.tess.point_mode)
+            sz_spv_execution_mode(t.m, function, SpvExecutionModePointMode);
+      }
+   }
+
    /* Vulkan refuses to begin transform feedback for a pipeline whose last
     * pre-rasterization stage does not declare the Xfb execution mode
     * (VUID-vkCmdBeginTransformFeedbackEXT-None-04128). The per-variable

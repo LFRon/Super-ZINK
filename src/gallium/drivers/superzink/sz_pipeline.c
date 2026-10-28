@@ -224,6 +224,10 @@ sz_pipeline_destroy_objects(struct sz_screen *screen, struct sz_gfx_pipeline *p)
     * pipeline itself belong to the one pipeline that was built with them. */
    if (p->vs != VK_NULL_HANDLE)
       screen->vk.DestroyShaderModule(screen->dev, p->vs, NULL);
+   if (p->tcs != VK_NULL_HANDLE)
+      screen->vk.DestroyShaderModule(screen->dev, p->tcs, NULL);
+   if (p->tes != VK_NULL_HANDLE)
+      screen->vk.DestroyShaderModule(screen->dev, p->tes, NULL);
    if (p->gs != VK_NULL_HANDLE)
       screen->vk.DestroyShaderModule(screen->dev, p->gs, NULL);
    if (p->fs != VK_NULL_HANDLE)
@@ -672,6 +676,17 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
    if (p->vs == VK_NULL_HANDLE || p->fs == VK_NULL_HANDLE)
       goto fail;
 
+   /* Tessellation: both stages are bound or neither is, because GL links them
+    * as a pair. */
+   p->tcs = ctx->state.shaders[MESA_SHADER_TESS_CTRL]
+                ? sz_pipeline_module(ctx, MESA_SHADER_TESS_CTRL)
+                : VK_NULL_HANDLE;
+   p->tes = ctx->state.shaders[MESA_SHADER_TESS_EVAL]
+                ? sz_pipeline_module(ctx, MESA_SHADER_TESS_EVAL)
+                : VK_NULL_HANDLE;
+   if ((p->tcs == VK_NULL_HANDLE) != (p->tes == VK_NULL_HANDLE))
+      goto fail;
+
    /* A geometry stage is part of the pipeline only when one is bound. There is
     * no bootstrap fallback for it: an empty GS is exactly "no GS", and GL 3.2
     * apps are free not to use one. */
@@ -687,7 +702,7 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
     * a measurable part of the cost of a state change. */
    VkResult result;
 
-   VkPipelineShaderStageCreateInfo stages[3];
+   VkPipelineShaderStageCreateInfo stages[5];
    unsigned stage_count = 0;
 
    stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
@@ -696,6 +711,21 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
       .module = p->vs,
       .pName = "main",
    };
+
+   if (p->tcs != VK_NULL_HANDLE) {
+      stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+         .module = p->tcs,
+         .pName = "main",
+      };
+      stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+         .module = p->tes,
+         .pName = "main",
+      };
+   }
 
    if (p->gs != VK_NULL_HANDLE) {
       stages[stage_count++] = (VkPipelineShaderStageCreateInfo) {
@@ -986,6 +1016,14 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
       .stencilAttachmentFormat = stencil_format,
    };
 
+      /* Vulkan requires this structure when and only when a tessellation stage is
+    * present, and it has no default: the input patch size is a pipeline
+    * property, not a shader one. */
+   const VkPipelineTessellationStateCreateInfo tessellation = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+      .patchControlPoints = MAX2(ctx->state.patch_vertices, 1),
+   };
+
    const VkGraphicsPipelineCreateInfo pipeline_ci = {
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
       /* A pipeline whose descriptors come from a descriptor buffer has to say so
@@ -1001,6 +1039,7 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
       .pStages = stages,
       .pVertexInputState = &vertex_input,
       .pInputAssemblyState = &input_assembly,
+      .pTessellationState = p->tcs != VK_NULL_HANDLE ? &tessellation : NULL,
       .pViewportState = &viewport_state,
       .pRasterizationState = &raster,
       .pMultisampleState = &multisample,
@@ -1046,6 +1085,11 @@ sz_pipeline_key_from_state(struct sz_context *ctx, VkPrimitiveTopology topology,
    key->rasterizer = SZ_STATE_ID(ctx->state.rasterizer);
    key->dsa = SZ_STATE_ID(ctx->state.depth_stencil_alpha);
    key->vs = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_VERTEX]);
+   key->tcs = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_TESS_CTRL]);
+   key->tes = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_TESS_EVAL]);
+   /* patchControlPoints is baked into the pipeline, and GL lets the application
+    * change it between draws with glPatchParameteri. */
+   key->patch_vertices = ctx->state.patch_vertices;
    key->gs = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_GEOMETRY]);
    key->fs = SZ_STATE_ID(ctx->state.shaders[MESA_SHADER_FRAGMENT]);
 #undef SZ_STATE_ID
@@ -1070,6 +1114,8 @@ sz_pipeline_key_equal(const struct sz_pipeline_key *a,
 {
    return a->blend == b->blend && a->rasterizer == b->rasterizer &&
           a->dsa == b->dsa && a->vs == b->vs && a->fs == b->fs &&
+          a->tcs == b->tcs && a->tes == b->tes &&
+          a->patch_vertices == b->patch_vertices &&
           a->topology == b->topology && a->samples == b->samples &&
           a->gs == b->gs &&
           a->color_count == b->color_count && a->depth == b->depth &&

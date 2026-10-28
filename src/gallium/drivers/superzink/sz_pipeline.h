@@ -58,12 +58,18 @@ struct sz_pipeline_key {
    uint64_t rasterizer;
    uint64_t dsa;
    uint64_t vs;
+   uint64_t tcs;
+   uint64_t tes;
    uint64_t gs;
    uint64_t fs;
+   /* VkPipelineTessellationStateCreateInfo::patchControlPoints. */
+   unsigned patch_vertices;
 };
 
 struct sz_gfx_pipeline {
    VkShaderModule vs;
+   VkShaderModule tcs;
+   VkShaderModule tes;
    VkShaderModule gs;
    VkShaderModule fs;
    VkPipeline pipeline;
