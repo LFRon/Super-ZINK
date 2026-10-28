@@ -2978,6 +2978,9 @@ struct sz_copy_job {
    unsigned level;
    bool to_staging;
    unsigned row_pitch;
+   /* Byte offset inside `staging` the copy reads from. Non-zero for a partial
+    * upload: a flush_region copies one range of a transfer that covers more. */
+   uint32_t staging_offset;
 };
 
 static void
@@ -2997,7 +3000,7 @@ sz_copy_job_record(struct sz_context *ctx, VkCommandBuffer cmd, void *user)
                                          : SZ_ACCESS_TRANSFER_DST);
 
       const VkBufferCopy region = {
-         .srcOffset = job->to_staging ? job->box.x : 0,
+         .srcOffset = job->to_staging ? job->box.x : job->staging_offset,
          .dstOffset = job->to_staging ? 0 : job->box.x,
          .size = job->box.width,
       };
@@ -3124,13 +3127,14 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
     * Buffers therefore go through the staging path, where the copy is recorded at
     * the position of the upload and is ordered against the draws around it.
     *
-    * What is excluded is a map the caller declares it manages itself: the state
-    * tracker's uploader keeps one UNSYNCHRONIZED (and persistent or
-    * flush-explicit) map open across a whole batch and writes into it between
-    * draws, so staging it would put the copies after the draws that need them.
-    * Textures keep the direct path for the same reason they always did -- they
-    * are written once and then only sampled. A read-only map is unaffected too:
-    * waiting for the GPU is what makes a read a synchronisation point in GL. */
+    * What is not staged is a map the caller declares it manages itself. The state
+    * tracker's uploader keeps one such map open across a whole batch and writes
+    * into it between draws, so staging it would put the copies after the draws
+    * that need them. Those writes are synchronised instead: the GPU is given the
+    * chance to finish reading the buffer before the CPU overwrites it, which is
+    * the same stall a read already pays for and happens once per batch rather
+    * than once per draw. Textures keep the direct path as well -- they are
+    * written once and then only sampled. */
    const bool streaming_write =
       (usage & PIPE_MAP_WRITE) && res->target == PIPE_BUFFER &&
       !(usage & (PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_FLUSH_EXPLICIT |
@@ -3301,7 +3305,8 @@ sz_transfer_flush_region(struct pipe_context *pipe,
                          struct pipe_transfer *transfer,
                          const struct pipe_box *box)
 {
-   /* The whole box is copied at unmap, so there is nothing to flush early. */
+   /* A mapped write is synchronised at map time (see sz_transfer_map), so the
+    * whole box is copied at unmap and there is nothing to flush early. */
 }
 
 /* glTextureBarrier (NV_texture_barrier).

@@ -243,7 +243,11 @@ sz_blit_cross_format(struct pipe_context *pipe,
    const enum pipe_format src_format = info->src.resource->format;
    const enum pipe_format dst_format = info->dst.resource->format;
 
-   if (!sz_box_equals(&info->src.box, &info->dst.box)) {
+   /* The source box may be flipped, which sz_box_equals() reads as a different
+    * extent, so the sizes are compared directly. */
+   if (info->src.box.width != info->dst.box.width ||
+       abs(info->src.box.height) != abs(info->dst.box.height) ||
+       info->src.box.depth != info->dst.box.depth) {
       sz_warn_once("a blit that changes format and scales is not implemented");
       return true;
    }
@@ -264,8 +268,23 @@ sz_blit_cross_format(struct pipe_context *pipe,
 
    struct pipe_transfer *src_transfer = NULL, *dst_transfer = NULL;
    struct pipe_box box = info->src.box;
-   if (box.width <= 0 || box.height <= 0 || box.depth <= 0)
+   if (box.width <= 0 || box.height == 0 || box.depth <= 0)
       return true;
+
+   /* A negative height is GL's flipped source: the rectangle runs upwards from
+    * box.y, which is the normal case for glBlitFramebuffer because its origin is
+    * the bottom-left. Dropping it left the destination holding whatever it had
+    * before -- for a window that is the previous frame, or the clear colour,
+    * forever. It is normalised here so the mapping addresses a positive
+    * rectangle, and the flip is applied when the rows are written. */
+   const bool flip = box.height < 0;
+   if (flip) {
+      /* A flipped box spans from y - 1 down to y + height, so the lowest row it
+       * names is y + height. */
+      box.y = MAX2(box.y + box.height, 0);
+      box.height = -box.height;
+   }
+   const unsigned rows = (unsigned)box.height;
 
    /* The destination box may be at a different origin, so it is described
     * separately even though the extents match. */
@@ -288,13 +307,23 @@ sz_blit_cross_format(struct pipe_context *pipe,
 
    /* Level by level: util_format_translate converts one 2D slice, so a blit of a
     * 3D resource (or an array, whose layers are separate slices) walks the
-    * slices here. */
+    * slices here.
+    *
+    * The mapped pointers address the first texel of their own box, so every
+    * offset handed to the translator is relative to it. */
    const unsigned slices = MAX2(box.depth, 1);
    for (unsigned z = 0; z < slices; z++) {
-      util_format_translate(dst_format, dst, dst_transfer->stride, dst_box.x,
-                            dst_box.y, src_format, src,
-                            src_transfer->stride, box.x, box.y, box.width,
-                            box.height);
+      if (!flip) {
+         util_format_translate(dst_format, dst, dst_transfer->stride, 0, 0,
+                               src_format, src, src_transfer->stride, 0, 0,
+                               (unsigned)box.width, rows);
+      } else {
+         for (unsigned r = 0; r < rows; r++)
+            util_format_translate(dst_format, dst, dst_transfer->stride, 0,
+                                  rows - 1 - r, src_format, src,
+                                  src_transfer->stride, 0, r,
+                                  (unsigned)box.width, 1);
+      }
       dst = (uint8_t *)dst + dst_transfer->layer_stride;
       src = (const uint8_t *)src + src_transfer->layer_stride;
    }
@@ -404,8 +433,19 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 
    ctx->screen->stats.blits++;
 
+
    /* Both commands are illegal inside a render pass, and anything already
-    * queued must land before the blit does. */
+    * queued must land before the blit does.
+    *
+    * The flush has to be explicit. sz_context_cmd_no_pass() ends a render pass
+    * only when one is open, and a batch whose draws are still queued has none
+    * yet -- so without this the blit is recorded ahead of the very draws it is
+    * supposed to copy. An application that renders into a framebuffer and then
+    * blits it to the window (which is how Minecraft and every other modern
+    * renderer presents) then shows the previous frame's content, or the clear
+    * colour, forever. */
+   sz_draw_flush(ctx);
+
    VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
       return;
@@ -413,6 +453,7 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    if (info->mask & PIPE_MASK_RGBA)
       sz_blit_aspect(ctx, cmd, info, src, dst, VK_IMAGE_ASPECT_COLOR_BIT,
                      src_format, dst_format, src_samples, dst_samples);
+
 
    if (info->mask & PIPE_MASK_Z)
       sz_blit_aspect(ctx, cmd, info, src, dst, VK_IMAGE_ASPECT_DEPTH_BIT,
