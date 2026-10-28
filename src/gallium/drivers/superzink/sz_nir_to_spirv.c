@@ -762,6 +762,16 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
       }
    }
 
+   /* Patch varyings have a location space of their own, and it starts at zero:
+    * VARYING_SLOT_PATCH0 is where GL_LAYOUT_PATCH starts, well above the
+    * generic varyings. Subtracting VARYING_SLOT_VAR0 from a patch slot instead
+    * produced locations past 32, which Vulkan rejects. */
+   if (slot >= VARYING_SLOT_PATCH0) {
+      *location = slot - VARYING_SLOT_PATCH0;
+      t->used_generic_varying = true;
+      return true;
+   }
+
    if (slot >= VARYING_SLOT_VAR0) {
       *location = slot - VARYING_SLOT_VAR0;
       t->used_generic_varying = true;
@@ -1000,6 +1010,12 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
          break;
       case SpvBuiltInTessLevelOuter:
       case SpvBuiltInTessLevelInner:
+         sz_spv_capability(t->m, SpvCapabilityTessellation);
+         /* The two level arrays are patch builtins and SPIR-V insists the
+          * decoration says so: "BuiltIn TessLevelOuter variable needs to also
+          * have a Patch decoration". Locality is not implied by the builtin. */
+         sz_spv_decorate_bare(t->m, id, SpvDecorationPatch);
+         break;
       case SpvBuiltInTessCoord:
       case SpvBuiltInInvocationId:
       case SpvBuiltInPatchVertices:

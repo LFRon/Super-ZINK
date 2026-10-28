@@ -86,7 +86,7 @@
  * descriptor type, so it needs a third set. */
 #define SZ_DESCRIPTOR_SET_IMAGES 3
 #define SZ_DESCRIPTOR_SET_COUNT 4
-#define SZ_DESCRIPTOR_STAGES 3
+#define SZ_DESCRIPTOR_STAGES 5
 #define SZ_DESCRIPTOR_UBO_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_CONST_BUFFERS)
 #define SZ_DESCRIPTOR_SAMPLER_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
 #define SZ_DESCRIPTOR_TEXEL_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
@@ -113,10 +113,14 @@ sz_descriptor_stage_index(mesa_shader_stage stage)
    switch (stage) {
    case MESA_SHADER_VERTEX:
       return 0;
-   case MESA_SHADER_GEOMETRY:
+   case MESA_SHADER_TESS_CTRL:
       return 1;
-   case MESA_SHADER_FRAGMENT:
+   case MESA_SHADER_TESS_EVAL:
       return 2;
+   case MESA_SHADER_GEOMETRY:
+      return 3;
+   case MESA_SHADER_FRAGMENT:
+      return 4;
    default:
       return SZ_DESCRIPTOR_STAGES;
    }

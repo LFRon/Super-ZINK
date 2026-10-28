@@ -28,7 +28,8 @@
  * the layout cannot hold three stages and still stay inside the 32 descriptors
  * every device is guaranteed (see SZ_DESCRIPTOR_STAGES). */
 static const mesa_shader_stage sz_descriptor_stages[SZ_DESCRIPTOR_STAGES] = {
-   MESA_SHADER_VERTEX, MESA_SHADER_GEOMETRY, MESA_SHADER_FRAGMENT,
+   MESA_SHADER_VERTEX,      MESA_SHADER_TESS_CTRL, MESA_SHADER_TESS_EVAL,
+   MESA_SHADER_GEOMETRY,    MESA_SHADER_FRAGMENT,
 };
 
 static bool

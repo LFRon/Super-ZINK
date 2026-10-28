@@ -53,6 +53,10 @@ sz_descriptor_stage_flags(mesa_shader_stage stage)
    switch (stage) {
    case MESA_SHADER_VERTEX:
       return VK_SHADER_STAGE_VERTEX_BIT;
+   case MESA_SHADER_TESS_CTRL:
+      return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+   case MESA_SHADER_TESS_EVAL:
+      return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
    case MESA_SHADER_GEOMETRY:
       return VK_SHADER_STAGE_GEOMETRY_BIT;
    case MESA_SHADER_FRAGMENT:
