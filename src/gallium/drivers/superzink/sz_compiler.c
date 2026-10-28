@@ -49,6 +49,13 @@ static const struct nir_shader_compiler_options sz_nir_options_default = {
    .lower_ifind_msb = true,
    .lower_ufind_msb = true,
    .lower_find_lsb = true,
+   /* `(x & 0xff)` becomes nir_op_extract_u8 in the algebraic pass, and a byte
+    * mask is everywhere -- packUnorm's expansion alone emits four. They lower
+    * to a shift and an and, which the translator already speaks. */
+   .lower_extract_byte = true,
+   .lower_extract_word = true,
+   .lower_insert_byte = true,
+   .lower_insert_word = true,
    .lower_pack_half_2x16 = true,
    .lower_unpack_half_2x16 = true,
    .lower_pack_split = true,

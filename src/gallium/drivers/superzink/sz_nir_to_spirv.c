@@ -1060,6 +1060,13 @@ static const struct sz_alu_map sz_alu_maps[] = {
    { nir_op_f2f32, SpvOpFConvert },
    { nir_op_i2i32, SpvOpSConvert },
    { nir_op_u2u32, SpvOpUConvert },
+
+   /* GLSL 3.30's integer bit operations: bitfieldExtract/Insert/Reverse,
+    * bitCount, findLSB and findMSB. */
+   { nir_op_ubitfield_extract, SpvOpBitFieldUExtract },
+   { nir_op_ibitfield_extract, SpvOpBitFieldSExtract },
+   { nir_op_bitfield_reverse, SpvOpBitReverse },
+   { nir_op_bit_count, SpvOpBitCount },
 };
 
 /* Opcodes that exist in GLSL.std.450 rather than in core SPIR-V. */
@@ -1095,6 +1102,13 @@ static const struct sz_glsl_map sz_glsl_maps[] = {
    { nir_op_fcos, GLSLstd450Cos },
    { nir_op_ftanh, GLSLstd450Tanh },
    { nir_op_ffma, GLSLstd450Fma },
+   /* GLSL 3.30 floating-point additions. */
+   { nir_op_ldexp, GLSLstd450Ldexp },
+   /* SPIR-V dropped the findLSB/findMSB core instructions before 1.0; the
+    * GLSL dialect kept them, with exactly the -1-for-no-bit result GL wants. */
+   { nir_op_find_lsb, GLSLstd450FindILsb },
+   { nir_op_ufind_msb, GLSLstd450FindUMsb },
+   { nir_op_ifind_msb, GLSLstd450FindSMsb },
 };
 
 static uint32_t sz_glsl450;
@@ -1316,10 +1330,51 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
     * RADV's parser rather than a validation error. */
    if (sz_alu_is_passthrough(op)) {
       const nir_def *typed = alu->src[op == nir_op_bcsel ? 1 : 0].src.ssa;
-      dst.base = typed ? t->def_types[typed->index].base : SZ_BASE_FLOAT;
+      enum sz_base base = typed ? t->def_types[typed->index].base : SZ_BASE_FLOAT;
+
+      /* These three carry no type of their own. NIR spells a bitcast as a plain
+       * mov, so what the value *is* comes from whoever consumes it: a phi that
+       * already decided, and otherwise the uses. The operand is only the last
+       * resort, for a value nothing typed consumes. */
+      if (t->base_hint && t->base_hint[alu->def.index] != 0xff) {
+         base = (enum sz_base)t->base_hint[alu->def.index];
+      } else {
+         enum sz_base inferred;
+         if (sz_infer_def_base(&alu->def, 0, &inferred))
+            base = inferred;
+      }
+
+      /* Integers have one canonical signedness here, for the reason given
+       * below the table lookup. */
+      dst.base = base == SZ_BASE_INT ? SZ_BASE_UINT : base;
    } else if (!sz_base_from_alu_type(nir_op_infos[op].output_type, &dst.base)) {
       sz_fail(t, "NIR op `%s` has no SPIR-V mapping", nir_op_infos[op].name);
       return;
+   }
+
+   /* Integer arithmetic is emitted unsigned even where the opcode table says
+    * signed. Those ops are bit-identical either way and SPIR-V only asks that
+    * the result and its operands agree, which the operand coercion below
+    * arranges; emitting one canonical signedness is what keeps an OpPhi valid
+    * when NIR merges an "int" arm with a "uint" one, since a phi cannot convert
+    * its incoming values -- a conversion there would have to live in the merge
+    * block, where the arm's definition need not dominate. Ops whose signedness
+    * *is* the instruction (the signed conversions, the signed division and
+    * remainder, the signed min/max) keep the type the table declares. */
+   switch (op) {
+   case nir_op_iadd:
+   case nir_op_isub:
+   case nir_op_imul:
+   case nir_op_ineg:
+   case nir_op_iand:
+   case nir_op_ior:
+   case nir_op_ixor:
+   case nir_op_inot:
+   case nir_op_b2i32:
+      dst.base = SZ_BASE_UINT;
+      break;
+   default:
+      break;
    }
 
    /* A one-bit result is a bool, whatever the opcode table calls it: the
@@ -1437,6 +1492,36 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
       return;
    }
 
+   /* bitfieldExtract()/bitfieldInsert() reach the SPIR-V bitfield opcodes, and
+    * those want Offset/Count in the result type -- a uint result takes uint
+    * offsets, even though NIR declares them int. bitfieldInsert also takes four
+    * operands, one more than the generic loop below reads. */
+   if (op == nir_op_ubitfield_extract || op == nir_op_ibitfield_extract ||
+       op == nir_op_bitfield_insert) {
+      const SpvOp spirv = op == nir_op_bitfield_insert ? SpvOpBitFieldInsert
+                           : op == nir_op_ibitfield_extract
+                              ? SpvOpBitFieldSExtract
+                              : SpvOpBitFieldUExtract;
+      enum sz_base base;
+      if (sz_base_from_alu_type(nir_op_infos[op].output_type, &base))
+         dst.base = base;
+
+      const struct sz_dtype want = {
+         .base = dst.base,
+         .bits = dst.bits,
+         .ncomp = dst.ncomp,
+      };
+      const unsigned nsrcs = nir_op_infos[op].num_inputs;
+      uint32_t ops[4];
+      for (unsigned j = 0; j < nsrcs; j++)
+         ops[j] = sz_alu_source_as(t, &alu->src[j], &want, dst.ncomp);
+
+      t->defs_id[alu->def.index] =
+         sz_spv_alu(t->m, spirv, sz_dtype_type(t, &dst), ops, nsrcs);
+      t->def_types[alu->def.index] = dst;
+      return;
+   }
+
    for (unsigned i = 0; i < ARRAY_SIZE(sz_alu_maps); i++) {
       if (sz_alu_maps[i].op != op)
          continue;
@@ -1463,6 +1548,18 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
          default:
             break;
          }
+      }
+
+      /* The opcode declares the type of its result, and that beats the guess
+       * made from the def's uses: a bitfield extract is unsigned whatever its
+       * consumer looks like, and OpBitFieldUExtract rejects a float result type.
+       * A bool result is left alone -- it has no declared type of its own here,
+       * and its bit width is one. */
+      if (dst.bits > 1) {
+         enum sz_base declared;
+         if (sz_base_from_alu_type(nir_op_infos[op].output_type, &declared) &&
+             declared != SZ_BASE_BOOL)
+            dst.base = declared;
       }
 
       /* Equality on bools arrives as `ieq`/`ine` -- GLSL's `==` on bvec lowers
@@ -1518,6 +1615,7 @@ sz_emit_alu(struct sz_translate *t, nir_alu_instr *alu)
 
    sz_fail(t, "NIR op `%s` has no SPIR-V mapping", nir_op_infos[op].name);
 }
+
 
 /* ------------------------------------------------------------------------- */
 /* Instructions                                                             */
@@ -2718,6 +2816,7 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
 static bool
 sz_emit_instr(struct sz_translate *t, nir_instr *instr)
 {
+
    switch (instr->type) {
    case nir_instr_type_alu:
       sz_emit_alu(t, nir_instr_as_alu(instr));
@@ -2896,6 +2995,7 @@ sz_emit_phi(struct sz_translate *t, nir_phi_instr *phi)
    t->defs_id[phi->def.index] = id;
    t->def_types[phi->def.index] = type;
 
+
    if (unresolved) {
       unsigned entry = 0;
       nir_foreach_phi_src (src, phi) {
@@ -3007,10 +3107,11 @@ sz_emit_phis(struct sz_translate *t, nir_block *block)
 {
    nir_foreach_instr (instr, block) {
       if (instr->type != nir_instr_type_phi)
-         return;
+         break;
       if (!sz_emit_instr(t, instr))
          return;
    }
+
 }
 
 static void

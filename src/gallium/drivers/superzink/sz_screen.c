@@ -583,8 +583,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * look like a driver bug rather than a missing feature. */
    {
       struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
-      caps->glsl_feature_level = 150;
-      caps->glsl_feature_level_compatibility = 150;
+      caps->glsl_feature_level = 330;
+      caps->glsl_feature_level_compatibility = 330;
       caps->max_texture_2d_size = 16384;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
