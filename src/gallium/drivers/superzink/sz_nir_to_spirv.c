@@ -191,8 +191,17 @@ struct sz_translate {
       /* The value OpLoad produced from the variable, which is what the sampling
        * ops take as their image operand. */
       uint32_t value;
+      /* The variable it was loaded from, and the block serial that load belongs
+       * to. An OpLoad only dominates the blocks after it, so the cached value is
+       * reused no further than the block that emitted it. */
+      uint32_t var;
+      unsigned value_block;
    } samplers[SZ_MAX_SAMPLERS];
    unsigned num_samplers;
+
+   /* Bumped by every OpLabel. A descriptor load cached in one block must not be
+    * reused in another: it does not dominate it. */
+   unsigned block_serial;
 
    /* Storage images, declared on first use like the samplers: a GL image
     * uniform is a descriptor, and one that the shader never touches still names
@@ -201,6 +210,8 @@ struct sz_translate {
       unsigned index;
       uint32_t image_type;
       uint32_t value;
+      uint32_t var;
+      unsigned value_block;
    } images[SZ_MAX_IMAGES];
    unsigned num_images;
 
@@ -2715,6 +2726,11 @@ sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
       if (t->images[i].index != index)
          continue;
       *out_image_type = t->images[i].image_type;
+      if (t->images[i].value_block != t->block_serial) {
+         t->images[i].value =
+            sz_spv_load(t->m, t->images[i].image_type, t->images[i].var);
+         t->images[i].value_block = t->block_serial;
+      }
       return t->images[i].value;
    }
 
@@ -2741,6 +2757,8 @@ sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
    t->images[t->num_images].index = index;
    t->images[t->num_images].image_type = image_type;
    t->images[t->num_images].value = value;
+   t->images[t->num_images].var = id;
+   t->images[t->num_images].value_block = t->block_serial;
    t->num_images++;
 
    *out_image_type = image_type;
@@ -2851,6 +2869,15 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
          return 0;
       }
 
+      /* The load was emitted in whichever block first sampled this unit, and a
+       * second block is not necessarily dominated by it -- loop bodies and the
+       * break block that follows one are the case that showed up. Re-load once
+       * per block instead. */
+      if (t->samplers[i].value_block != t->block_serial) {
+         t->samplers[i].value =
+            sz_spv_load(t->m, t->samplers[i].loaded_type, t->samplers[i].var);
+         t->samplers[i].value_block = t->block_serial;
+      }
       return t->samplers[i].value;
    }
 
@@ -2914,6 +2941,8 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
    t->samplers[t->num_samplers].image_type = image_type;
    t->samplers[t->num_samplers].loaded_type = pointee_type;
    t->samplers[t->num_samplers].value = value;
+   t->samplers[t->num_samplers].var = var;
+   t->samplers[t->num_samplers].value_block = t->block_serial;
    t->num_samplers++;
 
    sz_interface_add(t, var);
@@ -3326,11 +3355,11 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
        * argument and texture2DProj's, plus implicit-LOD texture2D in a fragment
        * shader that asked for it.
        *
-       * Implicit LOD exists in no other stage: spirv-val rejects the module with
-       * "ImplicitLod instructions require Fragment, GLCompute, MeshEXT or
-       * TaskEXT execution model", and a vertex shader that samples a texture
-       * (Minecraft's does) is legal GL. Outside a fragment shader the LOD is 0,
-       * which is what an implicit LOD means when there are no derivatives. */
+       * Implicit LOD does not exist outside a fragment shader -- spirv-val
+       * rejects the module with "ImplicitLod instructions require Fragment,
+       * GLCompute, MeshEXT or TaskEXT execution model" -- so a vertex or
+       * geometry shader that samples a texture (Minecraft's does) gets LOD 0
+       * explicitly instead, which is what GL means by an implicit LOD there. */
       if (t->nir->info.stage != MESA_SHADER_FRAGMENT) {
          opcode = tex->is_shadow ? SpvOpImageSampleDrefExplicitLod
                                  : SpvOpImageSampleExplicitLod;
@@ -4360,6 +4389,7 @@ sz_open_block(struct sz_translate *t, uint32_t label)
 
    sz_spv_label_id(t->m, label);
    t->block_open = true;
+   t->block_serial++;
 }
 
 /* `with_phis` is false only for a loop's first block: its phis belong to the loop
