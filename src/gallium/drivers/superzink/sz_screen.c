@@ -670,6 +670,14 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* glViewportIndexedf and friends: GL 4.1 wants sixteen viewport slots, the
+       * viewport state is dynamic, and sz_emit_viewport() writes every slot per
+       * batch. gl_ViewportIndex is the ViewportIndex builtin the translator
+       * declares. st grants ARB_viewport_array and ARB_fragment_layer_viewport
+       * together off this, and the bounds it then reports are the ones Vulkan
+       * allows. */
+      caps->max_viewports = PIPE_MAX_VIEWPORTS;
+
       /* Cube map arrays: VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, a Cube dimension that
        * carries a layer coordinate, the imageCubeArray feature (required), the
        * extent.depth fix, per-level layout tracking, and now a per-attachment

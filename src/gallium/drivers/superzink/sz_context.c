@@ -1928,33 +1928,54 @@ sz_emit_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
 {
    const struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
 
+   /* GL_ARB_viewport_array: one viewport per slot the application set, in the
+    * order it set them. Vulkan takes the same array, and a vertex shader picks
+    * with gl_ViewportIndex -- which is the ViewportIndex builtin the translator
+    * already declares.
+    *
+    * All PIPE_MAX_VIEWPORTS slots are written even when the application set one:
+    * the pipeline declares every slot dynamic, and Vulkan requires each of them
+    * to have been set before a draw (VUID-vkCmdDraw-None-07831). A slot the
+    * application never mentioned repeats the last one it did, which is what GL
+    * says an unused index does -- the viewport in effect is still viewport 0.
+    *
+    * Zero viewports means the state tracker has not sent one yet, and the
+    * framebuffer's extent is the only sensible answer. */
+   const unsigned count = CLAMP(ctx->state.num_viewports, 1, PIPE_MAX_VIEWPORTS);
+
+   VkViewport viewports[PIPE_MAX_VIEWPORTS];
+
    /* Gallium viewport state is in GL window coordinates: y grows upwards from
     * the bottom-left corner. Vulkan's framebuffer origin is the top-left corner,
-    * so a positive height with y at `translate - scale` maps NDC +1 to row 0 --
-    * which is where GL puts the top of the window. Keeping the height positive is
-    * what keeps the rendered image the right way up; a negative height (the
-    * alternative, used when the shader does not flip y itself) would mirror the
-    * frame vertically on screen. */
-   VkViewport viewport = {
-      .x = 0.0f,
-      .y = 0.0f,
-      .width = (float)fb->width,
-      .height = (float)fb->height,
-      .minDepth = 0.0f,
-      .maxDepth = 1.0f,
+    * so `translate - scale` with a positive height maps NDC +1 to row 0 -- which
+    * is where GL puts the top of the window. Keeping the height positive is what
+    * keeps the rendered image the right way up; a negative height would mirror
+    * the frame vertically on screen. */
+   /* With no viewport from the state tracker the whole framebuffer is the
+    * sensible answer. */
+   const struct pipe_viewport_state fallback = {
+      .scale = { (float)fb->width / 2.0f, (float)fb->height / 2.0f, 0.5f },
+      .translate = { (float)fb->width / 2.0f, (float)fb->height / 2.0f, 0.5f },
    };
 
-   if (ctx->state.num_viewports > 0) {
-      const struct pipe_viewport_state *vp = &ctx->state.viewports[0];
-      viewport.x = vp->translate[0] - vp->scale[0];
-      viewport.y = vp->translate[1] - vp->scale[1];
-      viewport.width = 2.0f * vp->scale[0];
-      viewport.height = 2.0f * vp->scale[1];
-      viewport.minDepth = vp->translate[2] - vp->scale[2];
-      viewport.maxDepth = vp->translate[2] + vp->scale[2];
+   for (unsigned i = 0; i < PIPE_MAX_VIEWPORTS; i++) {
+      const unsigned slot = ctx->state.num_viewports == 0
+                               ? 0
+                               : MIN2(i, count - 1);
+      const struct pipe_viewport_state *vp =
+         ctx->state.num_viewports == 0 ? &fallback
+                                       : &ctx->state.viewports[slot];
+      viewports[i] = (VkViewport) {
+         .x = vp->translate[0] - vp->scale[0],
+         .y = vp->translate[1] - vp->scale[1],
+         .width = 2.0f * vp->scale[0],
+         .height = 2.0f * vp->scale[1],
+         .minDepth = vp->translate[2] - vp->scale[2],
+         .maxDepth = vp->translate[2] + vp->scale[2],
+      };
    }
 
-   ctx->screen->vk.CmdSetViewport(cmd, 0, 1, &viewport);
+   ctx->screen->vk.CmdSetViewport(cmd, 0, PIPE_MAX_VIEWPORTS, viewports);
 }
 
 static void
@@ -1962,31 +1983,40 @@ sz_emit_scissor(struct sz_context *ctx, VkCommandBuffer cmd)
 {
    const struct pipe_framebuffer_state *fb = &ctx->state.framebuffer;
 
-   VkRect2D scissor = {
-      .offset = { 0, 0 },
-      .extent = { fb->width, fb->height },
-   };
-
    /* The scissor rects are only meaningful while glScissor's test is on, and the
     * state tracker keeps sending them after it is switched off. Applying the
     * last rect regardless clips every later draw to a stale rectangle, which
     * renders as "everything after a scissored draw is missing". */
    const struct sz_state *rast_state = ctx->state.rasterizer;
    const bool scissor_test = rast_state && rast_state->u.rasterizer.scissor;
-   if (scissor_test && ctx->state.num_scissors > 0) {
-      const struct pipe_scissor_state *sc = &ctx->state.scissors[0];
-      scissor.offset.x = sc->minx;
-      scissor.offset.y = sc->miny;
-      scissor.extent.width = sc->maxx - sc->minx;
-      scissor.extent.height = sc->maxy - sc->miny;
+   const unsigned count =
+      CLAMP(ctx->state.num_scissors, 1, PIPE_MAX_VIEWPORTS);
+
+   VkRect2D scissors[PIPE_MAX_VIEWPORTS];
+
+   /* Every slot is written for the same reason the viewports are: the pipeline
+    * declares them all dynamic. */
+   if (!scissor_test || ctx->state.num_scissors == 0) {
+      const VkRect2D full = {
+         .offset = { 0, 0 },
+         .extent = { fb->width, fb->height },
+      };
+      for (unsigned i = 0; i < PIPE_MAX_VIEWPORTS; i++)
+         scissors[i] = full;
+      ctx->screen->vk.CmdSetScissor(cmd, 0, PIPE_MAX_VIEWPORTS, scissors);
+      return;
    }
 
-   /* A zero-sized scissor rejects every fragment; Vulkan forbids the extent,
-    * so the draw is simply not recorded. */
-   if (scissor.extent.width == 0 || scissor.extent.height == 0)
-      return;
+   for (unsigned i = 0; i < PIPE_MAX_VIEWPORTS; i++) {
+      const struct pipe_scissor_state *sc =
+         &ctx->state.scissors[MIN2(i, count - 1)];
+      scissors[i] = (VkRect2D) {
+         .offset = { sc->minx, sc->miny },
+         .extent = { sc->maxx - sc->minx, sc->maxy - sc->miny },
+      };
+   }
 
-   ctx->screen->vk.CmdSetScissor(cmd, 0, 1, &scissor);
+   ctx->screen->vk.CmdSetScissor(cmd, 0, PIPE_MAX_VIEWPORTS, scissors);
 }
 
 static bool

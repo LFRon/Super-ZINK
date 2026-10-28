@@ -761,8 +761,8 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
     * index, and baking them into the pipeline would rebuild it constantly. */
    const VkPipelineViewportStateCreateInfo viewport_state = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-      .viewportCount = 1,
-      .scissorCount = 1,
+      .viewportCount = PIPE_MAX_VIEWPORTS,
+      .scissorCount = PIPE_MAX_VIEWPORTS,
    };
 
    const struct pipe_rasterizer_state *rast_state = sz_raster(ctx);

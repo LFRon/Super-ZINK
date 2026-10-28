@@ -669,6 +669,20 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
             return true;
          }
       } else {
+         /* gl_Layer and gl_ViewportIndex: a geometry or vertex shader writes
+          * them to say which layer and which viewport its primitives go to, and
+          * Vulkan has a builtin for each. Without them the capability that
+          * promises layered rendering cannot work. */
+         if (slot == VARYING_SLOT_LAYER) {
+            *builtin = SpvBuiltInLayer;
+            *has_builtin = true;
+            return true;
+         }
+         if (slot == VARYING_SLOT_VIEWPORT) {
+            *builtin = SpvBuiltInViewportIndex;
+            *has_builtin = true;
+            return true;
+         }
          if (slot == FRAG_RESULT_DEPTH) {
             *builtin = SpvBuiltInFragDepth;
             *has_builtin = true;
@@ -873,6 +887,12 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
          break;
       case SpvBuiltInCullDistance:
          sz_spv_capability(t->m, SpvCapabilityCullDistance);
+         break;
+      case SpvBuiltInLayer:
+         sz_spv_capability(t->m, SpvCapabilityGeometry);
+         break;
+      case SpvBuiltInViewportIndex:
+         sz_spv_capability(t->m, SpvCapabilityMultiViewport);
          break;
       default:
          break;
