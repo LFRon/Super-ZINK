@@ -720,6 +720,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* ARB_base_instance: vkCmdDraw's firstInstance is both the base instance
+       * gl_BaseInstance reports (see the BaseInstance builtin) and the offset
+       * per-instance vertex fetches start at, which is what GL's baseInstance
+       * means. Probing only. */
+      caps->start_instance = true;
+
       /* ARB_sample_shading: per-sample fragment shading. gl_SampleID,
        * gl_SamplePosition, gl_SampleMaskIn and gl_SampleMask[] all translate
        * (see sz_load_sample_id() and the FRAG_RESULT_SAMPLE_MASK slot), and the
