@@ -2963,6 +2963,26 @@ sz_load_mask_element(struct sz_translate *t, uint32_t var, uint32_t array_type,
    return sz_spv_composite_extract(t->m, int_type, arr, &index, 1);
 }
 
+/* gl_SamplePosition and gl_SampleMask[] are the two remaining sample builtins:
+ * the first is a vec2 float input, the second an int array output that the
+ * fragment shader may write to kill individual samples. */
+static uint32_t
+sz_load_sample_position(struct sz_translate *t)
+{
+   const uint32_t float_type = sz_spv_type_float32(t->m);
+   const uint32_t vec2 = sz_spv_type_vec(t->m, float_type, 2);
+
+   sz_spv_capability(t->m, SpvCapabilitySampleRateShading);
+
+   const uint32_t ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassInput, vec2);
+   const uint32_t var = sz_spv_variable(t->m, ptr_type, SpvStorageClassInput);
+   sz_spv_decorate(t->m, var, SpvDecorationBuiltIn, SpvBuiltInSamplePosition);
+
+   t->interfaces[t->num_interfaces++] = var;
+   return sz_spv_load(t->m, vec2, var);
+}
+
 static uint32_t
 sz_load_sample_mask_in(struct sz_translate *t)
 {
@@ -3069,6 +3089,15 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
          return false;
       t->defs_id[intrin->def.index] = value;
       t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_INT, 32, 1 };
+      return true;
+   }
+   case nir_intrinsic_load_sample_pos_from_id:
+   case nir_intrinsic_load_sample_pos: {
+      const uint32_t value = sz_load_sample_position(t);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_FLOAT, 32, 2 };
       return true;
    }
    case nir_intrinsic_load_sample_mask_in: {

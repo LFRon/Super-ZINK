@@ -665,6 +665,13 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* Not claimed: per-sample shading needs a multisampled *renderbuffer* to
+       * resolve into its texture, and that resolve arrives as a blit from one
+       * multisampled image to another -- which Vulkan cannot do at all, and
+       * which GL rejects too, so the destination's sample count is being
+       * reported wrong somewhere. The four sample builtins translate (see
+       * sz_load_sample_position() and friends); the capability waits for that
+       * resolve to be found and fixed. */
       caps->draw_indirect =
          screen->caps.core_features.drawIndirectFirstInstance &&
          screen->caps.core_features.multiDrawIndirect;
