@@ -1636,9 +1636,14 @@ sz_alu_source_op(struct sz_translate *t, nir_op op, const nir_alu_src *src,
 
    struct sz_dtype want = *dst;
    want.ncomp = ncomp;
+   /* The width is the operand's, not the result's. `dst` is the *result* type,
+    * and a comparison's result is a one-bit bool while its operands are 32 bits
+    * wide: taking the width from there denied every constant operand of a
+    * comparison its conversion, which is how a float zero came to be the first
+    * operand of OpSLessThan. */
    want.bits = t->def_types[def->index].bits;
-   if (want.base == SZ_BASE_BOOL)
-      want.bits = 1;
+   if (want.bits == 0)
+      want.bits = dst->bits;
 
    switch (nir_alu_type_get_base_type(nir_op_infos[op].input_types[j])) {
    case nir_type_int:
