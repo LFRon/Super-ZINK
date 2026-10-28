@@ -3110,8 +3110,34 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
    t->base.usage = usage;
    t->base.box = *box;
 
+   /* A buffer write must not go straight into the resource's memory, however
+    * directly the CPU can address it.
+    *
+    * Draws are recorded into a command buffer and submitted later, so the GPU has
+    * not read the previous contents when the next upload overwrites them. An
+    * application that uploads vertices, draws, uploads the next batch and draws
+    * again -- which is how every renderer builds a frame, and what Minecraft's
+    * BufferBuilder does several times per frame -- then has every draw read the
+    * last upload, so the frame renders with geometry that belongs to some other
+    * draw and nothing lands on screen.
+    *
+    * Buffers therefore go through the staging path, where the copy is recorded at
+    * the position of the upload and is ordered against the draws around it.
+    *
+    * What is excluded is a map the caller declares it manages itself: the state
+    * tracker's uploader keeps one UNSYNCHRONIZED (and persistent or
+    * flush-explicit) map open across a whole batch and writes into it between
+    * draws, so staging it would put the copies after the draws that need them.
+    * Textures keep the direct path for the same reason they always did -- they
+    * are written once and then only sampled. A read-only map is unaffected too:
+    * waiting for the GPU is what makes a read a synchronisation point in GL. */
+   const bool streaming_write =
+      (usage & PIPE_MAP_WRITE) && res->target == PIPE_BUFFER &&
+      !(usage & (PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_FLUSH_EXPLICIT |
+                 PIPE_MAP_PERSISTENT));
+
    void *direct = sz_resource_map(r);
-   if (direct) {
+   if (direct && !streaming_write) {
       if (usage & PIPE_MAP_READ) {
          /* GL reads are synchronous: whatever the GPU was asked to write has
           * to be there before the pointer is handed out, and a direct map has
@@ -3217,6 +3243,20 @@ sz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
        * glxgears. The staging resource stays alive through the existing
        * retirement table, which defers its destruction to the submission this
        * copy is part of. */
+      /* The queued draws have to be emitted before this copy, or the two swap
+       * places in the command stream and every draw that reads this resource
+       * reads the data being uploaded now instead of the data that was there.
+       * An application that uploads vertices, draws, uploads the next batch and
+       * draws again -- which is how a renderer builds a frame, and what
+       * Minecraft's BufferBuilder does several times per frame -- then has every
+       * draw read the last upload, so the frame renders with geometry that
+       * belongs to some other draw and nothing lands on screen.
+       *
+       * sz_renderpass_end() flushes too, but only while a pass is open; a batch
+       * whose draws are still queued has none yet, which is the common case
+       * here. */
+      sz_draw_flush(ctx);
+
       VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
       if (cmd != VK_NULL_HANDLE)
          sz_copy_job_record(ctx, cmd, &job);
