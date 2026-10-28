@@ -610,18 +610,6 @@ sz_guess_def_type(struct sz_translate *t, const nir_def *def,
  * where the source wrote gl_in. A user varying is called whatever the shader
  * called it. */
 static bool
-sz_is_builtin_var(const nir_variable *var)
-{
-   if (!var->name)
-      return true;
-   if (strncmp(var->name, "gl_", 3) == 0)
-      return true;
-   if (strncmp(var->name, "VARYING_SLOT_", 13) == 0)
-      return true;
-   return false;
-}
-
-static bool
 sz_varying_location(struct sz_translate *t, const nir_variable *var,
                     SpvBuiltIn *builtin, bool *has_builtin, unsigned *location)
 {
@@ -657,13 +645,13 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
       /* gl_FragCoord in a fragment shader, gl_in[].gl_Position in a geometry
        * shader: the same slot, two different builtins.
        *
-       * The slot number alone is not enough. A tessellation pipeline renumbers
-       * its per-vertex varyings from zero, so an ordinary varying can arrive at
-       * slot 0 -- numerically VARYING_SLOT_POS -- in the same shader that also
-       * has a real gl_Position. What tells them apart is the name, and it is the
-       * same rule the rest of this file and the GLSL linker use: a builtin's name
-       * starts with "gl_". A varying that lost its name is not a builtin. */
-      if (slot == VARYING_SLOT_POS && sz_is_builtin_var(var)) {
+       * KNOWN GAP: a tessellation pipeline renumbers its per-vertex varyings from
+       * zero, so an ordinary varying can also arrive at slot 0, named after the
+       * slot exactly as gl_in is. The two are then indistinguishable here, and
+       * mapping slot 0 to Position is the choice that keeps geometry shaders
+       * working; a tessellation interface variable at slot 0 is mis-declared until
+       * gl_in and gl_out are emitted as gl_PerVertex blocks. */
+      if (slot == VARYING_SLOT_POS) {
          *builtin = frag ? SpvBuiltInFragCoord : SpvBuiltInPosition;
          *has_builtin = true;
          return true;
@@ -730,9 +718,7 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
       }
    } else {
       if (!frag) {
-         /* Same name rule as the input side: a tessellation pipeline can hand a
-          * plain varying the slot that numbers gl_Position. */
-         if (slot == VARYING_SLOT_POS && sz_is_builtin_var(var)) {
+         if (slot == VARYING_SLOT_POS) {
             /* SpvBuiltInPosition is zero, so the builtin value cannot double as
              * its own "was set" flag. */
             *builtin = SpvBuiltInPosition;
