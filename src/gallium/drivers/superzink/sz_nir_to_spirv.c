@@ -77,10 +77,13 @@ struct sz_dtype {
    enum sz_base base;
    unsigned bits;
    unsigned ncomp;
-   /* Non-zero when this is an array of `ncomp`-wide values. Only one level is
-    * ever needed: the arrays that reach the translator are a geometry shader's
-    * per-vertex inputs, which GL itself limits to one array dimension. */
+   /* Non-zero when this is an array of `ncomp`-wide values. Two levels are
+    * enough for everything GL 4.x expresses: one for a per-vertex array, and a
+    * second for the outer dimension of the arrays-of-arrays that
+    * ARB_arrays_of_arrays allows, which tessellation shaders use freely
+    * (`in vec3 inpos[][16]`). */
    unsigned array_len;
+   unsigned array_len_inner;
 };
 
 struct sz_translate {
@@ -374,6 +377,11 @@ sz_dtype_type(struct sz_translate *t, const struct sz_dtype *type)
                                ? scalar
                                : sz_spv_type_vec(t->m, scalar, type->ncomp);
 
+   if (type->array_len_inner > 0)
+      return sz_spv_type_array(
+         t->m, sz_spv_type_array(t->m, element, type->array_len_inner),
+         type->array_len);
+
    if (type->array_len > 0)
       return sz_spv_type_array(t->m, element, type->array_len);
 
@@ -391,14 +399,27 @@ sz_dtype_from_glsl(struct sz_translate *t, const struct glsl_type *glsl,
     * member-offset scheme that nothing here asks for yet. */
    if (glsl_type_is_array(glsl)) {
       const struct glsl_type *elem = glsl_get_array_element(glsl);
-      if (glsl_type_is_array(elem) || glsl_type_is_struct_or_ifc(elem) ||
-          glsl_type_is_matrix(elem)) {
+      if (glsl_type_is_struct_or_ifc(elem) || glsl_type_is_matrix(elem)) {
          sz_fail(t, "unsupported array element type in `%s`",
                  glsl_get_type_name(glsl));
          return false;
       }
       out->array_len = glsl_get_length(glsl);
       glsl = elem;
+
+      /* One more dimension: ARB_arrays_of_arrays. A shader whose outer array
+       * has no length is a per-vertex array of the other one, and the state
+       * tracker always leaves the inner length known. */
+      if (glsl_type_is_array(glsl)) {
+         out->array_len_inner = glsl_get_length(glsl);
+         glsl = glsl_get_array_element(glsl);
+         if (glsl_type_is_array(glsl) || glsl_type_is_struct_or_ifc(glsl) ||
+             glsl_type_is_matrix(glsl)) {
+            sz_fail(t, "more than two array dimensions in `%s`",
+                    glsl_get_type_name(glsl));
+            return false;
+         }
+      }
    }
 
    if (glsl_type_is_array(glsl) || glsl_type_is_struct_or_ifc(glsl) ||
@@ -1152,7 +1173,8 @@ sz_emit_deref(struct sz_translate *t, nir_deref_instr *deref)
       } else if (!sz_dtype_from_glsl(t, deref->type, &elem_type)) {
          return 0;
       }
-      elem_type.array_len = 0;
+      /* deref->type is already the type *after* this index, so a remaining array
+       * dimension belongs to the element and must be kept. */
 
       uint32_t index = sz_def_value(t, deref->arr.index.ssa);
       if (index == 0)
