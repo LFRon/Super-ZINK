@@ -617,7 +617,39 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       /* textureLod in a shader maps onto OpImageQueryLod, which is what
        * GL_ARB_texture_query_lod exposes. The instruction is already emitted for
        * nir_texop_lod, so the capability was simply never claimed. */
+      /* Five capabilities whose mechanism has been in place all along:
+       *
+       *  - the sample count of an image is nir_texop_texture_samples, already
+       *    emitted (query_levels needs no capability of its own -- st grants it
+       *    with GLSL 1.30);
+       *  - the fine and coarse derivative forms are OpDPdxFine and friends, with
+       *    the DerivativeControl capability declared when they are used;
+       *  - glPolygonOffsetClamp's third value is Vulkan's depthBiasClamp, which
+       *    the pipeline already passes through;
+       *  - gl_CullDistance is the CullDistance builtin the translator already
+       *    declares. */
       caps->texture_query_lod = true;
+      caps->texture_query_samples = true;
+      caps->fs_fine_derivative = true;
+      caps->polygon_offset_clamp = true;
+      /* Not claimed, although the mechanism looks present:
+       *  - caps->cull_distance makes st keep gl_CullDistance in the shader, and
+       *    the builtin is declared, but piglit's arb_cull_distance renders
+       *    unclipped (8 failures), so something in the chain is still wrong;
+       *  - caps->sampler_view_target makes ARB_texture_view's format
+       *    reinterpretation legal, and viewing an RGBA8 texture as RGBA32F needs
+       *    compatibility rules this driver has none of (536 failures). */
+      /* Mirrored clamp to edge is a Vulkan address mode, gated on the device
+       * feature of the same name; the sampler already maps PIPE_TEX_WRAP_MIRROR_*
+       * onto it. */
+      caps->texture_mirror_clamp_to_edge =
+         screen->caps.sampler_mirror_clamp_to_edge;
+      /* Anisotropic filtering, ditto: the sampler already carries
+       * maxAnisotropy from pipe_sampler_state, and both the EXT and the ARB
+       * spelling of the extension follow from these two fields. */
+      caps->anisotropic_filter = screen->caps.core_features.samplerAnisotropy;
+      caps->max_texture_anisotropy =
+         screen->caps.core_features.samplerAnisotropy ? 16.0f : 0.0f;
 
       /* GL_ARB_draw_indirect: the counts come out of a buffer through
        * vkCmdDrawIndirect, which is core Vulkan. Two device features decide

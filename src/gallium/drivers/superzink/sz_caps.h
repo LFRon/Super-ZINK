@@ -69,6 +69,9 @@
    X(uniform_buffer_standard_layout, "uniformBufferStandardLayout",             \
      "VK_KHR_uniform_buffer_standard_layout", VK_API_VERSION_1_2,              \
      q.f12.uniformBufferStandardLayout)                                           \
+   X(sampler_mirror_clamp_to_edge, "samplerMirrorClampToEdge",                  \
+     "VK_KHR_sampler_mirror_clamp_to_edge", VK_API_VERSION_1_2,                 \
+     q.f12.samplerMirrorClampToEdge)                                            \
    X(format_feature_flags2,        "formatFeatureFlags2",                       \
      "VK_KHR_format_feature_flags2",        VK_API_VERSION_1_3,                \
      true)                                                                       \

@@ -274,6 +274,8 @@ sz_gate_features(const struct sz_screen *screen, struct sz_vk_features *features
    features->f12.timelineSemaphore &= caps->timeline_semaphore;
    features->f12.uniformBufferStandardLayout &=
       caps->uniform_buffer_standard_layout;
+   features->f12.samplerMirrorClampToEdge &=
+      caps->sampler_mirror_clamp_to_edge;
    features->f12.bufferDeviceAddress &= caps->buffer_device_address;
    features->f13.dynamicRendering &= caps->dynamic_rendering;
    features->f13.synchronization2 &= caps->synchronization2;
