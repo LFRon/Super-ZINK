@@ -3100,6 +3100,50 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       sz_spv_end_primitive(t->m);
       return true;
 
+   case nir_intrinsic_vote_any:
+   case nir_intrinsic_vote_all: {
+      /* ARB_shader_group_vote's anyInvocation() and allInvocations(). Both need
+       * the GroupNonUniform capability, and the subgroup size Vulkan works with
+       * is the device's -- GL's "all invocations in the current set" is the
+       * same set, since the extension leaves the set implementation-defined. */
+      sz_spv_capability(t->m, SpvCapabilityGroupNonUniform);
+
+      const struct sz_dtype bool_type = { SZ_BASE_BOOL, 1, 1 };
+      const uint32_t cond = sz_intrin_source_as(t, &intrin->src[0], &bool_type, 1);
+      if (cond == 0)
+         return false;
+
+      const uint32_t scope =
+         sz_spv_const_bits(t->m, sz_spv_type_int32(t->m), SpvScopeSubgroup);
+      const uint32_t zero =
+         sz_spv_const_bits(t->m, sz_spv_type_int32(t->m), SpvGroupOperationReduce);
+      const SpvOp op = intrin->intrinsic == nir_intrinsic_vote_any
+                          ? SpvOpGroupNonUniformAny
+                          : SpvOpGroupNonUniformAll;
+      const uint32_t ops[] = { scope, cond };
+      const uint32_t value =
+         sz_spv_alu(t->m, op, sz_spv_type_bool(t->m), ops, 2);
+      (void)zero;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_BOOL, 1, 1 };
+      return true;
+   }
+   case nir_intrinsic_load_base_vertex:
+   case nir_intrinsic_load_base_instance: {
+      /* ARB_shader_draw_parameters' gl_BaseVertex and gl_BaseInstance. Vulkan
+       * carries them as the BaseVertex and BaseInstance builtins, which
+       * vkCmdDraw* already receives from pipe_draw_info. */
+      const SpvBuiltIn builtin =
+         intrin->intrinsic == nir_intrinsic_load_base_vertex
+            ? SpvBuiltInBaseVertex
+            : SpvBuiltInBaseInstance;
+      const uint32_t value = sz_load_builtin_int(t, builtin);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_INT, 32, 1 };
+      return true;
+   }
    case nir_intrinsic_load_sample_id: {
       /* gl_SampleID. Reading the sample index is what makes per-sample shading
        * meaningful, which is why the capability is gated on this working. */

@@ -220,6 +220,9 @@ struct sz_screen {
    VkPhysicalDevice pdev;
    VkPhysicalDeviceProperties props;
    VkPhysicalDeviceMemoryProperties mem_props;
+   /* Queried once with the rest of the properties: which stages can use
+    * subgroup operations, and which operations they support. */
+   VkPhysicalDeviceSubgroupProperties subgroup_props;
    uint32_t api_version;
 
    /* Built once here and treated as read-only afterwards (ADR-001). */

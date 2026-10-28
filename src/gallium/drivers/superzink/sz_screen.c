@@ -325,6 +325,20 @@ sz_select_physical_device(struct sz_screen *screen)
          best = devs[i];
          screen->props = props;
          best_caps = caps;
+
+         /* Subgroup support is a property, not a feature: Vulkan wants it
+          * queried through VkPhysicalDeviceProperties2. */
+         if (screen->vk.GetPhysicalDeviceProperties2) {
+            screen->subgroup_props = (VkPhysicalDeviceSubgroupProperties) {
+               .sType =
+                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+            };
+            VkPhysicalDeviceProperties2 props2 = {
+               .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+               .pNext = &screen->subgroup_props,
+            };
+            screen->vk.GetPhysicalDeviceProperties2(devs[i], &props2);
+         }
       }
    }
 
@@ -632,6 +646,21 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->texture_query_samples = true;
       caps->fs_fine_derivative = true;
       caps->polygon_offset_clamp = true;
+      /* anyInvocation()/allInvocations(): sz_nir_to_spirv emits
+       * OpGroupNonUniformAny/All with the subgroup scope, which needs the
+       * groupNonUniform feature on every stage the shader can run in. */
+      caps->shader_group_vote =
+         (screen->subgroup_props.supportedOperations &
+          (VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT)) ==
+            (VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT) &&
+         (screen->subgroup_props.supportedStages &
+          (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)) ==
+            (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+
+      /* gl_BaseVertex and gl_BaseInstance: both are BaseVertex/BaseInstance
+       * builtins, and the firstInstance / vertexOffset a draw already passes. */
+      caps->draw_parameters = true;
+
       /* glTextureBarrier: sz_texture_barrier() flushes the batch and emits the
        * colour-write-to-sampled-read dependency GL's rule requires and Vulkan
        * does not give by default. */
