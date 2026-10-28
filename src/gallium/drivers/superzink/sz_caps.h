@@ -244,6 +244,10 @@ struct sz_caps {
     * ARB_transform_feedback_overflow_query needs. */
    bool query_so_overflow;
 
+   /* VkPhysicalDeviceTransformFeedbackPropertiesEXT::maxTransformFeedbackStreams.
+    * One is the minimum, so zero means the extension is absent. */
+   unsigned max_transform_feedback_streams;
+
    /* VK_EXT_descriptor_buffer properties. The descriptor sizes are properties
     * because the in-memory layout of a descriptor is implementation-defined:
     * vkGetDescriptorEXT writes that many bytes and nothing else knows how many

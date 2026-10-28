@@ -720,6 +720,18 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
       caps->max_texel_buffer_elements = 65536;
       caps->texture_buffer_offset_alignment = 256;
 
+      /* ARB_transform_feedback3: four GL streams, each captured into the
+       * transform feedback binding of the same index, which is the only
+       * arrangement Vulkan allows. sz_decorate_stream_output() emits the Stream
+       * decoration and rejects a program that puts two buffers in one stream. */
+      caps->max_vertex_streams =
+         MIN2(4u, screen->caps.max_transform_feedback_streams);
+      /* Every stream is captured into the binding of its own index, and GL
+       * gives each of those its own buffer, so several streams never have to
+       * share one buffer's address space. */
+      caps->stream_output_interleave_buffers =
+         screen->caps.max_transform_feedback_streams >= 4;
+
       /* ARB_base_instance: vkCmdDraw's firstInstance is both the base instance
        * gl_BaseInstance reports (see the BaseInstance builtin) and the offset
        * per-instance vertex fetches start at, which is what GL's baseInstance

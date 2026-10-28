@@ -272,6 +272,7 @@ sz_caps_init(struct sz_caps *caps,
        * report per-stream overflow, which is what
        * ARB_transform_feedback_overflow_query is. */
       caps->query_so_overflow = xfb.transformFeedbackQueries;
+      caps->max_transform_feedback_streams = xfb.maxTransformFeedbackStreams;
       caps->descriptor_buffer_offset_alignment =
          desc.descriptorBufferOffsetAlignment;
       caps->descriptor_size_uniform_buffer = desc.uniformBufferDescriptorSize;

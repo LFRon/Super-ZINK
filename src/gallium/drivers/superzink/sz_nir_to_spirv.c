@@ -784,6 +784,13 @@ sz_decorate_stream_output(struct sz_translate *t, const nir_variable *var,
          continue;
 
       sz_spv_decorate(t->m, id, SpvDecorationXfbBuffer, o->output_buffer);
+      /* Which vertex stream captures this output. Stream 0 is the default, and
+       * decorating it would drag in the GeometryStreams capability for nothing,
+       * so only a real second stream is spelled out. */
+      if (o->stream != 0) {
+         sz_spv_capability(t->m, SpvCapabilityGeometryStreams);
+         sz_spv_decorate(t->m, id, SpvDecorationStream, o->stream);
+      }
       /* Stride and offset are in dwords on the Gallium side and in bytes in
        * SPIR-V. */
       sz_spv_decorate(t->m, id, SpvDecorationXfbStride,
