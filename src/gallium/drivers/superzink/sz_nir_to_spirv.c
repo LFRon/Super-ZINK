@@ -144,8 +144,22 @@ struct sz_translate {
        * and it declares gl_FrontFacing as a 32-bit integer while SPIR-V wants a
        * bool. */
       struct sz_dtype type;
+      /* Which gl_PerVertex block this variable is a member of, and which
+       * member. -1 means "an ordinary variable with an OpVariable of its own";
+       * otherwise `id` is the block's variable and the deref has to append the
+       * member index. See sz_pv_block_create(). */
+      int pv_block;
+      unsigned pv_member;
    } vars[SZ_MAX_VARIABLES];
    unsigned num_vars;
+
+   /* The gl_PerVertex blocks this module declares, one per storage class, both
+    * created on demand. `pointee` is 0 until one is needed. */
+   struct {
+      uint32_t var;
+      uint32_t pointee;
+      unsigned array_len;
+   } pv[2];
 
    /* Uniform blocks are declared on first use rather than in the variable walk,
     * because the load is what carries the binding: after
@@ -840,6 +854,80 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
    return false;
 }
 
+/* ------------------------------------------------------------------------- */
+/* gl_PerVertex                                                              */
+/* ------------------------------------------------------------------------- */
+
+/* Position and PointSize are not variables of their own.
+ *
+ * Vulkan accepts them declared standalone -- a plain OpVariable decorated
+ * Position validates -- but that is not the form the rest of the world emits.
+ * glslang, which is what every implementation is actually exercised with,
+ * declares one Block-decorated struct per direction whose members carry the
+ * builtins, and the per-vertex interface layout of the tessellation and
+ * geometry stages is built around handing a whole gl_PerVertex per vertex from
+ * one stage to the next. A shader that declares Position on its own presents
+ * that interface with a different shape from the one every other producer in
+ * the pipeline presents it with.
+ *
+ * Clip and cull distances keep their own variables: they are arrays of floats
+ * with a per-shader length, and folding them in buys this driver nothing.
+ *
+ * Two blocks exist at most, one per storage class, both created on demand: a
+ * fragment shader never has one. */
+#define SZ_PV_OUT 0
+#define SZ_PV_IN 1
+
+static int
+sz_pv_which(SpvStorageClass storage)
+{
+   switch (storage) {
+   case SpvStorageClassOutput: return SZ_PV_OUT;
+   case SpvStorageClassInput:  return SZ_PV_IN;
+   default:                    return -1;
+   }
+}
+
+/* Member 0 is Position and member 1 PointSize, the order gl_PerVertex has in
+ * both the GL and the SPIR-V specification. */
+static int
+sz_pv_member_of(unsigned slot)
+{
+   switch (slot) {
+   case VARYING_SLOT_POS:  return 0;
+   case VARYING_SLOT_PSIZ: return 1;
+   default:                return -1;
+   }
+}
+
+static void
+sz_pv_block_create(struct sz_translate *t, int which, SpvStorageClass storage,
+                   unsigned array_len)
+{
+   const struct sz_dtype vec4 = {.base = SZ_BASE_FLOAT, .bits = 32, .ncomp = 4};
+   const struct sz_dtype scalar = {.base = SZ_BASE_FLOAT, .bits = 32, .ncomp = 1};
+   const uint32_t members[2] = {sz_dtype_type(t, &vec4),
+                                sz_dtype_type(t, &scalar)};
+   const uint32_t block = sz_spv_type_struct(t->m, members, 2);
+
+   sz_spv_member_decorate(t->m, block, 0, SpvDecorationBuiltIn,
+                          SpvBuiltInPosition);
+   sz_spv_member_decorate(t->m, block, 1, SpvDecorationBuiltIn,
+                          SpvBuiltInPointSize);
+   sz_spv_decorate_bare(t->m, block, SpvDecorationBlock);
+
+   /* Only the struct carries Block; the array of structs does not, which is
+    * how glslang spells an arrayed gl_PerVertex. */
+   uint32_t pointee = block;
+   if (array_len != 0)
+      pointee = sz_spv_type_array(t->m, block, array_len);
+
+   t->pv[which].pointee = pointee;
+   t->pv[which].array_len = array_len;
+   t->pv[which].var =
+      sz_spv_variable(t->m, sz_spv_type_ptr(t->m, storage, pointee), storage);
+}
+
 /* Locates the shader output variable declared at `slot`. */
 static nir_variable *
 sz_find_output(struct sz_translate *t, unsigned slot)
@@ -1034,10 +1122,49 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
    }
 
    const uint32_t pointee = sz_dtype_type(t, &type);
-   const uint32_t ptr_type = sz_spv_type_ptr(t->m, storage, pointee);
-   const uint32_t id = sz_spv_variable(t->m, ptr_type, storage);
 
-   if (has_builtin) {
+   /* Position and PointSize are members of gl_PerVertex rather than variables
+    * of their own; see sz_pv_block_create(). */
+   int pv = -1;
+   unsigned pv_member = 0;
+   if (has_builtin &&
+       (builtin == SpvBuiltInPosition || builtin == SpvBuiltInPointSize)) {
+      const int which = sz_pv_which(storage);
+      const int member = sz_pv_member_of((unsigned)var->data.location);
+      if (which < 0 || member < 0) {
+         sz_fail(t, "`%s` cannot be a gl_PerVertex member here", var->name);
+         return false;
+      }
+      const unsigned array_len = nir_is_arrayed_io(var, t->nir->info.stage)
+                                    ? (unsigned)glsl_get_length(var->type)
+                                    : 0;
+      if (t->pv[which].pointee == 0)
+         sz_pv_block_create(t, which, storage, array_len);
+      else if (t->pv[which].array_len != array_len) {
+         /* Both members share one block, so they have to agree on whether the
+          * stage hands them over per vertex. */
+         sz_fail(t, "gl_PerVertex members disagree on arrayness in `%s`",
+                 var->name);
+         return false;
+      }
+      pv = which;
+      pv_member = (unsigned)member;
+   }
+
+   uint32_t id;
+   if (pv >= 0) {
+      /* The block already carries the builtin decoration; a variable of its
+       * own would be a second declaration of Position. */
+      id = t->pv[pv].var;
+   } else {
+      id = sz_spv_variable(t->m, sz_spv_type_ptr(t->m, storage, pointee),
+                           storage);
+   }
+
+   if (pv >= 0) {
+      /* Nothing: the member is decorated on the block, and a Location on it
+       * would be invalid. */
+   } else if (has_builtin) {
       sz_spv_decorate_builtin(t->m, id, builtin);
 
       /* A builtin is not usable on its own: PrimitiveId exists only with the
@@ -1100,7 +1227,7 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
          sz_spv_decorate_bare(t->m, id, SpvDecorationPatch);
    }
 
-   if (storage == SpvStorageClassOutput)
+   if (pv < 0 && storage == SpvStorageClassOutput)
       sz_decorate_stream_output(t, var, id);
 
    /* Flat is meaningful only on fragment stage inputs: an integer varying
@@ -1118,6 +1245,8 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
    t->vars[t->num_vars].pointee = pointee;
    t->vars[t->num_vars].storage = storage;
    t->vars[t->num_vars].type = type;
+   t->vars[t->num_vars].pv_block = pv;
+   t->vars[t->num_vars].pv_member = pv_member;
    t->num_vars++;
 
    return true;
@@ -1157,6 +1286,28 @@ sz_deref_storage(const nir_deref_instr *deref)
    return SpvStorageClassFunction;
 }
 
+/* The t->vars index of the gl_PerVertex member a chain roots at, or -1.
+ *
+ * Casts are transparent: a deref cast only reinterprets the pointee, the block
+ * is still the base of the chain. Anything else (a nested array, a struct
+ * member) means the chain already consumed the member and is not the
+ * block[vertex] form this is looking for. */
+static int
+sz_pv_rooted_at(struct sz_translate *t, nir_src src)
+{
+   nir_deref_instr *deref = nir_src_as_deref(src);
+   while (deref && deref->deref_type != nir_deref_type_var) {
+      if (deref->deref_type != nir_deref_type_cast)
+         return -1;
+      deref = nir_src_as_deref(deref->parent);
+   }
+   if (!deref)
+      return -1;
+
+   const int idx = sz_find_variable(t, deref->var);
+   return (idx >= 0 && t->vars[idx].pv_block >= 0) ? idx : -1;
+}
+
 /* Returns the SPIR-V id of the pointer `deref` denotes, or 0 on failure. */
 static uint32_t
 sz_emit_deref(struct sz_translate *t, nir_deref_instr *deref)
@@ -1167,6 +1318,22 @@ sz_emit_deref(struct sz_translate *t, nir_deref_instr *deref)
       if (idx < 0) {
          sz_fail(t, "deref of undeclared variable `%s`", deref->var->name);
          return 0;
+      }
+      if (t->vars[idx].pv_block >= 0) {
+         const int which = t->vars[idx].pv_block;
+         /* An arrayed stage (tessellation, geometry) hands a whole gl_PerVertex
+          * per vertex, so the chain is block[vertex].member: the block variable
+          * is the base and the member index is appended by the array deref that
+          * follows. */
+         if (t->pv[which].array_len != 0)
+            return t->pv[which].var;
+
+         const struct sz_dtype member = t->vars[idx].type;
+         const uint32_t ptr = sz_spv_type_ptr(t->m, t->vars[idx].storage,
+                                              sz_dtype_type(t, &member));
+         const uint32_t index =
+            sz_spv_const_uint32(t->m, t->vars[idx].pv_member);
+         return sz_spv_access_chain(t->m, ptr, t->pv[which].var, &index, 1);
       }
       return t->vars[idx].id;
    }
@@ -1227,6 +1394,18 @@ sz_emit_deref(struct sz_translate *t, nir_deref_instr *deref)
       const uint32_t ptr_type =
          sz_spv_type_ptr(t->m, sz_deref_storage(deref),
                          sz_dtype_type(t, &elem_type));
+
+      /* Indexing a per-vertex builtin does two things at once: it picks the
+       * vertex out of the gl_PerVertex array and the member out of the struct.
+       * SPIR-V wants both indices in one access chain, in that order. */
+      const int pv_idx = sz_pv_rooted_at(t, deref->parent);
+      if (pv_idx >= 0) {
+         const unsigned member = t->vars[pv_idx].pv_member;
+         const uint32_t indices[2] = {
+            index, sz_spv_const_uint32(t->m, member),
+         };
+         return sz_spv_access_chain(t->m, ptr_type, base, indices, 2);
+      }
 
       return sz_spv_access_chain(t->m, ptr_type, base, &index, 1);
    }
@@ -4621,7 +4800,19 @@ sz_nir_to_spirv(struct nir_shader *nir,
        * interface list: SPIR-V 1.4 made that the rule for all storage classes,
        * not just Input and Output, and leaving a Private one out is a validation
        * error ("is used by entry point but is not listed as an interface"). */
-      t.interfaces[t.num_interfaces++] = t.vars[t.num_vars - 1].id;
+      /* A gl_PerVertex member shares the block's variable, which is already in
+       * the list; naming it twice would be a duplicate interface entry. */
+      {
+         const uint32_t id = t.vars[t.num_vars - 1].id;
+         bool seen = false;
+         for (unsigned k = 0; k < t.num_interfaces; k++)
+            if (t.interfaces[k] == id) {
+               seen = true;
+               break;
+            }
+         if (!seen)
+            sz_interface_add(&t, id);
+      }
    }
 
    /* Legacy (`gl_TexCoord` style) and generic varyings are numbered in two
