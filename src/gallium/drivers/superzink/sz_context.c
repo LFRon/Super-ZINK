@@ -682,7 +682,7 @@ sz_create_shader_state(struct pipe_context *pipe,
 
    char *error = NULL;
    if (!sz_nir_to_spirv(state->u.shader.nir, &state->u.shader.stream_output,
-                        &state->u.shader.spirv,
+                        sz_context(pipe)->screen->need_2d_zs, &state->u.shader.spirv,
                         &state->u.shader.spirv_words, &error)) {
       /* The caller reads error_message only when it asks for compile errors, and
        * frees it with free(), which is why this is strdup and not ralloc. */
@@ -771,9 +771,12 @@ sz_view_type(enum pipe_texture_target target, unsigned array_size)
 {
    switch (target) {
    case PIPE_TEXTURE_1D:
-      return VK_IMAGE_VIEW_TYPE_1D;
    case PIPE_TEXTURE_1D_ARRAY:
-      return VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+      /* An aliased 1D depth texture is a 2D image, so its sampler view is 2D;
+       * sz_view_type's caller knows the resource, not just the target, so the
+       * decision is taken there. */
+      return target == PIPE_TEXTURE_1D ? VK_IMAGE_VIEW_TYPE_1D
+                                       : VK_IMAGE_VIEW_TYPE_1D_ARRAY;
    case PIPE_TEXTURE_2D:
       return array_size > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                             : VK_IMAGE_VIEW_TYPE_2D;
@@ -865,7 +868,11 @@ sz_create_sampler_view(struct pipe_context *pipe, struct pipe_resource *texture,
    const VkImageViewCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
       .image = res->image,
-      .viewType = sz_view_type(templ->target, texture->array_size),
+      .viewType = res->aliased_2d
+                     ? (templ->target == PIPE_TEXTURE_1D
+                           ? VK_IMAGE_VIEW_TYPE_2D
+                           : VK_IMAGE_VIEW_TYPE_2D_ARRAY)
+                     : sz_view_type(templ->target, texture->array_size),
       .format = format,
       .components = {
          .r = sz_component_swizzle(templ->swizzle_r),

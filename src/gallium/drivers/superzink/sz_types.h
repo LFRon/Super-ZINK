@@ -356,6 +356,14 @@ struct sz_screen {
    bool have_d32_sfloat;
    bool have_d32_sfloat_s8_uint;
 
+   /* True when the device cannot create a 1D depth/stencil image, which is the
+    * case on RADV: every 1D depth format answers VK_ERROR_FORMAT_NOT_SUPPORTED.
+    * GL has 1D depth (and 1D shadow) textures, so rather than report a gap the
+    * shape is aliased: such a texture is created as a 2D image one texel high,
+    * its view is 2D, and a 1D shadow sampler becomes a 2D one with a zero second
+    * coordinate. This is the same trade ZINK makes for the same reason. */
+   bool need_2d_zs;
+
    /* Set by the first dma-buf failure, so a missing capability is reported once
     * instead of on every allocation attempt. */
    bool dmabuf_warned;

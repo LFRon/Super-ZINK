@@ -35,6 +35,9 @@ struct sz_resource {
     * descriptor names a buffer by address in the descriptor-buffer path, and
     * asking once at creation beats asking on every draw. */
    uint64_t address;
+   /* A 1D depth/stencil resource created as a 2D image one texel high, because
+    * the device has no 1D depth. Views and shader image dimensions follow it. */
+   bool aliased_2d;
 
    /* A whole-resource view of `image`, created alongside it.
     *

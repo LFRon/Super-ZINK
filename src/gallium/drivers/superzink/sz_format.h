@@ -46,6 +46,17 @@ VkFormatFeatureFlags sz_format_features_from_bindings(unsigned bindings);
 /* Mapping tables shared with sz_resource, so image creation and image support
  * queries can never disagree about what a target means. */
 VkImageType sz_image_type(enum pipe_texture_target target);
+
+/* The Vulkan image shape a Gallium resource really gets.
+ *
+ * Differs from sz_image_type() for one case: a 1D or 1D_ARRAY depth/stencil
+ * texture on a device where 1D depth is unsupported becomes 2D (one texel high),
+ * because GL has such textures and Vulkan's 1D depth is optional in practice.
+ * Every place that decides a shape, a view type or a shader image dimension has
+ * to agree, so they all come through here. */
+VkImageType sz_image_vk_type(struct sz_screen *screen,
+                             enum pipe_texture_target target,
+                             enum pipe_format format);
 VkImageCreateFlags sz_image_create_flags(enum pipe_texture_target target);
 VkSampleCountFlagBits sz_vk_sample_count(unsigned sample_count);
 

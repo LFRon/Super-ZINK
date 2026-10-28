@@ -128,12 +128,17 @@ void sz_lower_nir(struct nir_shader *nir);
  * Returns false and leaves *out_words NULL for anything outside the implemented
  * subset. Every rejection names the NIR instruction it could not handle: a
  * translator that silently skips an instruction produces a shader that renders
- * the wrong thing, which is far more expensive to debug than a refusal. */
+ * the wrong thing, which is far more expensive to debug than a refusal.
+ *
+ * `alias_1d_shadow` says the screen has no 1D depth images, so a 1D shadow
+ * sampler's texture is really a 2D image one texel high: the declared image
+ * dimension becomes 2D and the coordinate gains a zero second component. */
 struct pipe_stream_output_info;
 
 bool sz_nir_to_spirv(struct nir_shader *nir,
                      const struct pipe_stream_output_info *so,
-                     uint32_t **out_words, size_t *out_size, char **error);
+                     bool alias_1d_shadow, uint32_t **out_words,
+                     size_t *out_size, char **error);
 
 /* SZ_DEBUG=spirv: writes a module to dumpNN_<suffix>.spv in the working
  * directory, next to the bootstrap shaders' dumps. */

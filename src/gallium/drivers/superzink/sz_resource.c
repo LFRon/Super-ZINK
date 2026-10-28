@@ -237,7 +237,7 @@ static VkImageCreateInfo
 sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
 {
    const VkFormat format = sz_vk_format(screen, tmpl->format);
-   const VkImageType type = sz_image_type(tmpl->target);
+   const VkImageType type = sz_image_vk_type(screen, tmpl->target, tmpl->format);
    const bool linear = sz_bindings_require_linear(tmpl->bind);
 
    VkImageUsageFlags usage = sz_image_usage_from_bindings(tmpl->bind, tmpl->format);
@@ -254,7 +254,8 @@ sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
       if (usage == 0)
          usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-   } else if (type == VK_IMAGE_TYPE_1D) {
+   } else if (tmpl->target == PIPE_TEXTURE_1D ||
+              tmpl->target == PIPE_TEXTURE_1D_ARRAY) {
       usage &= ~(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
       if (usage == 0)
          usage = VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -277,7 +278,11 @@ sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
       .format = format,
       .extent = {
          .width = tmpl->width0,
-         .height = type == VK_IMAGE_TYPE_1D ? 1 : MAX2(tmpl->height0, 1),
+         .height = type == VK_IMAGE_TYPE_1D ||
+                     tmpl->target == PIPE_TEXTURE_1D ||
+                     tmpl->target == PIPE_TEXTURE_1D_ARRAY
+                      ? 1
+                      : MAX2(tmpl->height0, 1),
          .depth = depth,
       },
       .mipLevels = levels,
@@ -301,12 +306,21 @@ sz_resource_create_view(struct sz_screen *screen, struct sz_resource *res,
                         VkFormat format)
 {
    VkImageViewType view_type;
+   /* A 1D depth/stencil texture is aliased to a 2D image one texel high on a
+    * device without 1D depth, so its view has to be 2D as well -- a 1D view of a
+    * 2D image is rejected. */
+   const bool aliased_2d = screen->need_2d_zs &&
+                           util_format_is_depth_or_stencil(res->base.format) &&
+                           (res->base.target == PIPE_TEXTURE_1D ||
+                            res->base.target == PIPE_TEXTURE_1D_ARRAY);
+
    switch (res->base.target) {
    case PIPE_TEXTURE_1D:
-      view_type = VK_IMAGE_VIEW_TYPE_1D;
+      view_type = aliased_2d ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_1D;
       break;
    case PIPE_TEXTURE_1D_ARRAY:
-      view_type = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+      view_type = aliased_2d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                             : VK_IMAGE_VIEW_TYPE_1D_ARRAY;
       break;
    case PIPE_TEXTURE_2D_ARRAY:
       view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -456,6 +470,10 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
    struct sz_resource *res = sz_resource_alloc(screen, tmpl);
    if (!res)
       return NULL;
+   res->aliased_2d = screen->need_2d_zs &&
+                     util_format_is_depth_or_stencil(tmpl->format) &&
+                     (tmpl->target == PIPE_TEXTURE_1D ||
+                      tmpl->target == PIPE_TEXTURE_1D_ARRAY);
    res->linear = ci.tiling != VK_IMAGE_TILING_OPTIMAL;
    res->drm_modifier = ci.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
    res->exportable = exportable;

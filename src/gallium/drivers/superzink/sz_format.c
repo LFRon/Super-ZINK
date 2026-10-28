@@ -199,6 +199,18 @@ sz_image_create_flags(enum pipe_texture_target target)
 }
 
 VkImageType
+sz_image_vk_type(struct sz_screen *screen, enum pipe_texture_target target,
+                 enum pipe_format format)
+{
+   if (screen->need_2d_zs &&
+       util_format_is_depth_or_stencil(format) &&
+       (target == PIPE_TEXTURE_1D || target == PIPE_TEXTURE_1D_ARRAY))
+      return VK_IMAGE_TYPE_2D;
+
+   return sz_image_type(target);
+}
+
+VkImageType
 sz_image_type(enum pipe_texture_target target)
 {
    switch (target) {
@@ -267,7 +279,7 @@ sz_format_supported_image(struct sz_screen *screen,
    if (vkformat == VK_FORMAT_UNDEFINED)
       return false;
 
-   const VkImageType type = sz_image_type(target);
+   const VkImageType type = sz_image_vk_type(screen, target, format);
 
    /* Scanout, display and shared images leave our process as dmabufs, so the
     * consumer cannot know our optimal layout: they must be linear. A format
@@ -288,6 +300,11 @@ sz_format_supported_image(struct sz_screen *screen,
    if (type == VK_IMAGE_TYPE_3D) {
       usage &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+      if (usage == 0)
+         usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+   } else if (target == PIPE_TEXTURE_1D || target == PIPE_TEXTURE_1D_ARRAY) {
+      /* A 1D shape has no depth attachment, aliased or not. */
+      usage &= ~VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
       if (usage == 0)
          usage = VK_IMAGE_USAGE_SAMPLED_BIT;
    }

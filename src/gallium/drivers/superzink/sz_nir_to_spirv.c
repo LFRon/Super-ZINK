@@ -75,6 +75,10 @@ struct sz_translate {
     * from the shader's own output mask. */
    const struct pipe_stream_output_info *so;
 
+   /* The screen has no 1D depth images, so a 1D shadow sampler is declared as 2D
+    * and sampled with a zero second coordinate. See sz_image_vk_type(). */
+   bool alias_1d_shadow;
+
    /* Indexed by nir_def::index. */
    struct sz_dtype *def_types;
    uint32_t *defs_id;
@@ -1800,6 +1804,14 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
    if (!sz_sampler_dim(t, tex->sampler_dim, &dim))
       return;
 
+   /* A 1D shadow texture is a 2D image one texel high on a device without 1D
+    * depth, so the declared image dimension has to say 2D or the descriptor and
+    * the shader disagree. The coordinate gains a zero second component below. */
+   const bool alias_2d = t->alias_1d_shadow && tex->is_shadow &&
+                         tex->sampler_dim == GLSL_SAMPLER_DIM_1D;
+   if (alias_2d)
+      dim = SpvDim2D;
+
    const unsigned ncomp = nir_tex_instr_dest_size(tex);
    struct sz_dtype result_type = {
       .bits = 32,
@@ -1844,6 +1856,32 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
             return;
          coord_value = sz_emit_projector(t, coord_value, tex->coord_components,
                                          tex->is_array, projector_value);
+      }
+
+      /* The aliased 1D shadow coordinate is (s), or (s, layer) for an array;
+       * the 2D image wants (s, 0) and (s, 0, layer). So a zero goes in at
+       * index 1, not on the end -- appending it would put the layer where the
+       * row belongs and the shader would sample the wrong texel. The image is
+       * one texel high and clamp-addressed, so a row of 0 is the only one. */
+      if (alias_2d) {
+         const unsigned n = tex->coord_components;
+         const uint32_t float_type = sz_spv_type_float32(t->m);
+         const uint32_t zero = sz_spv_const_float32(t->m, 0.0f);
+         uint32_t comps[5];
+
+         unsigned out = 0;
+         for (unsigned i = 0; i < n; i++) {
+            if (i == 1)
+               comps[out++] = zero;
+            comps[out++] = n == 1 ? coord_value
+                                  : sz_spv_composite_extract(
+                                       t->m, float_type, coord_value, &i, 1);
+         }
+         if (n == 1)
+            comps[out++] = zero;
+
+         coord_value = sz_spv_composite_construct(
+            t->m, sz_spv_type_vec(t->m, float_type, out), comps, out);
       }
    }
 
@@ -2817,12 +2855,13 @@ sz_spv_verify_cfg(struct sz_translate *t, const uint32_t *words, size_t count,
 
 bool
 sz_nir_to_spirv(struct nir_shader *nir,
-                const struct pipe_stream_output_info *so, uint32_t **words,
-                size_t *word_count, char **error)
+                const struct pipe_stream_output_info *so, bool alias_1d_shadow,
+                uint32_t **words, size_t *word_count, char **error)
 {
    struct sz_translate t = {
       .nir = nir,
       .so = so,
+      .alias_1d_shadow = alias_1d_shadow,
       .error = error,
    };
 

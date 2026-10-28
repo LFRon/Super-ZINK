@@ -549,6 +549,27 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
     * monotonic and it answers the only question a GL app asks with it. */
    screen->base.get_timestamp = sz_screen_get_timestamp;
 
+   /* Does this device have 1D depth/stencil images at all? RADV does not: every
+    * 1D depth format answers VK_ERROR_FORMAT_NOT_SUPPORTED. GL has 1D depth and
+    * 1D shadow textures, so the shape is aliased rather than the feature
+    * reported missing -- see sz_image_vk_type(). This is the same trade ZINK
+    * makes, and for the same reason. */
+   {
+      const VkPhysicalDeviceImageFormatInfo2 info = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+         .format = VK_FORMAT_D32_SFLOAT,
+         .type = VK_IMAGE_TYPE_1D,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+      };
+      VkImageFormatProperties2 props = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+      };
+      screen->need_2d_zs =
+         screen->vk.GetPhysicalDeviceImageFormatProperties2(screen->pdev, &info,
+                                                            &props) != VK_SUCCESS;
+   }
+
    u_init_pipe_screen_caps(&screen->base, !screen->is_cpu);
 
    /* Every driver must answer this: st/mesa asserts on it in debug builds and
