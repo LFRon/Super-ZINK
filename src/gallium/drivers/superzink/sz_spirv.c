@@ -37,16 +37,22 @@ struct sz_spv_module {
    struct sz_spv_section section[SEC_COUNT];
    uint32_t next_id;
 
-   /* Type cache. Linear scan: a module declares a few dozen types at most, and a
-    * hash table would be more code than the whole emitter. */
-   struct {
-      struct sz_spv_type_entry {
-         unsigned kind;
-         uint32_t a, b, c;
-         uint32_t id;
-      } entry[256];
-      unsigned count;
-   } types;
+   /* Type cache. Linear scan over a growable array: a hand-written shader
+    * declares a few dozen types, and a hash table would be more code than the
+    * whole emitter.
+    *
+    * It has to grow, because the count is not bounded by anything the driver
+    * controls. A shader pack's passes declare hundreds -- Complementary
+    * Reimagined's deferred pass alone overflows what used to be a fixed 256 --
+    * and a full cache does not fail the shader, it makes every further type be
+    * declared again, once per use, with an error line each time. */
+   struct sz_spv_type_entry {
+      unsigned kind;
+      uint32_t a, b, c;
+      uint32_t id;
+   } *type_entry;
+   unsigned type_count;
+   unsigned type_capacity;
 };
 
 static bool
@@ -127,6 +133,7 @@ sz_spv_module_destroy(struct sz_spv_module *m)
 
    for (unsigned i = 0; i < SEC_COUNT; i++)
       free(m->section[i].words);
+   free(m->type_entry);
    free(m);
 }
 
@@ -186,10 +193,10 @@ static uint32_t
 sz_spv_type_lookup(struct sz_spv_module *m, unsigned kind, uint32_t a, uint32_t b,
                    uint32_t c)
 {
-   for (unsigned i = 0; i < m->types.count; i++) {
-      if (m->types.entry[i].kind == kind && m->types.entry[i].a == a &&
-          m->types.entry[i].b == b && m->types.entry[i].c == c)
-         return m->types.entry[i].id;
+   for (unsigned i = 0; i < m->type_count; i++) {
+      if (m->type_entry[i].kind == kind && m->type_entry[i].a == a &&
+          m->type_entry[i].b == b && m->type_entry[i].c == c)
+         return m->type_entry[i].id;
    }
    return 0;
 }
@@ -198,11 +205,21 @@ static void
 sz_spv_type_record(struct sz_spv_module *m, unsigned kind, uint32_t a,
                    uint32_t b, uint32_t c, uint32_t id)
 {
-   if (m->types.count == ARRAY_SIZE(m->types.entry)) {
-      mesa_loge("SZ: SPIR-V type cache is full; a type would be declared twice");
-      return;
+   if (m->type_count == m->type_capacity) {
+      const unsigned capacity = MAX2(m->type_capacity * 2, 256u);
+      struct sz_spv_type_entry *grown =
+         realloc(m->type_entry, capacity * sizeof(*grown));
+      if (!grown) {
+         /* Out of host memory: declare the type again rather than miscompile.
+          * Duplicate OpType instructions are legal, just wasteful. */
+         mesa_loge("SZ: SPIR-V type cache could not grow past %u entries",
+                   m->type_count);
+         return;
+      }
+      m->type_entry = grown;
+      m->type_capacity = capacity;
    }
-   struct sz_spv_type_entry *entry = &m->types.entry[m->types.count++];
+   struct sz_spv_type_entry *entry = &m->type_entry[m->type_count++];
    entry->kind = kind;
    entry->a = a;
    entry->b = b;
