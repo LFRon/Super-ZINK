@@ -239,6 +239,11 @@ struct sz_caps {
     * or zero when the extension is absent. GL only needs four. */
    uint32_t max_transform_feedback_buffers;
 
+   /* VkPhysicalDeviceTransformFeedbackPropertiesEXT::transformFeedbackQueries,
+    * i.e. whether per-stream overflow can be reported at all. This is what
+    * ARB_transform_feedback_overflow_query needs. */
+   bool query_so_overflow;
+
    /* VK_EXT_descriptor_buffer properties. The descriptor sizes are properties
     * because the in-memory layout of a descriptor is implementation-defined:
     * vkGetDescriptorEXT writes that many bytes and nothing else knows how many

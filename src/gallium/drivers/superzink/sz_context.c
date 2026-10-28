@@ -2120,7 +2120,20 @@ sz_emit_draws(struct sz_context *ctx, VkCommandBuffer cmd)
       const uint32_t stride = ctx->pending.indirect.stride;
       const uint32_t count = ctx->pending.indirect.draw_count;
 
-      if (ctx->pending.indexed)
+      /* A count buffer means the record count is itself read by the device --
+       * that is GL_PARAMETER_BUFFER. The record count then becomes the
+       * *maximum*, which is exactly Vulkan's maxDrawCount. */
+      if (ctx->pending.indirect.count_buffer) {
+         const VkBuffer count_buffer =
+            ctx->pending.indirect.count_buffer->buffer;
+         const VkDeviceSize count_offset = ctx->pending.indirect.count_offset;
+         if (ctx->pending.indexed)
+            ctx->screen->vk.CmdDrawIndexedIndirectCount(
+               cmd, buffer, offset, count_buffer, count_offset, count, stride);
+         else
+            ctx->screen->vk.CmdDrawIndirectCount(
+               cmd, buffer, offset, count_buffer, count_offset, count, stride);
+      } else if (ctx->pending.indexed)
          ctx->screen->vk.CmdDrawIndexedIndirect(cmd, buffer, offset, count,
                                                 stride);
       else
@@ -2489,6 +2502,8 @@ sz_draw_flush(struct sz_context *ctx)
    ctx->pending.indirect.buffer = NULL;
    pipe_resource_reference(&ctx->pending.index_resource, NULL);
    pipe_resource_reference(&ctx->pending.indirect.resource, NULL);
+   ctx->pending.indirect.count_buffer = NULL;
+   pipe_resource_reference(&ctx->pending.indirect.count_resource, NULL);
 }
 
 static bool
@@ -2615,6 +2630,20 @@ sz_draw_append_indirect(struct sz_context *ctx, const struct pipe_draw_info *inf
                                                    : sizeof(uint32_t) * 4;
    ctx->pending.indirect.draw_count = indirect->draw_count ? indirect->draw_count : 1;
 
+   /* glMultiDrawArraysIndirectCount: the record count lives in another buffer.
+    * draw_count is then the clamp, so it stays as filled above. */
+   ctx->pending.indirect.count_buffer = NULL;
+   if (indirect->indirect_draw_count) {
+      struct sz_resource *count_res =
+         sz_resource(indirect->indirect_draw_count);
+      if (count_res->buffer != VK_NULL_HANDLE) {
+         ctx->pending.indirect.count_buffer = count_res;
+         pipe_resource_reference(&ctx->pending.indirect.count_resource,
+                                 indirect->indirect_draw_count);
+         ctx->pending.indirect.count_offset = indirect->indirect_draw_count_offset;
+      }
+   }
+
    ctx->pending.count = 1;
    ctx->pending.draws[0].count = 0;
    ctx->pending.draws[0].first = 0;
@@ -2635,11 +2664,11 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    if (num_draws == 0 && !indirect)
       return;
 
-   if (indirect && indirect->indirect_draw_count) {
-      /* glMultiDrawElementsIndirectCount reads the draw count from a buffer too,
-       * which needs VK_KHR_draw_indirect_count. Refusing is correct: the counts
-       * would otherwise be taken from the caller's num_draws. */
-      sz_warn_once("indirect draws with a draw count are not implemented");
+   /* A count buffer needs vkCmdDrawIndirectCount, which is core 1.2. Refuse
+    * rather than silently drawing the clamp count. */
+   if (indirect && indirect->indirect_draw_count &&
+       !ctx->screen->vk.CmdDrawIndirectCount) {
+      sz_warn_once("indirect draws with a draw count need Vulkan 1.2");
       return;
    }
 

@@ -563,6 +563,10 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdDrawIndexed, vkCmdDrawIndexed);
    SZ_DEV_PROC(CmdDrawIndirect, vkCmdDrawIndirect);
    SZ_DEV_PROC(CmdDrawIndexedIndirect, vkCmdDrawIndexedIndirect);
+   /* Core 1.2 (VK_KHR_draw_indirect_count). vkGetDeviceProcAddr returns NULL
+    * below 1.2, and the capability is gated on that. */
+   SZ_DEV_PROC(CmdDrawIndirectCount, vkCmdDrawIndirectCount);
+   SZ_DEV_PROC(CmdDrawIndexedIndirectCount, vkCmdDrawIndexedIndirectCount);
    SZ_DEV_PROC(CreateBufferView, vkCreateBufferView);
    SZ_DEV_PROC(DestroyBufferView, vkDestroyBufferView);
    SZ_DEV_PROC(CmdClearAttachments, vkCmdClearAttachments);

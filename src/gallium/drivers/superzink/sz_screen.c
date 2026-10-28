@@ -765,6 +765,20 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
          screen->caps.core_features.drawIndirectFirstInstance &&
          screen->caps.core_features.multiDrawIndirect;
 
+      /* GL_ARB_indirect_parameters: GL_PARAMETER_BUFFER holds the record count,
+       * which vkCmdDraw*IndirectCount reads on the device. The GL call's count
+       * argument is the clamp, i.e. Vulkan's maxDrawCount. */
+      /* ARB_transform_feedback_overflow_query: Vulkan answers it with a
+       * per-stream query, so "any stream" is the OR of the four. */
+      /* ARB_transform_feedback_overflow_query: Vulkan reports per-stream
+       * overflow through VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, gated on
+       * the transformFeedbackQueries property. "Any stream" is the OR of four. */
+      caps->query_so_overflow = screen->caps.query_so_overflow;
+
+      caps->multi_draw_indirect_params =
+         screen->vk.CmdDrawIndirectCount != NULL &&
+         screen->vk.CmdDrawIndexedIndirectCount != NULL;
+
       /* No fixed-function clip planes: Vulkan clips on the ClipDistance the
        * shader writes, and nothing else. Reporting zero is what makes the state
        * tracker lower an application's clip planes -- and gl_ClipVertex, which

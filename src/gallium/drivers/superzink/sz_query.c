@@ -59,6 +59,15 @@ sz_query_pool_type(const struct sz_screen *screen, enum pipe_query_type type,
       *count = 1;
       return sz_query_timestamp_supported(screen);
 
+   case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
+   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
+      /* VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT is per stream, and the query
+       * index selects which one. All streams are set up so that "any" can be the
+       * OR of them. */
+      *out = VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+      *count = 4;
+      return screen->caps.query_so_overflow;
+
    case PIPE_QUERY_TIME_ELAPSED:
       /* Two timestamps, and the answer is their difference. */
       *out = VK_QUERY_TYPE_TIMESTAMP;
@@ -107,8 +116,12 @@ sz_create_query(struct pipe_context *pipe, unsigned query_type, unsigned index)
    q->type = (enum pipe_query_type)query_type;
    q->pool = pool;
    q->count = count;
+   /* glBeginQueryIndexed(GL_TRANSFORM_FEEDBACK_STREAM_OVERFLOW, stream) hands the
+    * stream down as the query index. */
+   q->slot = (enum pipe_query_type)query_type == PIPE_QUERY_SO_OVERFLOW_PREDICATE
+                ? MIN2(index, 3)
+                : 0;
 
-   (void)index;
    return &q->base;
 }
 
@@ -202,6 +215,12 @@ sz_begin_query(struct pipe_context *pipe, struct pipe_query *query)
       /* A single timestamp is written by end_query -- glQueryCounter has no
        * begin at all -- and the disjointness is a property of the device. */
       break;
+   case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
+   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
+      /* Every stream starts here, so that the "any" result is their union. */
+      for (unsigned i = 0; i < q->count; i++)
+         ctx->screen->vk.CmdBeginQuery(cmd, q->pool, i, 0);
+      break;
    default:
       ctx->screen->vk.CmdBeginQuery(cmd, q->pool, 0, 0);
       break;
@@ -242,6 +261,11 @@ sz_end_query(struct pipe_context *pipe, struct pipe_query *query)
    case PIPE_QUERY_TIMESTAMP_DISJOINT:
       /* Nothing to record: the answer is a property of the device, not of the
        * work between begin and end. */
+      break;
+   case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
+   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
+      for (unsigned i = 0; i < q->count; i++)
+         ctx->screen->vk.CmdEndQuery(cmd, q->pool, i);
       break;
    default:
       ctx->screen->vk.CmdEndQuery(cmd, q->pool, 0);
@@ -285,6 +309,15 @@ sz_query_read(struct sz_context *ctx, struct sz_query *q, bool wait,
    case PIPE_QUERY_TIMESTAMP_DISJOINT:
       /* Only "was the clock continuous" is read from it, and it always was. */
       value = 0;
+      break;
+   case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
+      /* Already a boolean; "ticks" are nanoseconds and would scale it away. */
+      value = values[q->slot] != 0;
+      break;
+   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
+      value = 0;
+      for (unsigned i = 0; i < q->count; i++)
+         value |= values[i] != 0;
       break;
    default:
       value = sz_query_ticks_to_ns(screen, values[0]);
@@ -331,6 +364,8 @@ sz_get_query_result(struct pipe_context *pipe, struct pipe_query *query,
    switch (q->type) {
    case PIPE_QUERY_OCCLUSION_PREDICATE:
    case PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE:
+   case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
+   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
       result->b = value != 0;
       break;
    case PIPE_QUERY_TIMESTAMP_DISJOINT:

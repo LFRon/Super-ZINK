@@ -30,6 +30,10 @@ struct sz_query {
 
    VkQueryPool pool;
 
+   /* Stream index for VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: the query
+    * slot *is* the stream in that query type. */
+   unsigned slot;
+
    /* A begin/end pair is open, so end_query must not reset the pool under it.
     * glQueryCounter has no begin at all and goes straight to end_query. */
    bool begun;

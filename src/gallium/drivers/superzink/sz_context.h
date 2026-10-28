@@ -271,6 +271,12 @@ struct sz_context {
          VkDeviceSize offset;
          uint32_t stride;
          uint32_t draw_count;
+         /* When non-NULL the count is read from here instead, which is
+          * glMultiDrawArraysIndirectCount. */
+         struct sz_resource *count_buffer;
+         struct pipe_resource *count_resource;
+         VkDeviceSize count_offset;
+         uint32_t max_draw_count;
       } indirect;
    } pending;
 

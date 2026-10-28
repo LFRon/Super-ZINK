@@ -151,6 +151,10 @@ struct sz_vk_entrypoints {
     * a buffer, which is the whole of GL_ARB_draw_indirect. */
    PFN_vkCmdDrawIndirect CmdDrawIndirect;
    PFN_vkCmdDrawIndexedIndirect CmdDrawIndexedIndirect;
+   /* Core 1.2: the draw count itself comes from a buffer, which is what
+    * ARB_indirect_parameters' GL_PARAMETER_BUFFER is. */
+   PFN_vkCmdDrawIndirectCount CmdDrawIndirectCount;
+   PFN_vkCmdDrawIndexedIndirectCount CmdDrawIndexedIndirectCount;
    /* Buffer textures: a texel buffer descriptor is a VkBufferView. */
    PFN_vkCreateBufferView CreateBufferView;
    PFN_vkDestroyBufferView DestroyBufferView;
