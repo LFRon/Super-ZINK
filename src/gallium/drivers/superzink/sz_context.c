@@ -2850,16 +2850,71 @@ sz_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    struct sz_resource *index = NULL;
    VkIndexType type = VK_INDEX_TYPE_UINT16;
 
+   /* Indices from a client array (glDrawElements with no element array buffer
+    * bound) are the one piece of draw state that lives in the application's
+    * memory rather than in a buffer. Vulkan has no such thing, so the array is
+    * copied into one.
+    *
+    * The copy has to be complete before the draw reads it and no earlier, which
+    * is exactly what an upload through buffer_subdata gives: unmap flushes the
+    * queued draws, records the copy, and the batch that follows is recorded
+    * after it. The resource is handed to the pending batch, which keeps the
+    * reference until the draw has been emitted.
+    *
+    * Only the closure of the requested ranges is copied, not the whole array --
+    * a client-index draw names a window into it and nothing else is reachable. */
    if (info->index_size) {
+      type = info->index_size == 4 ? VK_INDEX_TYPE_UINT32
+                                   : VK_INDEX_TYPE_UINT16;
       if (info->has_user_indices) {
-         sz_warn_once("user index buffers are not implemented, ignoring");
+         unsigned first = UINT_MAX, last = 0;
+         for (unsigned i = 0; i < num_draws; i++) {
+            if (draws[i].count == 0)
+               continue;
+            first = MIN2(first, draws[i].start);
+            last = MAX2(last, draws[i].start + draws[i].count);
+         }
+         if (first == UINT_MAX || last <= first)
+            return;
+
+         /* Copied from index 0 rather than from `first`, because a draw's start
+          * is an index into the array as the application passed it and there is
+          * no per-draw offset to fold `first` into. */
+         const unsigned bytes = last * info->index_size;
+
+         struct pipe_resource *user = pipe_buffer_create(
+            pipe->screen, PIPE_BIND_INDEX_BUFFER, PIPE_USAGE_DEFAULT, bytes);
+         if (!user)
+            return;
+
+         struct pipe_transfer *transfer = NULL;
+         void *map = pipe_buffer_map_range(pipe, user, 0, bytes,
+                                           PIPE_MAP_WRITE, &transfer);
+         if (!map) {
+            pipe_resource_reference(&user, NULL);
+            return;
+         }
+         memcpy(map, info->index.user, bytes);
+         pipe_buffer_unmap(pipe, transfer);
+
+         index = sz_resource(user);
+         if (!index || index->buffer == VK_NULL_HANDLE) {
+            pipe_resource_reference(&user, NULL);
+            return;
+         }
+
+         /* The batch holds its own reference; the one taken below only covers
+          * the interval until the append has recorded it. */
+         if (indirect)
+            sz_draw_append_indirect(ctx, info, indirect, index, type);
+         else
+            sz_draw_append(ctx, info, draws, num_draws, index, type);
+         pipe_resource_reference(&user, NULL);
          return;
       }
       index = sz_resource(info->index.resource);
       if (!index || index->buffer == VK_NULL_HANDLE)
          return;
-      type = info->index_size == 4 ? VK_INDEX_TYPE_UINT32
-                                   : VK_INDEX_TYPE_UINT16;
    }
 
    if (indirect)
