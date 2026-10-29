@@ -208,6 +208,18 @@ struct sz_retired_resource {
    uint64_t value;
 };
 
+/* A view handle that outlives the pipe_sampler_view naming it.
+ *
+ * A sampler view is destroyed as soon as the state tracker drops it, which says
+ * nothing about the GPU: the command buffer being recorded, or a batch already
+ * submitted, still names the VkImageView in a bound descriptor. Same rule as
+ * struct sz_retired_resource, one handle to free instead of a whole resource. */
+struct sz_retired_view {
+   VkImageView view;
+   VkBufferView buffer_view;
+   uint64_t value;
+};
+
 struct sz_screen {
    struct pipe_screen base;
    struct pipe_screen *wrapped; /* debug_screen_wrap() wrapper, freed on destroy */
@@ -253,6 +265,12 @@ struct sz_screen {
    struct sz_retired_resource *retired_resources;
    unsigned num_retired_resources;
    unsigned retired_resources_capacity;
+
+   /* Image and buffer views awaiting the timeline value in `value`. See
+    * sz_screen_retire_view(). */
+   struct sz_retired_view *retired_views;
+   unsigned num_retired_views;
+   unsigned retired_views_capacity;
 
    /* pipe_context::destroy has no way to reach the screen's flag, so the screen
     * tracks it here. See sz_screen_context_create(). */

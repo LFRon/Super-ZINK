@@ -697,6 +697,66 @@ sz_resource_reclaim(struct sz_screen *screen)
          screen->retired_resources[screen->num_retired_resources];
       sz_resource_destroy_now(screen, pres);
    }
+
+   for (unsigned i = 0; i < screen->num_retired_views; ) {
+      if (screen->retired_views[i].value > completed) {
+         i++;
+         continue;
+      }
+
+      const struct sz_retired_view retired = screen->retired_views[i];
+      screen->num_retired_views--;
+      screen->retired_views[i] =
+         screen->retired_views[screen->num_retired_views];
+
+      if (retired.view != VK_NULL_HANDLE)
+         screen->vk.DestroyImageView(screen->dev, retired.view, NULL);
+      if (retired.buffer_view != VK_NULL_HANDLE)
+         screen->vk.DestroyBufferView(screen->dev, retired.buffer_view, NULL);
+   }
+}
+
+/* Retirement is by the submission that could name the handle, exactly as
+ * sz_screen_resource_destroy() does it: the recording batch takes the next
+ * timeline value, so one past it is the value that makes the handle safe. */
+void
+sz_screen_retire_view(struct sz_screen *screen, VkImageView view,
+                      VkBufferView buffer_view)
+{
+   if (view == VK_NULL_HANDLE && buffer_view == VK_NULL_HANDLE)
+      return;
+
+   const uint64_t retire_value = screen->batch_state.next_value + 1;
+
+   sz_resource_reclaim(screen);
+
+   if (screen->num_retired_views == screen->retired_views_capacity) {
+      const unsigned capacity = MAX2(screen->retired_views_capacity * 2, 64);
+      struct sz_retired_view *grown =
+         realloc(screen->retired_views, capacity * sizeof(*grown));
+      if (grown) {
+         screen->retired_views = grown;
+         screen->retired_views_capacity = capacity;
+      }
+   }
+
+   if (screen->num_retired_views == screen->retired_views_capacity) {
+      /* Only reachable when the table could not grow: waiting is the one thing
+       * that makes progress, and the reclaim above then frees the oldest. */
+      sz_queue_wait_idle(&screen->batch_state);
+      sz_resource_reclaim(screen);
+      if (screen->num_retired_views == screen->retired_views_capacity) {
+         screen->vk.DestroyImageView(screen->dev, view, NULL);
+         if (buffer_view != VK_NULL_HANDLE)
+            screen->vk.DestroyBufferView(screen->dev, buffer_view, NULL);
+         return;
+      }
+   }
+
+   screen->retired_views[screen->num_retired_views].view = view;
+   screen->retired_views[screen->num_retired_views].buffer_view = buffer_view;
+   screen->retired_views[screen->num_retired_views].value = retire_value;
+   screen->num_retired_views++;
 }
 
 static void
@@ -753,6 +813,19 @@ sz_screen_resource_destroy(struct pipe_screen *pscreen,
 void
 sz_resource_reclaim_all(struct sz_screen *screen)
 {
+   for (unsigned i = 0; i < screen->num_retired_views; i++) {
+      if (screen->retired_views[i].view != VK_NULL_HANDLE)
+         screen->vk.DestroyImageView(screen->dev,
+                                     screen->retired_views[i].view, NULL);
+      if (screen->retired_views[i].buffer_view != VK_NULL_HANDLE)
+         screen->vk.DestroyBufferView(screen->dev,
+                                      screen->retired_views[i].buffer_view,
+                                      NULL);
+   }
+   screen->num_retired_views = 0;
+   free(screen->retired_views);
+   screen->retired_views = NULL;
+
    for (unsigned i = 0; i < screen->num_retired_resources; i++)
       sz_resource_destroy_now(screen, screen->retired_resources[i].res);
    screen->num_retired_resources = 0;

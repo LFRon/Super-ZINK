@@ -842,10 +842,13 @@ sz_sampler_view_destroy(struct pipe_context *pipe,
    struct sz_sampler_view *sv = (struct sz_sampler_view *)view;
    struct sz_screen *screen = sz_context(pipe)->screen;
 
-   if (sv->view != VK_NULL_HANDLE)
-      screen->vk.DestroyImageView(screen->dev, sv->view, NULL);
-   if (sv->buffer_view != VK_NULL_HANDLE)
-      screen->vk.DestroyBufferView(screen->dev, sv->buffer_view, NULL);
+   /* The handles go to the screen rather than to vkDestroyImageView: a command
+    * buffer that has been recorded -- or a batch already submitted -- still
+    * names them, and Vulkan only allows the destruction once that work has
+    * finished executing. Freeing them here is the use-after-free that crashed
+    * RADV in arb_texture_view@rendering-formats, where the application clears
+    * through a view and deletes it in the next statement. */
+   sz_screen_retire_view(screen, sv->view, sv->buffer_view);
 
    pipe_resource_reference(&sv->base.texture, NULL);
    free(sv);

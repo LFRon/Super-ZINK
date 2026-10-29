@@ -163,6 +163,11 @@ void sz_resource_reclaim_all(struct sz_screen *screen);
  * table is empty, so callers on hot paths may call it unconditionally. */
 void sz_resource_reclaim(struct sz_screen *screen);
 
+/* Hands `view`/`buffer_view` over to the screen, which destroys them once the
+ * submission that may still name them has completed. */
+void sz_screen_retire_view(struct sz_screen *screen, VkImageView view,
+                           VkBufferView buffer_view);
+
 /* Wraps a VkImage whose memory was imported from a dma-buf into a
  * pipe_resource. Used by sz_dmabuf's resource_from_handle, which owns the
  * VkImage creation because only it knows the plane layout. */
