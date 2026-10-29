@@ -24,6 +24,7 @@
 #include "sz_pipeline.h"
 #include "sz_query.h"
 #include "sz_renderpass.h"
+#include "sz_bo.h"
 #include "sz_resource.h"
 #include "sz_sync.h"
 
@@ -2271,6 +2272,54 @@ sz_emit_draws(struct sz_context *ctx, VkCommandBuffer cmd)
       const uint32_t first = ctx->pending.draws[i].first;
       const int32_t index_bias = ctx->pending.draws[i].index_bias;
 
+      /* SZ_DEBUG=stream: the buffers and offsets one draw names. Reading a whole
+       * frame of these shows how an application actually uses its buffers -- a
+       * transform that stays at one offset all frame long is in a slot the
+       * application has to protect itself, and a vertex buffer that rotates is
+       * one the driver has to order every upload against. */
+      if (sz_debug_enabled(SZ_DEBUG_STREAM)) {
+         const struct pipe_vertex_buffer *vb =
+            ctx->state.num_vertex_buffers ? &ctx->state.vertex_buffers[0] : NULL;
+         const struct pipe_constant_buffer *cb =
+            &ctx->state.constant_buffers[MESA_SHADER_VERTEX][0];
+
+         /* A hash of the vertices the draw will fetch. Two draws with the same
+          * binding and different hashes are an application rewriting the buffer
+          * in place between them, which the driver has to keep ordered. */
+         uint32_t hash = 2166136261u;
+         if (vb && vb->buffer.resource) {
+            const struct sz_resource *vr = sz_resource(vb->buffer.resource);
+            const uint8_t *base = sz_bo_map(vr->bo);
+            const struct sz_state *ve_st = ctx->state.vertex_elements;
+            const unsigned stride =
+               ve_st && ve_st->u.ve.count ? ve_st->u.ve.elements[0].src_stride
+                                          : 16;
+            if (base) {
+               const uint64_t off = vb->buffer_offset + (uint64_t)first * stride;
+               const uint64_t len = MIN2((uint64_t)count * stride, 256);
+               for (uint64_t k = 0; k < len; k++) {
+                  hash ^= base[off + k];
+                  hash *= 16777619u;
+               }
+            }
+         }
+
+         mesa_logi("SZ: draw %u%s count=%u first=%u bias=%d vh=%08x vb=%" PRIx64
+                   "+%" PRIu64 " ubo=%" PRIx64 "+%u/%u idx=%" PRIx64 "+%" PRIu64,
+                   i, ctx->pending.indexed ? "i" : "", count, first, index_bias,
+                   hash,
+                   vb && vb->buffer.resource
+                      ? (uint64_t)(uintptr_t)sz_resource(vb->buffer.resource)->buffer
+                      : 0,
+                   vb ? (uint64_t)vb->buffer_offset : 0,
+                   cb && cb->buffer
+                      ? (uint64_t)(uintptr_t)sz_resource(cb->buffer)->buffer : 0,
+                   cb ? cb->buffer_offset : 0, cb ? cb->buffer_size : 0,
+                   ctx->pending.index_buffer
+                      ? (uint64_t)(uintptr_t)ctx->pending.index_buffer->buffer : 0,
+                   ctx->pending.index_offset);
+      }
+
       if (ctx->pending.indexed)
          ctx->screen->vk.CmdDrawIndexed(cmd, count,
                                         ctx->pending.instance_count, first,
@@ -3127,6 +3176,33 @@ sz_oneshot(struct sz_context *ctx, struct sz_copy_job *job)
    return true;
 }
 
+
+/* SZ_DEBUG=race: report a CPU write into a buffer a submission still reads.
+ *
+ * GL lets the application decide when a buffer is free to overwrite, and every
+ * renderer decides it with a fence. A write that lands while the previous reader
+ * is still on the device is therefore not the application's mistake to make: it
+ * means the fence it waited on said "done" too early, which is exactly the kind
+ * of bug that shows up as one vertex of a quad reading another draw's data. */
+static void
+sz_race_check(struct sz_context *ctx, struct sz_resource *r, uint64_t offset,
+              uint64_t size)
+{
+   if (!sz_debug_enabled(SZ_DEBUG_RACE) || !r || !r->last_use_value)
+      return;
+
+   sz_queue_poll(&ctx->screen->batch_state);
+   const uint64_t completed = ctx->screen->batch_state.completed_value;
+   if (r->last_use_value <= completed)
+      return;
+
+   sz_warn("race: writing bytes %" PRIu64 "..%" PRIu64 " of buffer %" PRIx64
+           " while submission %" PRIu64 " (completed %" PRIu64
+           ") still reads it",
+           offset, offset + size, (uint64_t)(uintptr_t)r->buffer,
+           r->last_use_value, completed);
+}
+
 static void *
 sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
                 unsigned level, unsigned usage, const struct pipe_box *box,
@@ -3162,21 +3238,26 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
     * PIPE_MAP_UNSYNCHRONIZED_BIT used to be an exception, on the grounds that the
     * application had taken responsibility for the overlap. It had not: what the
     * flag promises is that the GL will not *block*, not that a draw the driver
-    * has queued and not yet submitted may be handed a pointer into memory it is
-    * going to read later. The application's fence cannot describe that draw -- it
-    * was never submitted -- so the batch is recorded with a pointer into bytes
-    * the CPU is about to overwrite, and every draw in it uses the last write of
-    * the frame. Minecraft maps its vertex and index buffers this way thousands of
-    * times a frame, which is why the flag showed up as a logo drawn with the
-    * panorama's transform instead of as a rare glitch.
+    * has queued and not yet submitted may be handed a pointer into memory it will
+    * read later. The application's fence cannot describe that draw -- it was
+    * never submitted -- so the batch is drained and the draw reads whichever
+    * bytes the CPU wrote afterwards. Minecraft maps its vertex and index buffers
+    * this way several thousand times a frame, which is why the flag showed up as
+    * a skewed logo rather than as a rare glitch: every draw in the batch used the
+    * last transform written.
     *
     * What is genuinely not staged is a mapping the caller holds open across
     * draws. The state tracker's uploader keeps one such map alive for the life of
-    * the buffer, so there is no unmap to copy at, and staging it would put the
+    * the buffer, so there is no unmap to copy at and staging it would put the
     * copies after the draws that need them. Those writes are covered by the
     * HOST_WRITE barrier instead, and the uploader's own offset advance is what
     * keeps them off memory still in flight. Textures keep the direct path as
     * well: they are written once and then only sampled. */
+   if (sz_debug_enabled(SZ_DEBUG_STREAM) && res->target == PIPE_BUFFER &&
+       (usage & PIPE_MAP_WRITE))
+      mesa_logi("SZ: mapw bind=0x%x usage=0x%x size=%u", res->bind, usage,
+                res->width0);
+
    const bool streaming_write =
       (usage & PIPE_MAP_WRITE) && res->target == PIPE_BUFFER &&
       !(usage & (PIPE_MAP_FLUSH_EXPLICIT | PIPE_MAP_PERSISTENT));
@@ -3197,6 +3278,7 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
           * writes many times, so waiting for unmap means waiting for the end of
           * the process, and every draw in between reads vertices with no
           * HOST_WRITE dependency in front of it. */
+         sz_race_check(ctx, r, box->x, box->width);
          r->write_maps++;
          r->host_written = true;
       }
@@ -3292,6 +3374,9 @@ sz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
        * was in that memory before the upload. The result is a draw whose vertex
        * or index data is one frame stale, in exactly one place on screen. */
       staging->host_written = true;
+
+      sz_race_check(ctx, sz_resource(t->base.resource), t->base.box.x,
+                    t->base.box.width);
 
       struct sz_copy_job job = {
          .res = sz_resource(t->base.resource),

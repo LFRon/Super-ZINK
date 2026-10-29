@@ -30,6 +30,8 @@ enum sz_debug_flag {
    SZ_DEBUG_TRACE     = (1 << 11),
    SZ_DEBUG_SERIALIZE = (1 << 12),
    SZ_DEBUG_SUBMIT_EACH = (1 << 13),
+   SZ_DEBUG_RACE      = (1 << 14),
+   SZ_DEBUG_STREAM    = (1 << 15),
 };
 
 extern uint32_t sz_debug;

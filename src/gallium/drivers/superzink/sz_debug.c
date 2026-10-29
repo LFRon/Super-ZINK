@@ -26,6 +26,8 @@ sz_debug_options[] = {
    { "trace",     SZ_DEBUG_TRACE,     "Print the first resource/present events of the life cycle" },
    { "serialize", SZ_DEBUG_SERIALIZE, "Submit and wait after every draw batch (tells a race apart from a data bug)" },
    { "submit_each", SZ_DEBUG_SUBMIT_EACH, "Submit after every draw batch but do not wait" },
+   { "race",      SZ_DEBUG_RACE,      "Warn when the CPU writes a buffer an uncompleted submission still reads" },
+   { "stream",    SZ_DEBUG_STREAM,    "Print one line per draw with the buffers and offsets it uses" },
    DEBUG_NAMED_VALUE_END
 };
 

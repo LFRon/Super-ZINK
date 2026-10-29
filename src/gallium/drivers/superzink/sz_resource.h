@@ -93,6 +93,14 @@ struct sz_resource {
     * a quad reading another draw's data, which turns the logo into a bow tie. */
    unsigned write_maps;
 
+   /* The timeline value of the last submission that named this buffer.
+    *
+    * Only used by SZ_DEBUG=race: a CPU write into a buffer whose last reader is
+    * still on the device is a write-after-read the application is supposed to
+    * have prevented with a fence, so seeing one means the fence the application
+    * trusted reported completion too early. */
+   uint64_t last_use_value;
+
    /* Set when the resource was created with linear tiling, which forbids
     * VK_IMAGE_TILING_OPTIMAL-only usage and needs explicit cache flushes. */
    bool linear;

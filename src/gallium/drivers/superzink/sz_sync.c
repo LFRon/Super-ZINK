@@ -320,6 +320,14 @@ sz_resource_access_levels(struct sz_screen *screen, VkCommandBuffer cmd,
     * write. A buffer that was never written needs nothing, which is the common
     * case for a static vertex buffer drawn every frame. */
    if (res->buffer != VK_NULL_HANDLE) {
+      /* Remember which submission this access will be part of, so a later CPU
+       * write can tell whether the reader is still on the device. Only a read
+       * is recorded: overwriting a range an uncompleted submission also wrote
+       * is a write-after-write, which the queue's submission order already
+       * resolves, and counting it would drown the real case. */
+      if (!sz_access_has_write(dst.access))
+         res->last_use_value = screen->batch_state.next_value + 1;
+
       /* Host writes through a mapped pointer are only visible to the device
        * after a barrier whose source is HOST/HOST_WRITE. The uploaders write
        * vertices and uniforms that way, so this is the common case for a
