@@ -5300,6 +5300,32 @@ sz_emit_shader(struct sz_translate *t, uint32_t function)
  * This costs one pass over the words at shader-compile time, which is nothing
  * next to the compile itself, and it turns a class of "the driver crashed"
  * reports into a legible translation error. */
+/* Whether the shader writes its own fragment depth.
+ * nir->info.outputs_written says so for a shader the GLSL compiler produced,
+ * but a TGSI-built one -- every one of util_blitter's resolve shaders -- arrives
+ * with that bitfield empty and the information only in the variables and stores
+ * that name FRAG_RESULT_DEPTH. Missing it is not a cosmetic problem: without
+ * the execution mode Vulkan requires for a FragDepth output, the pipeline
+ * ignores the value the shader computed and keeps the depth the rasteriser
+ * interpolated, which for a blit quad sitting at z = 0 is 0. That is exactly
+ * how a depth blit came out as a screen full of zeros.
+ *
+ * A variable that is declared but never stored to costs nothing: DepthReplacing
+ * only prevents early depth tests, and a shader with a FragDepth output cannot
+ * have them anyway. */
+static bool
+sz_shader_writes_frag_depth(nir_shader *nir)
+{
+   if (nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_DEPTH))
+      return true;
+
+   nir_foreach_variable_with_modes (var, nir, nir_var_shader_out) {
+      if ((unsigned)var->data.location == FRAG_RESULT_DEPTH)
+         return true;
+   }
+   return false;
+}
+
 static bool
 sz_spv_verify_cfg(struct sz_translate *t, const uint32_t *words, size_t count,
                   char **error)
@@ -5574,16 +5600,8 @@ sz_nir_to_spirv(struct nir_shader *nir,
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       sz_spv_execution_mode(t.m, function, SpvExecutionModeOriginUpperLeft);
 
-   /* A fragment shader that computes gl_FragDepth has to declare it: Vulkan
-    * requires an execution mode for the FragDepth builtin
-    * (VUID-FragDepth-FragDepth-04216), and a module without one is rejected by
-    * spirv-val -- so the depth the shader computed never reaches the pipeline
-    * and the attachment keeps whatever it held. Plain gl_FragDepth writes are
-    * DepthReplacing; GL's layout(depth_greater/less/unchanged) qualifiers map
-    * onto the three narrower modes, which is also the only way to keep early
-    * depth testing possible. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
-       (nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_DEPTH))) {
+       sz_shader_writes_frag_depth(nir)) {
       SpvExecutionMode mode;
       switch (nir->info.fs.depth_layout) {
       case FRAG_DEPTH_LAYOUT_GREATER:
