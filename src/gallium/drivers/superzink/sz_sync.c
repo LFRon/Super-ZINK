@@ -42,6 +42,16 @@ sz_sync_state_for(enum sz_access access, bool depth_stencil)
                                  : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
       };
 
+   case SZ_ACCESS_GENERAL:
+      /* Vulkan's escape hatch: every stage, every kind of access, one layout.
+       * Needed where no narrower layout states the truth -- clearing one aspect
+       * of a combined depth-stencil image, which TRANSFER_DST does not allow. */
+      return (struct sz_sync_state) {
+         .stages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .access = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+         .layout = VK_IMAGE_LAYOUT_GENERAL,
+      };
+
    case SZ_ACCESS_SAMPLED:
       return (struct sz_sync_state) {
          .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |

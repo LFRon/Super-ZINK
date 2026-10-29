@@ -1253,7 +1253,18 @@ sz_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *dst,
    if (cmd == VK_NULL_HANDLE)
       return;
 
-   sz_resource_access(ctx->screen, cmd, res, SZ_ACCESS_TRANSFER_DST);
+   /* TRANSFER_DST_OPTIMAL is the layout a depth clear normally uses, but it may
+    * only name a *whole* image: clearing one aspect of a combined depth-stencil
+    * format needs VK_IMAGE_LAYOUT_GENERAL, and RADV quietly drops the clear
+    * otherwise -- which is what left a stencil clear of a multisampled
+    * D32_SFLOAT_S8_UINT attachment at whatever it held, so every fragment then
+    * failed the stencil test that ManifestDepth sets up. */
+   const bool combined = util_format_has_depth(desc) && util_format_has_stencil(desc);
+   const bool whole_image =
+      aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+   VkImageLayout layout = sz_resource_access(
+      ctx->screen, cmd, res,
+      combined && !whole_image ? SZ_ACCESS_GENERAL : SZ_ACCESS_TRANSFER_DST);
 
    const VkImageSubresourceRange range = {
       .aspectMask = aspect,
@@ -1263,8 +1274,8 @@ sz_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *dst,
       .layerCount = dst->last_layer - dst->first_layer + 1,
    };
 
-   ctx->screen->vk.CmdClearDepthStencilImage(
-      cmd, res->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+   ctx->screen->vk.CmdClearDepthStencilImage(cmd, res->image, layout, &clear, 1,
+                                            &range);
 }
 
 static void

@@ -39,6 +39,7 @@ enum sz_access {
    SZ_ACCESS_TEXEL_BUFFER,  /* reading it as a buffer texture */
    SZ_ACCESS_TRANSFER_SRC,  /* copying out of it */
    SZ_ACCESS_TRANSFER_DST,  /* copying into it, or clearing it */
+   SZ_ACCESS_GENERAL,       /* reading and writing it as one thing at once */
    SZ_ACCESS_PRESENT,       /* handing it to the winsys */
 };
 
