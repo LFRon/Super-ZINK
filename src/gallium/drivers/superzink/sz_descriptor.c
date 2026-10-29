@@ -413,21 +413,22 @@ sz_descriptor_db_init(struct sz_screen *screen)
       screen->db.ring[i].used = 0;
    }
 
-   /* The placeholder an unbound constant buffer slot points at. It must be a
-    * real uniform buffer: pointing the slot at the descriptor buffer fails
-    * VUID-VkDescriptorGetInfoEXT-type-12220, because that one was not created
-    * with VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT. */
+   /* The placeholder an unbound constant or storage buffer slot points at. It
+    * must be a real buffer of the right kind: pointing the slot at the
+    * descriptor buffer fails VUID-VkDescriptorGetInfoEXT-type-12220 (uniform)
+    * and -12221 (storage), because that one was created with neither usage. */
    {
       const VkBufferCreateInfo ci = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
          .size = 256,
          .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                   VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
          .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       };
       if (screen->vk.CreateBuffer(screen->dev, &ci, NULL,
                                   &screen->dummy_ubo.buffer) != VK_SUCCESS) {
-         mesa_loge("SZ: could not create the unbound uniform buffer placeholder");
+         mesa_loge("SZ: could not create the unbound buffer placeholder");
          return false;
       }
 
