@@ -602,6 +602,23 @@ sz_spv_execution_mode_literals(struct sz_spv_module *m, uint32_t function,
 }
 
 void
+sz_spv_extension(struct sz_spv_module *m, const char *name)
+{
+   /* OpExtension takes a literal string: one word per four characters, padded
+    * with NULs, and it is *not* NUL-terminated -- the same packing OpEntryPoint
+    * uses for its name. */
+   const size_t len = strlen(name);
+   const size_t words = (len + 4) / 4;
+
+   uint32_t *ops = calloc(words, sizeof(*ops));
+   if (!ops)
+      return;
+   memcpy(ops, name, len);
+   sz_spv_emit_simple(m, SEC_EXTENSIONS, SpvOpExtension, ops, words);
+   free(ops);
+}
+
+void
 sz_spv_entry_point(struct sz_spv_module *m, SpvExecutionModel model,
                    uint32_t function, const char *name,
                    const uint32_t *interface, unsigned interface_count)

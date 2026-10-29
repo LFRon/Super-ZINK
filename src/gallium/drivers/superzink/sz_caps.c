@@ -348,6 +348,9 @@ sz_caps_init(struct sz_caps *caps,
       caps->external_memory_dma_buf &&
       sz_ext_advertised(exts, ext_count,
                         VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+   caps->shader_stencil_export =
+      sz_ext_advertised(exts, ext_count,
+                        VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
 
    FREE(exts);
 }

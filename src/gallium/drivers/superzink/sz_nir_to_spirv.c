@@ -840,6 +840,18 @@ sz_varying_location(struct sz_translate *t, const nir_variable *var,
             *has_builtin = true;
             return true;
          }
+         /* gl_FragStencilRefARB, and the internal gl_FragStencilRefEXT output
+          * that util_blitter's stencil shaders write (they reach the driver
+          * through TGSI, so the slot arrives as a variable, not as a builtin
+          * the frontend declared). Vulkan spells it FragStencilRefEXT behind
+          * VK_EXT_shader_stencil_export, and the module has to state the
+          * StencilRefReplacingEXT execution mode with it -- see
+          * sz_emit_stencil_ref_replacing(). */
+         if (slot == FRAG_RESULT_STENCIL) {
+            *builtin = SpvBuiltInFragStencilRefEXT;
+            *has_builtin = true;
+            return true;
+         }
          /* gl_SampleMask[] is the coverage mask the shader may narrow with
           * per-sample shading. Vulkan's SampleMask builtin is the same array of
           * int, so it needs no translation beyond the slot mapping. */
@@ -5340,6 +5352,25 @@ sz_shader_writes_frag_depth(nir_shader *nir)
    return false;
 }
 
+/* Whether the shader exports a stencil value. Same reasoning as
+ * sz_shader_writes_frag_depth(): the bitfield is empty for a shader built from
+ * TGSI, and SPIR-V requires the StencilRefReplacingEXT execution mode whenever
+ * the module declares a FragStencilRefEXT output. Without the mode the module is
+ * rejected; without the whole output Vulkan ignores the value the shader wrote,
+ * which is what a stencil blit looks like when nothing is copied. */
+static bool
+sz_shader_writes_frag_stencil(nir_shader *nir)
+{
+   if (nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_STENCIL))
+      return true;
+
+   nir_foreach_variable_with_modes (var, nir, nir_var_shader_out) {
+      if ((unsigned)var->data.location == FRAG_RESULT_STENCIL)
+         return true;
+   }
+   return false;
+}
+
 static bool
 sz_spv_verify_cfg(struct sz_translate *t, const uint32_t *words, size_t count,
                   char **error)
@@ -5632,6 +5663,17 @@ sz_nir_to_spirv(struct nir_shader *nir,
          break;
       }
       sz_spv_execution_mode(t.m, function, mode);
+   }
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+       sz_shader_writes_frag_stencil(nir)) {
+      /* VK_EXT_shader_stencil_export: the execution mode says the fragment
+       * shader replaces the stencil reference, and OpExtension says which
+       * extension the FragStencilRefEXT output comes from. spirv-val rejects
+       * one without the other. */
+      sz_spv_extension(t.m, "SPV_EXT_shader_stencil_export");
+      sz_spv_execution_mode(t.m, function,
+                            SpvExecutionModeStencilRefReplacingEXT);
    }
 
    /* Vulkan has no default workgroup size, and a compute pipeline is created

@@ -91,6 +91,9 @@ uint32_t sz_spv_const_composite(struct sz_spv_module *m, uint32_t type,
 
 /* Preamble. */
 void sz_spv_capability(struct sz_spv_module *m, SpvCapability capability);
+/* OpExtension, which declares that the module uses a SPIR-V extension. The
+ * builder does not deduplicate: callers emit one per feature they enable. */
+void sz_spv_extension(struct sz_spv_module *m, const char *name);
 void sz_spv_memory_model(struct sz_spv_module *m, SpvAddressingModel addressing,
                          SpvMemoryModel memory);
 void sz_spv_entry_point(struct sz_spv_module *m, SpvExecutionModel model,

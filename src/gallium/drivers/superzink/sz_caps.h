@@ -241,7 +241,11 @@ void sz_vk_features_link(struct sz_vk_features *f, uint32_t api_version,
 #define SZ_CAP_EXT_ONLY_LIST(X)                                                \
    X(external_memory_fd,          "VK_KHR_external_memory_fd")                  \
    X(external_memory_dma_buf,     "VK_EXT_external_memory_dma_buf")             \
-   X(drm_format_modifier,         "VK_EXT_image_drm_format_modifier")
+   X(drm_format_modifier,         "VK_EXT_image_drm_format_modifier")             \
+   /* gl_FragStencilRefARB. What it buys is a stencil blit at all: util_blitter      \
+    * refuses a stencil copy without it (util_blitter.c, has_stencil_export),         \
+    * and Vulkan has no vkCmd* that moves stencil samples bit by bit. */              \
+   X(shader_stencil_export,       "VK_EXT_shader_stencil_export")
 
 struct sz_caps {
 #define SZ_CAP_FIELD(field, name, ext, core, expr) bool field;

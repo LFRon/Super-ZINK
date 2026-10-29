@@ -837,6 +837,11 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * sampleRateShading feature is enabled because the driver needs it. */
       caps->sample_shading = true;
 
+      /* ARB_shader_stencil_export: gl_FragStencilRefARB becomes the
+       * FragStencilRefEXT output (sz_nir_to_spirv.c), and util_blitter's
+       * stencil copy shaders are gated on this cap. */
+      caps->shader_stencil_export = screen->caps.shader_stencil_export;
+
       /* glViewportIndexedf and friends: GL 4.1 wants sixteen viewport slots, the
        * viewport state is dynamic, and sz_emit_viewport() writes every slot per
        * batch. gl_ViewportIndex is the ViewportIndex builtin the translator
