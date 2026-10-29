@@ -212,12 +212,16 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
 
    VkRenderingAttachmentInfo depth = { 0 };
    bool has_depth = fb->zsbuf.texture != NULL;
-   /* A depth-only format is not a stencil attachment: naming it as one is a
-    * validation error, and the format has to agree with what the pipeline
-    * declared. */
-   const bool has_stencil =
-      has_depth &&
-      util_format_has_stencil(util_format_description(fb->zsbuf.format));
+   /* An attachment is named for the aspects its format actually has. A
+    * depth-only format is not a stencil attachment and a stencil-only one
+    * (GL_STENCIL_INDEX8) is not a depth attachment: either way the format has
+    * to agree with what the pipeline declared, and naming the wrong aspect is a
+    * validation error. It also has to agree with the image layout, which is why
+    * the three cases name three different ones. */
+   const struct util_format_description *zs_desc =
+      has_depth ? util_format_description(fb->zsbuf.format) : NULL;
+   const bool has_depth_aspect = zs_desc && util_format_has_depth(zs_desc);
+   const bool has_stencil = zs_desc && util_format_has_stencil(zs_desc);
 
    if (has_depth) {
       struct sz_resource *res = sz_resource(fb->zsbuf.texture);
@@ -232,10 +236,13 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
                                       &fb->zsbuf),
          /* The stencil attachment shares this struct, so the layout has to be
           * legal for both aspects: DEPTH_ATTACHMENT_OPTIMAL is not
-          * (VUID-vkCmdBeginRendering-pStencilAttachment-06098). */
-         .imageLayout = has_stencil
+          * (VUID-vkCmdBeginRendering-pStencilAttachment-06098), and a
+          * stencil-only attachment may not use the depth layout either. */
+         .imageLayout = has_depth_aspect && has_stencil
                            ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                           : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                           : has_depth_aspect
+                                ? VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
+                                : VK_IMAGE_LAYOUT_STENCIL_ATTACHMENT_OPTIMAL,
          .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
          .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
       };
@@ -251,7 +258,7 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
       .layerCount = 1,
       .colorAttachmentCount = color_count,
       .pColorAttachments = color_count ? color : NULL,
-      .pDepthAttachment = has_depth ? &depth : NULL,
+      .pDepthAttachment = has_depth_aspect ? &depth : NULL,
       .pStencilAttachment = has_stencil ? &depth : NULL,
    };
 

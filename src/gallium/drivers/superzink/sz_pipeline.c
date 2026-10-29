@@ -931,15 +931,23 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
     * render pass object to take them from. They are computed once, here, because
     * the stencil decision below needs to know whether a stencil aspect exists at
     * all before the pipeline is described. */
+   /* Each aspect is named only when the attachment has it. An attachment
+    * without an aspect has to report UNDEFINED: naming a stencil-less format as
+    * the depth format (or the reverse) makes the pipeline invalid rather than
+    * aspect-less. A stencil-only attachment -- GL_STENCIL_INDEX8, which is what
+    * an FBO with nothing but a stencil renderbuffer has -- otherwise names
+    * VK_FORMAT_S8_UINT as its depth format, and the draw that fills it writes
+    * nothing. */
+   const struct util_format_description *zs_desc =
+      has_depth ? util_format_description(fb->zsbuf.format) : NULL;
    const VkFormat depth_format =
-      has_depth ? sz_vk_format(screen, fb->zsbuf.format) : VK_FORMAT_UNDEFINED;
-   /* A depth format without a stencil aspect has to report UNDEFINED: naming a
-    * stencil-less format makes the pipeline invalid rather than stencil-less. */
+      zs_desc && util_format_has_depth(zs_desc)
+         ? sz_vk_format(screen, fb->zsbuf.format)
+         : VK_FORMAT_UNDEFINED;
    const VkFormat stencil_format =
-      has_depth &&
-         util_format_has_stencil(util_format_description(fb->zsbuf.format))
-            ? sz_vk_format(screen, fb->zsbuf.format)
-            : VK_FORMAT_UNDEFINED;
+      zs_desc && util_format_has_stencil(zs_desc)
+         ? sz_vk_format(screen, fb->zsbuf.format)
+         : VK_FORMAT_UNDEFINED;
 
    /* GL's depth test is off by default; a draw that enables it without a depth
     * attachment is a state-tracker bug, not something to honour.
