@@ -465,6 +465,16 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
       .drmFormatModifierCount = 1,
       .pDrmFormatModifiers = &linear_modifier,
    };
+   /* A modifier-tiled image may only be created mutable when the formats its
+    * views will use are declared up front (VUID-VkImageCreateInfo-tiling-02353),
+    * and unlike optimal tiling the driver cannot accept the whole format family
+    * on our behalf. The image is exported as a dma-buf, so the only view the
+    * consumer is told about is the image's own format. */
+   VkImageFormatListCreateInfo fmt_ci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+      .viewFormatCount = 1,
+      .pViewFormats = &ci.format,
+   };
 
    if (exportable) {
       ci.tiling = screen->caps.drm_format_modifier
@@ -473,6 +483,8 @@ sz_image_create(struct sz_screen *screen, const struct pipe_resource *tmpl)
       /* A list of one leaves the driver no choice, which is the point: the
        * consumer will be told LINEAR and cannot be told otherwise. */
       ext_ci.pNext = screen->caps.drm_format_modifier ? &mod_ci : NULL;
+      if (screen->caps.drm_format_modifier)
+         mod_ci.pNext = &fmt_ci;
       ci.pNext = &ext_ci;
       ci.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
    }
