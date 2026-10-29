@@ -3760,9 +3760,19 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
    t->depth_format = depth_format;
    t->aspect = aspect;
 
-   /* Depth only needs its own region when it would not fill the packed texel;
-    * stencil needs one unless it is the whole texel already. */
-   if (want_depth && depth_bs != bs) {
+   /* Depth only needs its own region when it does not fit the packed texel;
+    * stencil needs one unless it is the whole texel already.
+    *
+    * "Fits" is not `depth_bs == bs`: the bytes of the pipe format's texel the
+    * depth aspect owns are all of them minus the stencil byte, and GL's
+    * depth24-stencil8 misses by one on a device whose depth format is 32-bit
+    * float -- three bytes of depth and one of stencil in the texel, four bytes
+    * of float for the depth alone. Treating the texel as the depth region there
+    * made the CPU's stencil writes land in the depth bytes, so a stencil copy
+    * stamped 0.0 over every depth value it touched. */
+   const unsigned texel_depth_bytes =
+      single_aspect ? bs : bs - (has_stencil ? 1 : 0);
+   if (want_depth && depth_bs != texel_depth_bytes) {
       t->depth_pitch =
          (unsigned)sz_resource_linear_pitch(screen, box->width, depth_bs);
       t->depth_offset = (unsigned)size;
