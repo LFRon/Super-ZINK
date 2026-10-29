@@ -2689,6 +2689,9 @@ sz_draw_flush(struct sz_context *ctx)
    if (tf) {
       VkBuffer buffers[PIPE_MAX_SO_BUFFERS];
       VkDeviceSize offsets[PIPE_MAX_SO_BUFFERS];
+      VkDeviceSize sizes[PIPE_MAX_SO_BUFFERS];
+      VkBuffer counters[PIPE_MAX_SO_BUFFERS];
+      VkDeviceSize counter_offsets[PIPE_MAX_SO_BUFFERS];
       unsigned n = 0;
 
       for (unsigned i = 0; i < ctx->num_so_targets; i++) {
@@ -2701,21 +2704,18 @@ sz_draw_flush(struct sz_context *ctx)
          buffers[n] = res->buffer;
          offsets[n] = t->buffer_offset +
                       (ctx->so_offsets[i] == UINT_MAX ? 0 : ctx->so_offsets[i]);
+         /* The sizes are collected in the same pass as the buffers: this loop
+          * skips a slot whose target is unbound, so index n here is not index i
+          * in so_targets. Reading so_targets[n] afterwards dereferences the slot
+          * that was skipped. */
+         sizes[n] = t->buffer_size;
+         counters[n] = ctx->so_counter_buffer;
+         counter_offsets[n] = n * sizeof(uint32_t);
          n++;
       }
 
       if (n > 0 && ctx->screen->vk.CmdBeginTransformFeedbackEXT &&
           sz_so_counter_ensure(ctx)) {
-         VkDeviceSize sizes[PIPE_MAX_SO_BUFFERS];
-         VkBuffer counters[PIPE_MAX_SO_BUFFERS];
-         VkDeviceSize counter_offsets[PIPE_MAX_SO_BUFFERS];
-
-         for (unsigned i = 0; i < n; i++) {
-            const struct pipe_stream_output_target *t = ctx->so_targets[i];
-            sizes[i] = t->buffer_size;
-            counters[i] = ctx->so_counter_buffer;
-            counter_offsets[i] = i * sizeof(uint32_t);
-         }
 
          /* The counters were zeroed before the render pass opened (see
           * sz_so_counter_zero): vkCmdFillBuffer is illegal inside one. */
