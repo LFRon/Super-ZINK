@@ -1026,6 +1026,32 @@ sz_create_sampler_view(struct pipe_context *pipe, struct pipe_resource *texture,
 /* Clears                                                                     */
 /* ------------------------------------------------------------------------- */
 
+/* The colour clear value a surface takes.
+ *
+ * Which member of the union is read is decided by the attachment's format, not
+ * by the C type the application handed to glClear: an integer render target
+ * takes uint32/int32 values and everything else takes floats. Sending float
+ * bits to an integer attachment (or the reverse) clears with a value that looks
+ * plausible and is wrong. */
+static VkClearValue
+sz_clear_color_value(enum pipe_format format, const union pipe_color_union *color)
+{
+   VkClearValue value;
+
+   if (util_format_is_pure_uint(format)) {
+      for (unsigned i = 0; i < 4; i++)
+         value.color.uint32[i] = color->ui[i];
+   } else if (util_format_is_pure_sint(format)) {
+      for (unsigned i = 0; i < 4; i++)
+         value.color.int32[i] = color->i[i];
+   } else {
+      for (unsigned i = 0; i < 4; i++)
+         value.color.float32[i] = color->f[i];
+   }
+
+   return value;
+}
+
 /* Clears a rectangle of one of the current framebuffer's attachments.
  *
  * vkCmdClearColorImage can only clear a whole subresource, so a scissored
@@ -1036,7 +1062,8 @@ sz_create_sampler_view(struct pipe_context *pipe, struct pipe_resource *texture,
 static bool
 sz_clear_rect(struct sz_context *ctx, unsigned attachment, bool depth_stencil,
               VkImageAspectFlags aspects, const VkClearValue *value,
-              unsigned x, unsigned y, unsigned width, unsigned height)
+              unsigned x, unsigned y, unsigned width, unsigned height,
+              unsigned first_layer, unsigned layer_count)
 {
    /* The clear belongs after everything recorded so far and before everything
     * that follows, so the queued draws have to be emitted first. */
@@ -1060,8 +1087,8 @@ sz_clear_rect(struct sz_context *ctx, unsigned attachment, bool depth_stencil,
          .offset = { (int32_t)x, (int32_t)y },
          .extent = { width, height },
       },
-      .baseArrayLayer = 0,
-      .layerCount = 1,
+      .baseArrayLayer = first_layer,
+      .layerCount = MAX2(layer_count, 1),
    };
 
    ctx->screen->vk.CmdClearAttachments(cmd, 1, &clear, 1, &rect);
@@ -1088,6 +1115,8 @@ sz_clear_render_target(struct pipe_context *pipe, struct pipe_surface *dst,
 {
    struct sz_context *ctx = sz_context(pipe);
    struct sz_resource *res = sz_resource(dst->texture);
+   const unsigned layer_count = dst->last_layer - dst->first_layer + 1;
+   const VkClearValue value = sz_clear_color_value(dst->format, color);
 
    /* Draws issued before the clear are still queued, not recorded. Recording the
     * clear first would put it in front of them, so they would paint over it --
@@ -1095,13 +1124,29 @@ sz_clear_render_target(struct pipe_context *pipe, struct pipe_surface *dst,
     * draws a marker first reads the marker back instead of the clear colour. */
    sz_draw_flush(ctx);
 
-   if (!sz_box_covers_surface(&res->base, dst->level, dstx, dsty, width, height)) {
-      const VkClearValue value = { .color = {
-         .float32 = { color->f[0], color->f[1], color->f[2], color->f[3] } } };
+   /* vkCmdClearColorImage converts the clear value using the *image's* format,
+    * but GL converts it using the attachment's, and a GL texture view may name
+    * a different format for the same image: rgba8 seen as rgb10_a2, r32f seen
+    * as r32ui, r8 seen as r8_snorm. Clearing through the render pass names the
+    * view, so the conversion is the one GL specifies. The transfer path stays
+    * for the common case, where the two formats agree. */
+   if (sz_vk_format(ctx->screen, dst->format) !=
+       sz_vk_format(ctx->screen, res->base.format)) {
       for (unsigned i = 0; i < ctx->state.framebuffer.nr_cbufs; i++) {
          if (&ctx->state.framebuffer.cbufs[i] != dst)
             continue;
-         sz_clear_rect(ctx, i, false, 0, &value, dstx, dsty, width, height);
+         sz_clear_rect(ctx, i, false, 0, &value, dstx, dsty, width, height,
+                       dst->first_layer, layer_count);
+         return;
+      }
+   }
+
+   if (!sz_box_covers_surface(&res->base, dst->level, dstx, dsty, width, height)) {
+      for (unsigned i = 0; i < ctx->state.framebuffer.nr_cbufs; i++) {
+         if (&ctx->state.framebuffer.cbufs[i] != dst)
+            continue;
+         sz_clear_rect(ctx, i, false, 0, &value, dstx, dsty, width, height,
+                       dst->first_layer, layer_count);
          return;
       }
 
@@ -1120,21 +1165,17 @@ sz_clear_render_target(struct pipe_context *pipe, struct pipe_surface *dst,
 
    sz_resource_access(ctx->screen, cmd, res, SZ_ACCESS_TRANSFER_DST);
 
-   const VkClearColorValue clear = {
-      .float32 = { color->f[0], color->f[1], color->f[2], color->f[3] },
-   };
-
    const VkImageSubresourceRange range = {
       .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
       .baseMipLevel = dst->level,
       .levelCount = 1,
       .baseArrayLayer = dst->first_layer,
-      .layerCount = dst->last_layer - dst->first_layer + 1,
+      .layerCount = layer_count,
    };
 
    ctx->screen->vk.CmdClearColorImage(cmd, res->image,
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                      &clear, 1, &range);
+                                      &value.color, 1, &range);
 }
 
 static void
@@ -1185,7 +1226,8 @@ sz_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *dst,
          return;
       }
 
-      sz_clear_rect(ctx, 0, true, aspect, &value, dstx, dsty, width, height);
+      sz_clear_rect(ctx, 0, true, aspect, &value, dstx, dsty, width, height,
+                    dst->first_layer, dst->last_layer - dst->first_layer + 1);
       return;
    }
 
@@ -1228,12 +1270,15 @@ sz_clear(struct pipe_context *pipe, unsigned buffers, uint32_t color_clear_mask,
          return;
 
       if (buffers & PIPE_CLEAR_COLOR) {
-         const VkClearValue value = { .color = {
-            .float32 = { color->f[0], color->f[1], color->f[2], color->f[3] } } };
          for (unsigned i = 0; i < fb->nr_cbufs; i++) {
             if (!fb->cbufs[i].texture)
                continue;
-            sz_clear_rect(ctx, i, false, 0, &value, x0, y0, x1 - x0, y1 - y0);
+            const VkClearValue value =
+               sz_clear_color_value(fb->cbufs[i].format, color);
+            sz_clear_rect(ctx, i, false, 0, &value, x0, y0, x1 - x0,
+                          y1 - y0, fb->cbufs[i].first_layer,
+                          fb->cbufs[i].last_layer -
+                             fb->cbufs[i].first_layer + 1);
          }
       }
 
@@ -1249,7 +1294,9 @@ sz_clear(struct pipe_context *pipe, unsigned buffers, uint32_t color_clear_mask,
          if (aspect != 0) {
             const VkClearValue value = { .depthStencil = {
                .depth = (float)depth, .stencil = stencil } };
-            sz_clear_rect(ctx, 0, true, aspect, &value, x0, y0, x1 - x0, y1 - y0);
+            sz_clear_rect(ctx, 0, true, aspect, &value, x0, y0, x1 - x0,
+                          y1 - y0, fb->zsbuf.first_layer,
+                          fb->zsbuf.last_layer - fb->zsbuf.first_layer + 1);
          }
       }
 
