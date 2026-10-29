@@ -256,6 +256,17 @@ sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
     * another format", and RADV does not derive anything else from it. */
    flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 
+   /* Custom sample locations may only be used with a depth attachment whose
+    * image says so (VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT).
+    * The pipeline asks for them to rasterise as if single-sampled when
+    * GL_MULTISAMPLE is off, and GL keeps a depth attachment bound in that case,
+    * so the flag belongs on the multisampled depth images. RADV ignores it --
+    * custom sample locations are rasteriser state there, not storage -- and a
+    * driver that honours it is one where the flag is required anyway. */
+   if (screen->caps.sample_locations && tmpl->nr_samples > 1 &&
+       (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
+      flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+
    /* 3D images are never attachments in Gallium's model, and a 1D image cannot
     * have a depth/stencil attachment in Vulkan at all -- but GL has 1D depth
     * textures, so the sampled use has to survive while the attachment use does

@@ -874,7 +874,9 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
    const bool alpha_to_coverage =
       blend_state && blend_state->alpha_to_coverage;
 
-   const VkPipelineMultisampleStateCreateInfo multisample = {
+   const bool has_depth = fb->zsbuf.texture != NULL;
+
+   VkPipelineMultisampleStateCreateInfo multisample = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
       .rasterizationSamples = samples,
       .sampleShadingEnable = sample_shading ? VK_TRUE : VK_FALSE,
@@ -889,7 +891,41 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
          blend_state && blend_state->alpha_to_one ? VK_TRUE : VK_FALSE,
    };
 
-   const bool has_depth = fb->zsbuf.texture != NULL;
+   /* GL with GL_MULTISAMPLE off rasterises a multisampled target as if it were
+    * single-sampled: coverage is decided once, at the pixel centre, and a
+    * covered pixel fills every sample with the same value. Vulkan has no
+    * "un-multisample" switch, but a sample location table whose entries all sit
+    * at the pixel centre is that picture -- a sample is covered exactly when the
+    * pixel centre is, so all samples of a pixel agree, and interpolation is at
+    * the centre either way because sample shading is off.
+    *
+    * Two conditions come with the table: the sample count has to be one the
+    * device accepts (VkPhysicalDeviceSampleLocationsPropertiesEXT), and a depth
+    * attachment is only allowed with custom locations when its image was created
+    * with VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT, which
+    * sz_image_create_info() sets on every multisampled depth image. */
+   VkSampleLocationEXT center_locations[16];
+   const bool center_coverage =
+      rast_state && !rast_state->multisample && samples > 1 &&
+      (screen->caps.sample_location_sample_counts & samples);
+   VkSampleLocationsInfoEXT center_info = {
+      .sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT,
+      .sampleLocationsPerPixel = samples,
+      .sampleLocationGridSize = { 1, 1 },
+      .sampleLocationsCount = center_coverage ? (uint32_t)samples : 0,
+      .pSampleLocations = center_coverage ? center_locations : NULL,
+   };
+   VkPipelineSampleLocationsStateCreateInfoEXT sample_locations_state = {
+      .sType =
+         VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT,
+      .sampleLocationsEnable = center_coverage ? VK_TRUE : VK_FALSE,
+      .sampleLocationsInfo = center_info,
+   };
+   if (center_coverage) {
+      for (uint32_t i = 0; i < (uint32_t)samples; i++)
+         center_locations[i] = (VkSampleLocationEXT){ 0.5f, 0.5f };
+      multisample.pNext = &sample_locations_state;
+   }
 
    /* The attachment formats belong to the pipeline: dynamic rendering has no
     * render pass object to take them from. They are computed once, here, because
@@ -1132,6 +1168,10 @@ sz_pipeline_key_from_state(struct sz_context *ctx, VkPrimitiveTopology topology,
 
    key->samples = sz_framebuffer_samples(fb);
    key->sample_mask = ctx->state.sample_mask;
+   /* No rasterizer state means the GL defaults, where GL_MULTISAMPLE is on. */
+   key->multisample = ctx->state.rasterizer
+                         ? sz_raster(ctx)->multisample
+                         : true;
    key->color_count = MIN2(fb->nr_cbufs, PIPE_MAX_COLOR_BUFS);
    for (unsigned i = 0; i < key->color_count; i++)
       key->color[i] = sz_vk_format(ctx->screen, fb->cbufs[i].format);
@@ -1151,6 +1191,7 @@ sz_pipeline_key_equal(const struct sz_pipeline_key *a,
           a->patch_vertices == b->patch_vertices &&
           a->topology == b->topology && a->samples == b->samples &&
           a->sample_mask == b->sample_mask &&
+          a->multisample == b->multisample &&
           a->gs == b->gs &&
           a->color_count == b->color_count && a->depth == b->depth &&
           a->vertex_binding_count == b->vertex_binding_count &&

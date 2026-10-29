@@ -70,6 +70,10 @@ struct sz_pipeline_key {
     * ext_framebuffer_multisample@sample-coverage saw: four rectangles drawn with
     * four different coverages, all with the first one's. */
    unsigned sample_mask;
+   /* pipe_rasterizer_state::multisample, i.e. whether GL_MULTISAMPLE is on. When
+    * it is off the target is rasterised as if it were single-sampled, which is
+    * pipeline state (a sample location table), so it belongs in the key. */
+   bool multisample;
 };
 
 struct sz_gfx_pipeline {

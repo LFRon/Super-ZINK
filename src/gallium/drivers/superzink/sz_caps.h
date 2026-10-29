@@ -149,7 +149,17 @@
     * them, and the pacing falls back to the blocking wait when it does not. */  \
    X(present_wait,                 "presentWait",                               \
      "VK_KHR_present_wait",                 SZ_CORE_NONE,                      \
-     q.present_wait.presentWait)
+     q.present_wait.presentWait)                                                \
+   /* GL rasterises as if the target were single-sampled when GL_MULTISAMPLE is  \
+    * off: coverage is decided once, at the pixel centre, and a covered pixel    \
+    * fills all of its samples. Vulkan has no switch for that, but a sample      \
+    * location table whose entries all sit at the pixel centre makes every       \
+    * sample agree on coverage, which is the same picture. No feature struct:    \
+    * what the device has to report is a property (which sample counts it        \
+    * accepts), queried in sz_caps_init. */                                      \
+   X(sample_locations,             "sampleLocations",                           \
+     "VK_EXT_sample_locations",             SZ_CORE_NONE,                      \
+     cap_sample_locations)
 
 /* Every VkPhysicalDevice*Features structure Super-ZINK ever chains, in one
  * place. Querying (sz_caps_init) and enabling (sz_device_create) both go
@@ -267,6 +277,11 @@ struct sz_caps {
    /* VkPhysicalDeviceTransformFeedbackPropertiesEXT::maxTransformFeedbackStreams.
     * One is the minimum, so zero means the extension is absent. */
    unsigned max_transform_feedback_streams;
+
+   /* VkPhysicalDeviceSampleLocationsPropertiesEXT::sampleLocationSampleCounts,
+    * i.e. which sample counts accept a sample location table. Zero when the
+    * extension is absent. */
+   VkSampleCountFlags sample_location_sample_counts;
 
    /* VK_EXT_descriptor_buffer properties. The descriptor sizes are properties
     * because the in-memory layout of a descriptor is implementation-defined:

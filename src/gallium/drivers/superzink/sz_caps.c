@@ -221,6 +221,12 @@ sz_caps_init(struct sz_caps *caps,
                                                VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME),
    };
 
+   /* VK_EXT_sample_locations has no feature struct, so it is not part of the
+    * selection above; what is needed is the property, and that is only readable
+    * once the extension is known to exist. */
+   const bool have_sample_locations =
+      sz_ext_advertised(exts, ext_count, VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+
    struct sz_vk_features q;
    sz_vk_features_prepare(&q, api);
 
@@ -250,6 +256,11 @@ sz_caps_init(struct sz_caps *caps,
     * vk.xml): advertising the extension is the whole answer. */
    const bool cap_push_descriptor =
       vk14 ? q.f14.pushDescriptor : true;
+   /* Nothing but the extension name: VK_EXT_sample_locations has no feature
+    * struct, so what the caller must check is the per-capability property, and
+    * sz_pipeline.c does that when it builds a location table. */
+   const bool cap_sample_locations = have_sample_locations;
+
    const bool cap_local_read_depth_stencil =
       vk14 && q.props14.dynamicRenderingLocalReadDepthStencilAttachments;
    const bool cap_local_read_multisampled =
@@ -276,9 +287,17 @@ sz_caps_init(struct sz_caps *caps,
          .sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT,
       };
+      /* Only chain the sample location properties when the extension is
+       * advertised: a struct for an unadvertised extension has undefined
+       * contents, and the pointer would still be followed. */
+      VkPhysicalDeviceSampleLocationsPropertiesEXT sample_loc = {
+         .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT,
+      };
       push.pNext = &multi;
       multi.pNext = &xfb;
       xfb.pNext = &desc;
+      desc.pNext = have_sample_locations ? &sample_loc : NULL;
       get_props2(pdev, &query);
       caps->max_push_descriptors = push.maxPushDescriptors;
       caps->max_multi_draw_count = multi.maxMultiDrawCount;
@@ -299,6 +318,8 @@ sz_caps_init(struct sz_caps *caps,
       caps->descriptor_size_storage_texel_buffer =
          desc.storageTexelBufferDescriptorSize;
       caps->descriptor_size_storage_buffer = desc.storageBufferDescriptorSize;
+      caps->sample_location_sample_counts =
+         have_sample_locations ? sample_loc.sampleLocationSampleCounts : 0;
    }
 
    /* ── resolve every listed capability ───────────────────────────────────── */
