@@ -4801,6 +4801,11 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->delete_ts_state = sz_delete_state;
 
    pipe->create_ms_state = sz_create_ms_state;
+
+   /* Gallium's default sample mask is "every sample". The pipeline names it, so
+    * leaving the field at zero would make the first draw -- the one recorded
+    * before any set_sample_mask arrives -- cover nothing. */
+   ctx->state.sample_mask = ~0u;
    pipe->bind_ms_state = sz_bind_ms_state;
    pipe->delete_ms_state = sz_delete_state;
 

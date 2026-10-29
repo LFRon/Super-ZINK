@@ -862,11 +862,31 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
    const bool sample_shading =
       rast_state && rast_state->force_persample_interp && samples > 1;
 
+   /* The sample mask is a pipeline property in Vulkan and a per-draw state in
+    * Gallium. Without it glSampleCoverage and util_blitter's per-sample draws
+    * (one draw per destination sample, each masked to that sample) both write
+    * every sample, so an MSAA blit ends up with whichever sample was drawn last
+    * in all of them. */
+   const VkSampleMask sample_mask = (VkSampleMask)ctx->state.sample_mask;
+
+   /* Both are GL pixel operations that turn coverage into a per-sample mask;
+    * Vulkan has the same two switches and nothing else to map them onto. */
+   const bool alpha_to_coverage =
+      blend_state && blend_state->alpha_to_coverage;
+
    const VkPipelineMultisampleStateCreateInfo multisample = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
       .rasterizationSamples = samples,
       .sampleShadingEnable = sample_shading ? VK_TRUE : VK_FALSE,
       .minSampleShading = 1.0f,
+      /* The mask and alpha-to-coverage are mutually exclusive: coverage derived
+       * from alpha replaces the mask, so naming both is invalid
+       * (VUID-VkPipelineMultisampleStateCreateInfo-pSampleMask-09427) and the
+       * fixed mask wins over the computed coverage on RADV. */
+      .pSampleMask = alpha_to_coverage ? NULL : &sample_mask,
+      .alphaToCoverageEnable = alpha_to_coverage ? VK_TRUE : VK_FALSE,
+      .alphaToOneEnable =
+         blend_state && blend_state->alpha_to_one ? VK_TRUE : VK_FALSE,
    };
 
    const bool has_depth = fb->zsbuf.texture != NULL;
@@ -1111,6 +1131,7 @@ sz_pipeline_key_from_state(struct sz_context *ctx, VkPrimitiveTopology topology,
                             &key->vertex_attribute_count);
 
    key->samples = sz_framebuffer_samples(fb);
+   key->sample_mask = ctx->state.sample_mask;
    key->color_count = MIN2(fb->nr_cbufs, PIPE_MAX_COLOR_BUFS);
    for (unsigned i = 0; i < key->color_count; i++)
       key->color[i] = sz_vk_format(ctx->screen, fb->cbufs[i].format);
@@ -1129,6 +1150,7 @@ sz_pipeline_key_equal(const struct sz_pipeline_key *a,
           a->tcs == b->tcs && a->tes == b->tes &&
           a->patch_vertices == b->patch_vertices &&
           a->topology == b->topology && a->samples == b->samples &&
+          a->sample_mask == b->sample_mask &&
           a->gs == b->gs &&
           a->color_count == b->color_count && a->depth == b->depth &&
           a->vertex_binding_count == b->vertex_binding_count &&

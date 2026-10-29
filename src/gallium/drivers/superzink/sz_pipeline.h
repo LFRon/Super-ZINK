@@ -64,6 +64,12 @@ struct sz_pipeline_key {
    uint64_t fs;
    /* VkPipelineTessellationStateCreateInfo::patchControlPoints. */
    unsigned patch_vertices;
+   /* The sample mask is per draw in Gallium and part of the multisample state in
+    * Vulkan. It has to be keyed, otherwise a glSampleCoverage() change between
+    * two draws reuses the pipeline built for the previous mask -- which is what
+    * ext_framebuffer_multisample@sample-coverage saw: four rectangles drawn with
+    * four different coverages, all with the first one's. */
+   unsigned sample_mask;
 };
 
 struct sz_gfx_pipeline {
