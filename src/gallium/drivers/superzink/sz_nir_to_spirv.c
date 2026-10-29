@@ -93,6 +93,17 @@ struct sz_dtype {
    unsigned array_len_inner;
 };
 
+/* What an image instruction needs to know about the image it names, beyond the
+ * descriptor handle: the component type the module declared it with (which
+ * every read and write has to match, because the format is Unknown), and the
+ * shape the coordinate has to have. */
+struct sz_image_info {
+   uint32_t type;
+   enum sz_base base;
+   SpvDim dim;
+   bool arrayed;
+};
+
 struct sz_translate {
    struct sz_spv_module *m;
    struct nir_shader *nir;
@@ -208,7 +219,7 @@ struct sz_translate {
     * a binding the layout has to have. */
    struct {
       unsigned index;
-      uint32_t image_type;
+      struct sz_image_info info;
       uint32_t value;
       uint32_t var;
       unsigned value_block;
@@ -1060,8 +1071,11 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
                                    ? glsl_get_length(var->type)
                                    : 1;
       const uint32_t int_type = sz_spv_type_int32(t->m);
+      /* Always an array, even for a single unit: `image2D img[1]` is indexed by
+       * the deref chain like any other array, and OpAccessChain cannot index a
+       * scalar. */
       const uint32_t array_type =
-         elements > 1 ? sz_spv_type_array(t->m, int_type, elements) : int_type;
+         sz_spv_type_array(t->m, int_type, MAX2(elements, 1));
       const uint32_t ptr_type =
          sz_spv_type_ptr(t->m, SpvStorageClassPrivate, array_type);
       const uint32_t id =
@@ -1079,8 +1093,7 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
       t->vars[t->num_vars].type = (struct sz_dtype){.base = SZ_BASE_INT,
                                                     .bits = 32, .ncomp = 1,
                                                     .array_len =
-                                                       elements > 1 ? elements
-                                                                    : 0};
+                                                       MAX2(elements, 1)};
       t->num_vars++;
       return true;
    }
@@ -2218,8 +2231,11 @@ sz_ubo_array_ptr(struct sz_translate *t, unsigned index)
    const uint32_t array_type =
       sz_spv_type_array(t->m, uint_type, SZ_MAX_CONSTBUF_WORDS);
    /* Every load below works in 32-bit words, so the stride is the scalar size
-    * rather than anything derived from the block's GLSL type. */
-   sz_spv_decorate(t->m, array_type, SpvDecorationArrayStride, 4);
+    * rather than anything derived from the block's GLSL type. The array type is
+    * shared by every block, so the decoration belongs to the first one only --
+    * decorating it again is a duplicate decoration and an invalid module. */
+   if (t->num_ubos == 0)
+      sz_spv_decorate(t->m, array_type, SpvDecorationArrayStride, 4);
 
    const uint32_t block_type = sz_spv_type_struct(t->m, &array_type, 1);
    sz_spv_decorate_bare(t->m, block_type, SpvDecorationBlock);
@@ -2669,7 +2685,7 @@ sz_def_value(struct sz_translate *t, const nir_def *def)
  */
 static uint32_t
 sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
-             uint32_t *out_image_type)
+             struct sz_image_info *info)
 {
    nir_variable *var = nir_deref_instr_get_variable((nir_deref_instr *)deref);
    if (!var || var->data.mode != nir_var_image) {
@@ -2730,10 +2746,10 @@ sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
    for (unsigned i = 0; i < t->num_images; i++) {
       if (t->images[i].index != index)
          continue;
-      *out_image_type = t->images[i].image_type;
+      *info = t->images[i].info;
       if (t->images[i].value_block != t->block_serial) {
          t->images[i].value =
-            sz_spv_load(t->m, t->images[i].image_type, t->images[i].var);
+            sz_spv_load(t->m, t->images[i].info.type, t->images[i].var);
          t->images[i].value_block = t->block_serial;
       }
       return t->images[i].value;
@@ -2760,30 +2776,103 @@ sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
       return 0;
    }
    t->images[t->num_images].index = index;
-   t->images[t->num_images].image_type = image_type;
+   t->images[t->num_images].info =
+      (struct sz_image_info){image_type, sz_base, dim,
+                             glsl_sampler_type_is_array(type)};
    t->images[t->num_images].value = value;
    t->images[t->num_images].var = id;
    t->images[t->num_images].value_block = t->block_serial;
    t->num_images++;
 
-   *out_image_type = image_type;
+   info->type = image_type;
+   info->base = sz_base;
+   info->dim = dim;
+   info->arrayed = glsl_sampler_type_is_array(type);
    return value;
+}
+
+/* The descriptor variable an image deref names.
+ *
+ * OpImageTexelPointer wants a pointer to the image, not the loaded handle every
+ * other image instruction takes, so the atomic path needs the OpVariable that
+ * sz_image_get() declared. It is found through the cached value, which is what
+ * sz_image_get() just returned. */
+static uint32_t
+sz_image_var(struct sz_translate *t, const nir_deref_instr *deref)
+{
+   struct sz_image_info info = {0};
+   const uint32_t value = sz_image_get(t, deref, &info);
+   if (value == 0)
+      return 0;
+
+   for (unsigned i = 0; i < t->num_images; i++)
+      if (t->images[i].value == value)
+         return t->images[i].var;
+   return 0;
 }
 
 /* The integer coordinate vector an image operation addresses. GL hands NIR
  * floats or ints depending on the op, and Vulkan accepts only integers. */
 static uint32_t
-sz_image_coord(struct sz_translate *t, const nir_def *def)
+sz_image_coord(struct sz_translate *t, const nir_def *def,
+               const struct sz_image_info *info)
 {
    struct sz_dtype type = t->def_types[def->index];
-   const struct sz_dtype want = {SZ_BASE_INT, 32, type.ncomp ? type.ncomp : 1, 0};
-   const uint32_t value = sz_def_value(t, def);
+   const unsigned have = type.ncomp ? type.ncomp : 1;
+   const struct sz_dtype want = {SZ_BASE_INT, 32, have, 0};
+   uint32_t value = sz_def_value(t, def);
    if (value == 0)
       return 0;
    const uint32_t cast = sz_bitcast_to(t, value, &type, &want);
    if (cast)
-      return cast;
-   return value;
+      value = cast;
+
+   /* Vulkan fixes the coordinate's length from the image: one component for a
+    * 1D or buffer image, two for 2D, three for 3D and cube, plus one for the
+    * array layer. NIR hands over whatever GLSL built, which for a 1D image is
+    * an int and for a 2D one an ivec2, but an application may index an image
+    * with a wider vector than the image has dimensions. Padding and truncating
+    * here is what keeps the module valid. */
+   unsigned need;
+   switch (info->dim) {
+   case SpvDim1D:
+   case SpvDimBuffer:
+      need = 1;
+      break;
+   case SpvDim2D:
+   case SpvDimRect:
+   case SpvDimSubpassData:
+      need = 2;
+      break;
+   case SpvDimCube:
+      /* A cube image already takes three components -- the third is the face
+       * of a plain cube image and the layer of a cube array -- so the array
+       * layer does not add one. */
+      need = 3;
+      break;
+   default:
+      need = 3;
+      break;
+   }
+   if (info->arrayed && info->dim != SpvDimCube)
+      need++;
+
+   const uint32_t int32 = sz_spv_type_int32(t->m);
+   if (have == need)
+      return value;
+
+   uint32_t comps[4];
+   for (unsigned i = 0; i < need; i++) {
+      if (i < have)
+         comps[i] = sz_spv_composite_extract(t->m, int32, value, &i, 1);
+      else {
+         comps[i] = sz_spv_const_int32(t->m, 0);
+      }
+   }
+   if (need == 1)
+      return comps[0];
+   const uint32_t vec = sz_spv_type_vec(t->m, int32, need);
+   return sz_spv_composite_construct(t->m, vec, comps, need);
 }
 
 
@@ -2803,6 +2892,16 @@ sz_memory_semantics(struct sz_translate *t)
 {
    /* AcquireRelease | ImageMemory | UniformMemory | AtomicCounterMemory */
    return sz_spv_const_int32(t->m, 0x8u | 0x800u | 0x40u | 0x400u);
+}
+
+/* The mask OpAtomicCompareExchange wants for the failing case. It may say what
+ * the exchange acquires but nothing about what it releases, and the successful
+ * mask above says AcquireRelease, which is exactly that. */
+static uint32_t
+sz_memory_semantics_unequal(struct sz_translate *t)
+{
+   /* Acquire | ImageMemory | UniformMemory | AtomicCounterMemory */
+   return sz_spv_const_int32(t->m, 0x2u | 0x800u | 0x40u | 0x400u);
 }
 
 /* imageAtomic*, mapped onto OpImageTexelAtomic*. Those return the previous
@@ -3616,7 +3715,8 @@ sz_load_mask_element(struct sz_translate *t, uint32_t var, uint32_t array_type,
                      uint32_t int_type)
 {
    const uint32_t arr = sz_spv_load(t->m, array_type, var);
-   const uint32_t index = sz_spv_const_int32(t->m, 0);
+   /* OpCompositeExtract indexes with literals, not with ids. */
+   const unsigned index = 0;
    return sz_spv_composite_extract(t->m, int_type, arr, &index, 1);
 }
 
@@ -3870,11 +3970,9 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
          return false;
       const uint32_t vec2 = sz_spv_type_vec(t->m, sz_spv_type_float32(t->m), 2);
       uint32_t comps[2];
-      for (unsigned i = 0; i < 2; i++) {
-         const uint32_t index = sz_spv_const_int32(t->m, i);
+      for (unsigned i = 0; i < 2; i++)
          comps[i] = sz_spv_composite_extract(t->m, sz_spv_type_float32(t->m),
-                                             vec3, &index, 1);
-      }
+                                             vec3, &i, 1);
       t->defs_id[intrin->def.index] =
          sz_spv_composite_construct(t->m, vec2, comps, 2);
       t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_FLOAT, 32, 2, 0};
@@ -3912,17 +4010,21 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       /* imageLoad. OpImageRead takes the image and an integer coordinate and
        * returns the texel as the component type the module declared. */
       nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
-      uint32_t image_type = 0;
-      const uint32_t image = deref ? sz_image_get(t, deref, &image_type) : 0;
+      struct sz_image_info info = {0};
+      const uint32_t image = deref ? sz_image_get(t, deref, &info) : 0;
       if (image == 0)
          return false;
 
-      const uint32_t coord = sz_image_coord(t, intrin->src[1].ssa);
+      const uint32_t coord = sz_image_coord(t, intrin->src[1].ssa, &info);
       if (coord == 0)
          return false;
 
-      struct sz_dtype type = {0};
-      sz_guess_def_type(t, &intrin->def, &type);
+      /* OpImageRead's result type has to be the image's sampled type: the
+       * format is Unknown, so there is nothing to convert from or to. The NIR
+       * def carries only a component count, and its base type is inferred from
+       * the uses it has -- which for a value that is immediately bitcast is the
+       * wrong one. The variable's declared type is the authority. */
+      struct sz_dtype type = {info.base, 32, 4, 0};
       const uint32_t result_type = sz_dtype_type(t, &type);
 
       uint32_t ops[2];
@@ -3937,18 +4039,27 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
    case nir_intrinsic_image_deref_store: {
       /* imageStore. */
       nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
-      uint32_t image_type = 0;
-      const uint32_t image = deref ? sz_image_get(t, deref, &image_type) : 0;
+      struct sz_image_info info = {0};
+      const uint32_t image = deref ? sz_image_get(t, deref, &info) : 0;
       if (image == 0)
          return false;
 
-      const uint32_t coord = sz_image_coord(t, intrin->src[1].ssa);
+      const uint32_t coord = sz_image_coord(t, intrin->src[1].ssa, &info);
       if (coord == 0)
          return false;
 
-      const uint32_t value = sz_def_value(t, intrin->src[3].ssa);
-      if (value == 0)
+      const uint32_t stored = sz_def_value(t, intrin->src[3].ssa);
+      if (stored == 0)
          return false;
+
+      /* OpImageWrite's texel has to be the image's sampled type, for the same
+       * reason OpImageRead's result does: the format is Unknown, so the module
+       * is the only place the component type is stated. */
+      const struct sz_dtype have = t->def_types[intrin->src[3].ssa->index];
+      const struct sz_dtype want = {info.base, 32,
+                                    have.ncomp ? have.ncomp : 4, 0};
+      const uint32_t cast = sz_bitcast_to(t, stored, &have, &want);
+      const uint32_t value = cast ? cast : stored;
 
       const uint32_t ops[] = {image, coord, value};
       /* OpImageWrite has no result id and no result type: the plain
@@ -3963,8 +4074,8 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
        * OpImageQuerySize (through the Lod variant for levels), and GL wants an
        * ivec whose component count matches the image's dimensionality. */
       nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
-      uint32_t image_type = 0;
-      const uint32_t image = deref ? sz_image_get(t, deref, &image_type) : 0;
+      struct sz_image_info info = {0};
+      const uint32_t image = deref ? sz_image_get(t, deref, &info) : 0;
       if (image == 0)
          return false;
 
@@ -3991,17 +4102,18 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
    case nir_intrinsic_image_deref_atomic:
    case nir_intrinsic_image_deref_atomic_swap: {
       nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
-      uint32_t image_type = 0;
-      const uint32_t image = deref ? sz_image_get(t, deref, &image_type) : 0;
+      struct sz_image_info info = {0};
+      const uint32_t image = deref ? sz_image_get(t, deref, &info) : 0;
       if (image == 0)
          return false;
 
-      const uint32_t coord = sz_image_coord(t, intrin->src[1].ssa);
+      const uint32_t coord = sz_image_coord(t, intrin->src[1].ssa, &info);
       if (coord == 0)
          return false;
 
-      struct sz_dtype type = {0};
-      sz_guess_def_type(t, &intrin->def, &type);
+      /* An image atomic is defined on the image's own component type; the
+       * value it returns is that type too, whatever the NIR def was guessed as. */
+      struct sz_dtype type = {info.base, 32, 1, 0};
       const uint32_t scalar = sz_scalar_type(t, type.base, type.bits);
       const uint32_t result_type = sz_dtype_type(t, &type);
 
@@ -4014,14 +4126,23 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
          return false;
       }
 
-      /* OpImageTexelPointer needs the Image capability and yields a pointer in
-       * the Image storage class; the third operand is the sample index, which a
-       * storage image does not have. */
-      sz_spv_capability(t->m, SpvCapabilityImageBasic);
+      /* OpImageTexelPointer yields a pointer in the Image storage class; the
+       * third operand is the sample index, which a storage image does not have.
+       *
+       * It asks for no capability here. The grammar names ImageBasic, but that
+       * one is a Kernel capability: declaring it in a Shader module makes
+       * spirv-val apply the Kernel rules to the whole module, starting with
+       * "OpTypeInt signedness must be 0 when Kernel capability is used", and
+       * RADV's parser trusts the module enough to walk off the end of it. */
+
+      const uint32_t image_ptr = sz_image_var(t, deref);
+      if (image_ptr == 0)
+         return false;
+
       const uint32_t ptr_type =
          sz_spv_type_ptr(t->m, SpvStorageClassImage, scalar);
       const uint32_t sample = sz_spv_const_int32(t->m, 0);
-      const uint32_t texel_ops[] = {image, coord, sample};
+      const uint32_t texel_ops[] = {image_ptr, coord, sample};
       const uint32_t ptr =
          sz_spv_alu(t->m, SpvOpImageTexelPointer, ptr_type, texel_ops, 3);
 
@@ -4045,9 +4166,9 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
          if (compare == 0)
             return false;
          /* CompareExchange takes two semantics masks: on success and on
-          * failure. GL asks for the same ordering either way. */
+          * failure. The failing one may not release. */
          ops[n++] = sz_memory_semantics(t);
-         ops[n++] = sz_memory_semantics(t);
+         ops[n++] = sz_memory_semantics_unequal(t);
          ops[n++] = value;
          ops[n++] = compare;
       } else {

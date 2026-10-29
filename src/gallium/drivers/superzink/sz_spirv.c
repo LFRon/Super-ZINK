@@ -391,7 +391,8 @@ sz_spv_type_image(struct sz_spv_module *m, uint32_t sampled_type, SpvDim dim,
       break;
    case SpvDimCube:
       if (arrayed)
-         sz_spv_capability(m, SpvCapabilitySampledCubeArray);
+         sz_spv_capability(m, is_sampled ? SpvCapabilitySampledCubeArray
+                                         : SpvCapabilityImageCubeArray);
       break;
    case SpvDimRect:
       sz_spv_capability(m, SpvCapabilitySampledRect);
@@ -402,9 +403,11 @@ sz_spv_type_image(struct sz_spv_module *m, uint32_t sampled_type, SpvDim dim,
    default:
       break;
    }
-   if (ms && arrayed)
+   /* A multisampled storage image is its own capability; there is no
+    * per-stage array-indexing capability to name for it. */
+   if (ms)
       sz_spv_capability(m, is_sampled ? SpvCapabilitySampledImageArrayDynamicIndexing
-                                      : SpvCapabilityImageMSArray);
+                                      : SpvCapabilityStorageImageMultisample);
 
    /* Every texture in this driver is a sampled texture with an ordinary GL
     * format, so the format operand is Unknown: it only matters for storage
