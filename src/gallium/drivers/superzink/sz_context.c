@@ -1272,6 +1272,12 @@ sz_resource_copy_region(struct pipe_context *pipe, struct pipe_resource *dst,
    struct sz_resource *sdst = sz_resource(dst);
    struct sz_resource *ssrc = sz_resource(src);
 
+   /* Draws issued before the copy are still queued, not recorded. Recording the
+    * copy first would put it in front of them in the command buffer, so those
+    * draws would read the destination before the copy wrote it -- the same
+    * ordering mistake the upload path had. */
+   sz_draw_flush(ctx);
+
    VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
       return;
@@ -1284,9 +1290,17 @@ sz_resource_copy_region(struct pipe_context *pipe, struct pipe_resource *dst,
    };
 
    if (sdst->buffer != VK_NULL_HANDLE && ssrc->buffer != VK_NULL_HANDLE) {
+      sz_resource_access(ctx->screen, cmd, ssrc, SZ_ACCESS_TRANSFER_SRC);
+      sz_resource_access(ctx->screen, cmd, sdst, SZ_ACCESS_TRANSFER_DST);
+
+      /* VkBufferCopy offsets are relative to the VkBuffer, which was already
+       * bound at sz_bo_offset() when it was created. Adding the suballocation
+       * offset again moves the copy by however far into the shared block the
+       * buffer happens to sit -- glCopyBufferSubData then writes someone else's
+       * bytes and the destination keeps whatever it had. */
       const VkBufferCopy region = {
-         .srcOffset = sz_bo_offset(ssrc->bo) + src_box->x,
-         .dstOffset = sz_bo_offset(sdst->bo) + dstx,
+         .srcOffset = src_box->x,
+         .dstOffset = dstx,
          .size = src_box->width,
       };
       if (region.size)
