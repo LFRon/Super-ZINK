@@ -1018,6 +1018,12 @@ sz_clear_render_target(struct pipe_context *pipe, struct pipe_surface *dst,
    struct sz_context *ctx = sz_context(pipe);
    struct sz_resource *res = sz_resource(dst->texture);
 
+   /* Draws issued before the clear are still queued, not recorded. Recording the
+    * clear first would put it in front of them, so they would paint over it --
+    * the clear would appear to have done nothing, and a fast-clear test that
+    * draws a marker first reads the marker back instead of the clear colour. */
+   sz_draw_flush(ctx);
+
    if (!sz_box_covers_surface(&res->base, dst->level, dstx, dsty, width, height)) {
       const VkClearValue value = { .color = {
          .float32 = { color->f[0], color->f[1], color->f[2], color->f[3] } } };
@@ -1068,6 +1074,9 @@ sz_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *dst,
 {
    struct sz_context *ctx = sz_context(pipe);
    struct sz_resource *res = sz_resource(dst->texture);
+
+   /* Same ordering rule as the colour clear: the queued draws come first. */
+   sz_draw_flush(ctx);
 
    const struct util_format_description *desc =
       util_format_description(res->base.format);
