@@ -11,6 +11,7 @@
 #include "util/list.h"
 #include "util/log.h"
 #include "util/macros.h"
+#include "util/u_math.h"
 #include "util/u_memory.h"
 
 #include <inttypes.h>
@@ -27,9 +28,12 @@ sz_align_up(uint64_t value, uint64_t alignment)
 /* Requests below this size get a full block, so a frame's worth of small
  * vertex/uniform buffers lands in one VkDeviceMemory instead of sixty. */
 #define SZ_BLOCK_MIN_SIZE (16ull * 1024 * 1024)
-/* Cap on how much a single block may waste: a 17 MiB request must not pull in a
- * 32 MiB block when a 17 MiB one would do. */
-#define SZ_BLOCK_SLACK 4
+/* How much larger than the request a block may be. Rounding a request up to the
+ * next power of two already bounds the waste at that, so this is only a floor:
+ * a request below SZ_BLOCK_MIN_SIZE still gets the minimum block, because the
+ * point of a block is to serve a frame's worth of small allocations from one
+ * VkDeviceMemory. */
+#define SZ_BLOCK_SLACK 2
 
 #define SZ_MAX_RANGES 4096
 
@@ -183,9 +187,18 @@ sz_block_destroy(struct sz_screen *screen, struct sz_mem_block *block)
 static uint64_t
 sz_block_size_for(uint64_t size)
 {
-   uint64_t block = SZ_BLOCK_MIN_SIZE;
-   while (block < size * SZ_BLOCK_SLACK && block < (1ull << 32))
-      block <<= 1;
+   /* Round the request up to a power of two and no further.
+    *
+    * This used to start at the minimum block and double until the block was
+    * four times the request, which turned a 17 MiB staging buffer into a
+    * 128 MiB allocation -- the opposite of what SZ_BLOCK_SLACK was documented
+    * to mean. On a desktop GPU a handful of those exhausts device-local
+    * memory, and running out of VRAM on a compositor does not fail the
+    * allocation politely, it hangs the display.
+    *
+    * A power of two keeps the range allocator's splitting cheap, and it can
+    * never be more than twice the request. */
+   const uint64_t block = MAX2(util_next_power_of_two64(size), SZ_BLOCK_MIN_SIZE);
    return MAX2(block, sz_align_up(size, 65536));
 }
 
