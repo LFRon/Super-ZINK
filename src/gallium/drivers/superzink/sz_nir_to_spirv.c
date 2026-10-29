@@ -1071,6 +1071,11 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
       t->vars[t->num_vars].id = id;
       t->vars[t->num_vars].pointee = array_type;
       t->vars[t->num_vars].storage = SpvStorageClassPrivate;
+      /* Not a member of any gl_PerVertex block. The field is zero-initialised
+       * with the rest of `t`, and zero is a valid block index, so leaving it
+       * alone makes the placeholder look like block 0 member 0 -- an access
+       * chain on the never-created block 0, whose variable id is 0. */
+      t->vars[t->num_vars].pv_block = -1;
       t->vars[t->num_vars].type = (struct sz_dtype){.base = SZ_BASE_INT,
                                                     .bits = 32, .ncomp = 1,
                                                     .array_len =

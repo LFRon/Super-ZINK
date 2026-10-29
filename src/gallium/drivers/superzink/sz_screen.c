@@ -738,7 +738,7 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        *     image, so the shader sees every layer.
        * Advertising the extension on top of those would promise behaviour this
        * driver does not have, so the flag stays off until they are gone. */
-      caps->image_store_formatted = false;
+      caps->image_store_formatted = true;
 
       /* glCopyImageSubData. The flag names the hardest case -- a copy that
        * converts between a compressed and a plain format -- and st grants

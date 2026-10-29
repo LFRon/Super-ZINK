@@ -1818,6 +1818,12 @@ sz_set_shader_images(struct pipe_context *pipe, mesa_shader_stage shader,
       if (!copy)
          continue;
       *copy = images[i];
+      /* pipe_resource_reference() is a no-op when the destination already names
+       * the source, so the copy taken above would leave the view pointing at a
+       * resource it does not own. Clearing the field first is what makes the
+       * reference real; without it the texture can be freed while the image
+       * unit still names it. */
+      copy->resource = NULL;
       pipe_resource_reference(&copy->resource, images[i].resource);
       *dst = copy;
    }
