@@ -124,6 +124,13 @@
    X(transform_feedback,           "transformFeedback",                          \
      "VK_EXT_transform_feedback",           SZ_CORE_NONE,                      \
      q.transform_feedback.transformFeedback)                                    \
+   /* GL lets a sampler name any border colour; Vulkan without this extension    \
+    * has three. Every wrap mode that reads a border in a filtered fetch is       \
+    * affected, which is what texwrap's bordercolor cases test. */               \
+   X(custom_border_color,          "customBorderColor",                          \
+     "VK_EXT_custom_border_color",          SZ_CORE_NONE,                      \
+     q.custom_border_color.customBorderColors &&                               \
+        q.custom_border_color.customBorderColorWithoutFormat)                  \
    /* Without this, Vulkan forbids primitive restart on the five list topologies   \
     * (VUID-VkPipelineInputAssemblyStateCreateInfo-topology-06252), while GL        \
     * applies glPrimitiveRestartIndex to them like any other topology. */          \
@@ -176,6 +183,7 @@ struct sz_vk_features {
    VkPhysicalDeviceMultiDrawFeaturesEXT multi_draw;
    VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart;
    VkPhysicalDeviceTransformFeedbackFeaturesEXT transform_feedback;
+   VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_color;
 
    /* Not a feature: VkPhysicalDeviceVulkan14Properties carries the two
     * local-read attachment bits, and vk.xml gives them no extension-side
@@ -200,6 +208,7 @@ struct sz_vk_feature_selection {
    bool multi_draw;
    bool list_restart;
    bool transform_feedback;
+   bool custom_border_color;
 };
 
 void sz_vk_features_prepare(struct sz_vk_features *f, uint32_t api_version);

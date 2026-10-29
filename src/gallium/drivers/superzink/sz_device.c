@@ -232,6 +232,7 @@ sz_feature_selection(const struct sz_screen *screen)
       .multi_draw = caps->multi_draw,
       .list_restart = caps->list_restart,
       .transform_feedback = caps->transform_feedback,
+      .custom_border_color = caps->custom_border_color,
    };
 }
 

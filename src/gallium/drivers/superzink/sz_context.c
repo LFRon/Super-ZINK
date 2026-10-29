@@ -500,13 +500,20 @@ sz_address_mode(enum pipe_tex_wrap wrap)
    return VK_SAMPLER_ADDRESS_MODE_REPEAT;
 }
 
-/* Vulkan predefines three border colours unless VK_EXT_custom_border_color is
- * enabled. Gallium passes the colour as four floats, so the three legal values
- * are recognised by value and anything else falls back to transparent black with
- * a warning -- a wrong border colour is visible, a silently unsupported one is
- * worse. */
+/* The border colour a sampler reads with.
+ *
+ * Vulkan predefines three colours, and VK_EXT_custom_border_color adds an
+ * arbitrary fourth. The three are still worth recognising by value even when the
+ * extension is available: a predefined colour needs no pNext on the sampler and
+ * no per-sampler state in the driver, which matters because samplers are created
+ * for every state change of every texture unit.
+ *
+ * When the extension is missing, an unusual colour falls back to transparent
+ * black with a warning. A wrong border colour is visible on screen; silently
+ * pretending the sampler was honoured is worse. */
 static VkBorderColor
-sz_border_color(const union pipe_color_union *color)
+sz_border_color(struct sz_screen *screen, const union pipe_color_union *color,
+                VkSamplerCustomBorderColorCreateInfoEXT *custom)
 {
    const float *c = color->f;
    const bool zero_rgb = c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f;
@@ -519,9 +526,22 @@ sz_border_color(const union pipe_color_union *color)
    if (one_rgb && c[3] == 1.0f)
       return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
 
-   sz_warn_once("custom border colours are not supported; using "
-                "transparent black");
-   return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+   if (!screen->caps.custom_border_color) {
+      sz_warn_once("custom border colours are not supported; using "
+                   "transparent black");
+      return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+   }
+
+   *custom = (VkSamplerCustomBorderColorCreateInfoEXT) {
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT,
+      .customBorderColor.float32 = { c[0], c[1], c[2], c[3] },
+      /* VK_FORMAT_UNDEFINED needs customBorderColorWithoutFormat, which the
+       * capability already requires; without it the colour has to be given in
+       * the format's own encoding, which the caller of a sampler does not
+       * know. */
+      .format = VK_FORMAT_UNDEFINED,
+   };
+   return VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
 }
 
 static VkSampler
@@ -552,6 +572,14 @@ sz_sampler_create(struct sz_screen *screen,
       sz_warn_once("a shadow sampler with unnormalised coordinates is not "
                    "implementable in Vulkan");
 
+   /* The border colour has to be resolved before the create info is built: the
+    * pNext that carries a custom colour depends on which VkBorderColor came
+    * back, and the two cannot be evaluated in the same initialiser list because
+    * C does not say in which order its expressions run. */
+   VkSamplerCustomBorderColorCreateInfoEXT custom_border = { 0 };
+   const VkBorderColor border_color =
+      sz_border_color(screen, &templ->border_color, &custom_border);
+
    const VkSamplerCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
       .magFilter = sz_tex_filter(templ->mag_img_filter),
@@ -574,8 +602,9 @@ sz_sampler_create(struct sz_screen *screen,
                            : VK_COMPARE_OP_NEVER,
       .minLod = unnormalized ? 0.0f : templ->min_lod,
       .maxLod = unnormalized ? 0.0f : templ->max_lod,
-      .borderColor = sz_border_color(&templ->border_color),
       .unnormalizedCoordinates = unnormalized,
+      .borderColor = border_color,
+      .pNext = custom_border.sType != 0 ? &custom_border : NULL,
    };
 
    VkSampler sampler = VK_NULL_HANDLE;

@@ -84,6 +84,8 @@ sz_vk_features_prepare(struct sz_vk_features *f, uint32_t api_version)
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT;
    f->transform_feedback.sType =
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT;
+   f->custom_border_color.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT;
 
    (void)api_version;
 }
@@ -137,6 +139,8 @@ sz_vk_features_link(struct sz_vk_features *f, uint32_t api_version,
       sz_chain(&head, &tail, &f->list_restart);
    if (sel->transform_feedback)
       sz_chain(&head, &tail, &f->transform_feedback);
+   if (sel->custom_border_color)
+      sz_chain(&head, &tail, &f->custom_border_color);
 
    features2->pNext = head;
 }
@@ -210,6 +214,8 @@ sz_caps_init(struct sz_caps *caps,
                                       VK_EXT_MULTI_DRAW_EXTENSION_NAME),
       .transform_feedback = sz_ext_advertised(exts, ext_count,
                                               VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME),
+      .custom_border_color = sz_ext_advertised(exts, ext_count,
+                                               VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME),
    };
 
    struct sz_vk_features q;
