@@ -273,6 +273,7 @@ sz_gate_features(const struct sz_screen *screen, struct sz_vk_features *features
    SZ_CORE_FEATURES(SZ_GATE_CORE)
 #undef SZ_GATE_CORE
 
+   features->f11.shaderDrawParameters &= caps->shader_draw_parameters;
    features->f12.timelineSemaphore &= caps->timeline_semaphore;
    features->f12.uniformBufferStandardLayout &=
       caps->uniform_buffer_standard_layout;
@@ -639,6 +640,7 @@ sz_device_init(struct sz_screen *screen)
    sz_query_features(screen, &features, &chained);
    sz_gate_features(screen, &features);
    screen->have_shader_clip_distance = features.core.shaderClipDistance;
+   screen->have_shader_draw_parameters = features.f11.shaderDrawParameters;
    screen->have_shader_cull_distance = features.core.shaderCullDistance;
    /* `chained.pNext` now points at members of `features`, which is still in
     * scope, so it can be handed straight to vkCreateDevice. */

@@ -739,6 +739,7 @@ sz_create_shader_state(struct pipe_context *pipe,
    const struct sz_translate_options opts = {
       .alias_1d_shadow = screen->need_2d_zs,
       .clip_distance = screen->have_shader_clip_distance,
+      .base_instance = screen->have_shader_draw_parameters,
       .cull_distance = screen->have_shader_cull_distance,
    };
 

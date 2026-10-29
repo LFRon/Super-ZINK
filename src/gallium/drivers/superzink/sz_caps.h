@@ -163,6 +163,7 @@ struct sz_vk_features {
    /* Not chained: VkPhysicalDeviceFeatures2 carries this one directly. */
    VkPhysicalDeviceFeatures core;
 
+   VkPhysicalDeviceVulkan11Features f11;
    VkPhysicalDeviceVulkan12Features f12;
    VkPhysicalDeviceVulkan13Features f13;
    VkPhysicalDeviceVulkan14Features f14;
@@ -279,6 +280,11 @@ struct sz_caps {
 
    uint32_t instance_api_version;
    uint32_t device_api_version;
+
+   /* VkPhysicalDeviceVulkan11Features::shaderDrawParameters, i.e. whether the
+    * BaseVertex and BaseInstance builtins can be read at all. Everything that
+    * needs them is gated on this. */
+   bool shader_draw_parameters;
 
    /* True when the device is genuinely 1.4+, i.e. at least one capability was
     * resolved from core instead of from an extension. */

@@ -189,6 +189,9 @@ struct sz_translate_options {
     * them the ClipDistance / CullDistance builtins do not exist. */
    bool clip_distance;
    bool cull_distance;
+   /* VkPhysicalDeviceVulkan11Features::shaderDrawParameters: the BaseInstance
+    * builtin exists, so gl_InstanceID can subtract it. */
+   bool base_instance;
 };
 
 bool sz_nir_to_spirv(struct nir_shader *nir,

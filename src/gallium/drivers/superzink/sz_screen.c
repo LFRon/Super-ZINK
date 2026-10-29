@@ -602,8 +602,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * version bootstrap -- st_extensions grants ARB_shader_precision on
        * `GLSLVersion >= 410`, and GLSLVersion is clamped to the version the
        * context already reached, so 4.1 is unreachable while this says 400. */
-      caps->glsl_feature_level = 410;
-      caps->glsl_feature_level_compatibility = 410;
+      caps->glsl_feature_level = 420;
+      caps->glsl_feature_level_compatibility = 420;
       caps->max_texture_2d_size = 16384;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
@@ -663,8 +663,9 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
             (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
 
       /* gl_BaseVertex and gl_BaseInstance: both are BaseVertex/BaseInstance
-       * builtins, and the firstInstance / vertexOffset a draw already passes. */
-      caps->draw_parameters = true;
+       * builtins, which need VkPhysicalDeviceVulkan11Features::
+       * shaderDrawParameters to be readable at all. */
+      caps->draw_parameters = screen->caps.shader_draw_parameters;
 
       /* glTextureBarrier: sz_texture_barrier() flushes the batch and emits the
        * colour-write-to-sampled-read dependency GL's rule requires and Vulkan

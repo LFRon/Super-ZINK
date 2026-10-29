@@ -54,6 +54,7 @@ sz_vk_features_prepare(struct sz_vk_features *f, uint32_t api_version)
 {
    memset(f, 0, sizeof(*f));
 
+   f->f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
    f->f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
    f->f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
    f->f14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
@@ -103,8 +104,10 @@ sz_vk_features_link(struct sz_vk_features *f, uint32_t api_version,
    /* Core structs only exist on devices that know them; chaining a 1.4 struct
     * into a 1.3 driver makes vkGetPhysicalDeviceFeatures2 return
     * VK_ERROR_FEATURE_NOT_PRESENT on some drivers. */
-   if (sz_api_at_least(api_version, VK_API_VERSION_1_2))
+   if (sz_api_at_least(api_version, VK_API_VERSION_1_2)) {
+      sz_chain(&head, &tail, &f->f11);
       sz_chain(&head, &tail, &f->f12);
+   }
    if (sz_api_at_least(api_version, VK_API_VERSION_1_3))
       sz_chain(&head, &tail, &f->f13);
    if (sz_api_at_least(api_version, VK_API_VERSION_1_4))
@@ -233,6 +236,12 @@ sz_caps_init(struct sz_caps *caps,
    /* ── promoted capabilities: pick core or extension ─────────────────────── */
    const bool vk14 = sz_api_at_least(api, VK_API_VERSION_1_4);
 
+   /* Vulkan 1.2 promoted VK_KHR_shader_draw_parameters and made the feature
+    * mandatory, so a 1.2+ device always has it; the query is what makes that a
+    * measurement rather than an assumption. */
+   const bool cap_shader_draw_parameters =
+      sz_api_at_least(api, VK_API_VERSION_1_2) && q.f11.shaderDrawParameters;
+
    const bool cap_dynamic_rendering_local_read =
       vk14 ? q.f14.dynamicRenderingLocalRead : q.local_read.dynamicRenderingLocalRead;
    const bool cap_host_image_copy =
@@ -298,6 +307,7 @@ sz_caps_init(struct sz_caps *caps,
 #undef SZ_CAP_RESOLVE
 
    caps->core_features = q.core;
+   caps->shader_draw_parameters = cap_shader_draw_parameters;
    caps->uses_vk14_core = vk14;
 
    /* Extension-only capabilities. The dependency is folded in rather than left

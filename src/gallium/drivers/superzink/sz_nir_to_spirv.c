@@ -122,6 +122,8 @@ struct sz_translate {
    /* VkPhysicalDeviceFeatures::shaderClipDistance / shaderCullDistance. */
    bool clip_distance;
    bool cull_distance;
+   /* shaderDrawParameters is enabled, so BaseInstance is readable. */
+   bool base_instance;
 
    /* Indexed by nir_def::index. */
    struct sz_dtype *def_types;
@@ -3996,13 +3998,26 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
    }
    case nir_intrinsic_load_vertex_id:
    case nir_intrinsic_load_instance_id: {
-      const SpvBuiltIn builtin = intrin->intrinsic == nir_intrinsic_load_vertex_id
-                                    ? SpvBuiltInVertexIndex
-                                    : SpvBuiltInInstanceIndex;
-      const uint32_t value = sz_load_builtin_int(t, builtin);
+      const bool instance = intrin->intrinsic == nir_intrinsic_load_instance_id;
+      const uint32_t value =
+         sz_load_builtin_int(t, instance ? SpvBuiltInInstanceIndex
+                                         : SpvBuiltInVertexIndex);
       if (value == 0)
          return false;
-      t->defs_id[intrin->def.index] = value;
+
+      /* GL's gl_InstanceID is 0-based and does not count the base instance;
+       * Vulkan's InstanceIndex is exactly base instance + gl_InstanceID. */
+      uint32_t id = value;
+      if (instance && t->base_instance) {
+         const uint32_t base = sz_load_builtin_int(t, SpvBuiltInBaseInstance);
+         if (base != 0) {
+            const uint32_t ops[] = {value, base};
+            id = sz_spv_alu(t->m, SpvOpISub,
+                            sz_spv_type_int32(t->m), ops, 2);
+         }
+      }
+
+      t->defs_id[intrin->def.index] = id;
       t->def_types[intrin->def.index] = (struct sz_dtype){ SZ_BASE_INT, 32, 1 };
       return true;
    }
@@ -4948,6 +4963,7 @@ sz_nir_to_spirv(struct nir_shader *nir,
       .alias_1d_shadow = opts->alias_1d_shadow,
       .clip_distance = opts->clip_distance,
       .cull_distance = opts->cull_distance,
+      .base_instance = opts->base_instance,
       .error = error,
    };
 

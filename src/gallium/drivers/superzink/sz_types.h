@@ -377,6 +377,9 @@ struct sz_screen {
     * them. Taken from the feature snapshot after gating, so this is what the
     * device was created with rather than what it advertised. */
    bool have_shader_clip_distance;
+   /* Whether BaseVertex/BaseInstance can be read, i.e. whether gl_InstanceID can
+    * be turned into the 0-based index GL specifies. */
+   bool have_shader_draw_parameters;
    bool have_shader_cull_distance;
 
    /* The graphics queue family reports a non-zero timestampValidBits, so
