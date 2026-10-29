@@ -568,6 +568,22 @@ sz_sampler_create(struct sz_screen *screen,
    const bool unnormalized =
       templ->unnormalized_coords && !compare;
 
+   /* GL only uses the level-of-detail machinery when the minification filter
+    * asks for it. A NEAREST or LINEAR minification filter always samples the
+    * base level, and TEXTURE_MIN_LOD/TEXTURE_MAX_LOD/TEXTURE_LOD_BIAS are only
+    * consulted by the mipmapped filters -- so with a non-mipmap filter the bias
+    * has no effect at all, even when the sampler carries one and the view has
+    * more than one level.
+    *
+    * Vulkan has no such coupling: it always computes a LOD and clamps it to
+    * [minLod, maxLod], then applies the bias. Passing GL's parameters through
+    * unchanged therefore selects a different level than GL requires as soon as
+    * a bias or a non-zero max LOD is present, which is what piglit's
+    * glsl-1.30 tex-miplevel-selection reports: "Expected level: 0, Observed
+    * level: 1" for every bias above zero with mipfilter: no. */
+   const bool mipmapped = !unnormalized &&
+                          templ->min_mip_filter != PIPE_TEX_MIPFILTER_NONE;
+
    if (templ->unnormalized_coords && compare)
       sz_warn_once("a shadow sampler with unnormalised coordinates is not "
                    "implementable in Vulkan");
@@ -593,15 +609,17 @@ sz_sampler_create(struct sz_screen *screen,
                                    : sz_address_mode(templ->wrap_t),
       .addressModeW = unnormalized ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
                                    : sz_address_mode(templ->wrap_r),
-      .mipLodBias = unnormalized ? 0.0f : templ->lod_bias,
+      .mipLodBias = mipmapped ? templ->lod_bias : 0.0f,
       .anisotropyEnable = !unnormalized && max_anisotropy > 1.0f &&
                           screen->caps.core_features.samplerAnisotropy,
       .maxAnisotropy = max_anisotropy,
       .compareEnable = compare,
       .compareOp = compare ? sz_compare_op(templ->compare_func)
                            : VK_COMPARE_OP_NEVER,
-      .minLod = unnormalized ? 0.0f : templ->min_lod,
-      .maxLod = unnormalized ? 0.0f : templ->max_lod,
+      .minLod = mipmapped ? templ->min_lod : 0.0f,
+      /* Zero, not just "the same as min": Vulkan clamps LOD to maxLod, and a max
+       * that reaches a mip level makes the implicit-LOD path fetch it. */
+      .maxLod = mipmapped ? templ->max_lod : 0.0f,
       .unnormalizedCoordinates = unnormalized,
       .borderColor = border_color,
       .pNext = custom_border.sType != 0 ? &custom_border : NULL,
