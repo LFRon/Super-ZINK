@@ -734,6 +734,22 @@ sz_create_shader_state(struct pipe_context *pipe,
          return NULL;
       }
       state->u.shader.base.ir.nir = state->u.shader.nir;
+
+      /* A TGSI vertex shader numbers its inputs by semantic -- generic attribute
+       * 0 arrives as VERT_ATTRIB_GENERIC0, which is 16 -- while
+       * pipe_vertex_element[] and the attribute locations the pipeline declares
+       * are indexed by the order the inputs are declared in. tgsi_to_nir keeps
+       * that order in driver_location. Without this renumbering every TGSI
+       * vertex shader reads attribute 16, which nothing binds: util_blitter's
+       * passthrough quad then samples with garbage coordinates, and half of a
+       * depth blit came out as zeros because the fetch landed outside the
+       * source image. */
+      if (stage == MESA_SHADER_VERTEX) {
+         nir_foreach_variable_with_modes (var, state->u.shader.nir,
+                                          nir_var_shader_in) {
+            var->data.location = var->data.driver_location;
+         }
+      }
    } else if (templ->type != PIPE_SHADER_IR_NIR || !templ->ir.nir) {
       sz_warn_once("only NIR shaders are supported");
       state->u.shader.base.ir.nir = NULL;
@@ -1020,7 +1036,18 @@ sz_create_sampler_view(struct pipe_context *pipe, struct pipe_resource *texture,
          .a = sz_component_swizzle(templ->swizzle_a),
       },
       .subresourceRange = {
-         .aspectMask = sz_format_aspect(templ->format),
+         /* A sampled view of a combined depth-stencil format names the depth
+          * aspect alone. Vulkan gives a view of such a format one aspect to
+          * read -- and the shader wants the depth -- while RADV decides from
+          * the aspect which plane of its split layout to address: a view that
+          * named both read zeros for whole 8-row bands of a D32_SFLOAT_S8_UINT
+          * image, because the fetch landed on the stencil plane instead of the
+          * depth one. The stencil is sampled through a stencil-only view, which
+          * GL asks for by binding an S8 texture view anyway. */
+         .aspectMask = sz_format_aspect(templ->format) &
+                       VK_IMAGE_ASPECT_DEPTH_BIT
+                          ? VK_IMAGE_ASPECT_DEPTH_BIT
+                          : sz_format_aspect(templ->format),
          .baseMipLevel = first_level,
          .levelCount = last_level > first_level ? last_level - first_level + 1
                                                 : 1,
