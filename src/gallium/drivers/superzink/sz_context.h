@@ -186,6 +186,13 @@ struct sz_context {
     * not the bound one. */
    struct sz_pipeline_cache pipelines;
 
+   /* The compute pipeline, and the shader state it was built from. A compute
+    * shader is the whole pipeline -- there is no vertex input, no blend state
+    * and no attachment set to key on -- so one entry per bound object is enough
+    * and a miss is a single vkCreateComputePipelines. */
+   VkPipeline compute_pipeline;
+   void *compute_pipeline_shader;
+
    /* Emitted-command dirty bits. Zero means the state a draw needs is already in
     * the command buffer. */
    unsigned dirty;

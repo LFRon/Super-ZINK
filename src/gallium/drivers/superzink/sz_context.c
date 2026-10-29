@@ -769,6 +769,26 @@ sz_create_fs_state(struct pipe_context *pipe,
    return sz_create_shader_state(pipe, MESA_SHADER_FRAGMENT, templ);
 }
 
+/* A compute shader arrives through its own create entry point with a different
+ * state struct; the translator only wants the NIR, so it is repackaged and
+ * handed to the same path every other stage uses. */
+static void *
+sz_create_compute_state(struct pipe_context *pipe,
+                        const struct pipe_compute_state *templ)
+{
+   if (templ->ir_type != PIPE_SHADER_IR_NIR || !templ->prog) {
+      sz_warn_once("only NIR compute shaders are supported");
+      return NULL;
+   }
+
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = templ->prog,
+   };
+
+   return sz_create_shader_state(pipe, MESA_SHADER_COMPUTE, &state);
+}
+
 static void *
 sz_create_vs_state(struct pipe_context *pipe,
                    const struct pipe_shader_state *templ)
@@ -2568,7 +2588,7 @@ sz_draw_flush(struct sz_context *ctx)
    }
 
    if (ctx->dirty & SZ_DIRTY_DESCRIPTORS) {
-      sz_descriptor_push(ctx, cmd);
+      sz_descriptor_push(ctx, cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
       ctx->screen->stats.descriptor_pushes++;
       ctx->dirty &= ~SZ_DIRTY_DESCRIPTORS;
    }
@@ -3029,6 +3049,91 @@ sz_draw_vertex_state(struct pipe_context *pipe,
 static void
 sz_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 {
+   struct sz_context *ctx = sz_context(pipe);
+   struct sz_screen *screen = ctx->screen;
+
+   /* A dispatch may not be recorded inside a render pass, and the draws queued
+    * before it have to be emitted first so the barriers it records land after
+    * them. It shares the batch with those draws otherwise: one command buffer
+    * per frame is cheaper than one per dispatch, and the descriptors it needs are
+    * bump-allocated out of the same ring slot. */
+   sz_draw_flush(ctx);
+   VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
+   if (cmd == VK_NULL_HANDLE)
+      return;
+
+   const struct sz_state *shader = ctx->state.shaders[MESA_SHADER_COMPUTE];
+   if (!shader || !shader->u.shader.spirv) {
+      sz_warn_once("a compute dispatch was issued with no compute shader bound");
+      return;
+   }
+
+   if (ctx->compute_pipeline == VK_NULL_HANDLE ||
+       ctx->compute_pipeline_shader != shader) {
+      if (ctx->compute_pipeline != VK_NULL_HANDLE) {
+         screen->vk.DestroyPipeline(screen->dev, ctx->compute_pipeline, NULL);
+         ctx->compute_pipeline = VK_NULL_HANDLE;
+      }
+
+      const VkShaderModule module = sz_pipeline_module(ctx, MESA_SHADER_COMPUTE);
+      if (module == VK_NULL_HANDLE)
+         return;
+
+      const VkComputePipelineCreateInfo ci = {
+         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+         .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = module,
+            .pName = "main",
+         },
+         .layout = screen->pipeline_layout,
+      };
+      VkResult result = screen->vk.CreateComputePipelines(
+         screen->dev, screen->pipeline_cache, 1, &ci, NULL,
+         &ctx->compute_pipeline);
+      screen->vk.DestroyShaderModule(screen->dev, module, NULL);
+      if (result != VK_SUCCESS) {
+         mesa_loge("SZ: vkCreateComputePipelines failed: %d", result);
+         ctx->compute_pipeline = VK_NULL_HANDLE;
+         return;
+      }
+      ctx->compute_pipeline_shader = (void *)shader;
+      screen->stats.pipeline_builds++;
+   }
+
+   sz_descriptor_push(ctx, cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+   screen->vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              ctx->compute_pipeline);
+
+   if (info->indirect) {
+      /* glDispatchComputeIndirect: the three counts are read from the buffer. */
+      struct sz_resource *res = sz_resource(info->indirect);
+      sz_resource_access(screen, cmd, res, SZ_ACCESS_STORAGE_BUFFER);
+
+      VkBufferMemoryBarrier2 barrier = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+         .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+         .dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+         .dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+         .buffer = res->buffer,
+         .offset = 0,
+         .size = VK_WHOLE_SIZE,
+      };
+      const VkDependencyInfo dep = {
+         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+         .bufferMemoryBarrierCount = 1,
+         .pBufferMemoryBarriers = &barrier,
+      };
+      screen->vk.CmdPipelineBarrier2(cmd, &dep);
+
+      screen->vk.CmdDispatchIndirect(cmd, res->buffer,
+                                     info->indirect_offset);
+   } else {
+      screen->vk.CmdDispatch(cmd, info->grid[0], info->grid[1], info->grid[2]);
+   }
+
 }
 
 static void
@@ -4257,8 +4362,11 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->delete_depth_stencil_alpha_state = sz_delete_state;
 
    pipe->create_fs_state = sz_create_fs_state;
+   pipe->create_compute_state = sz_create_compute_state;
    pipe->bind_fs_state = sz_bind_fs_state;
+   pipe->bind_compute_state = sz_bind_compute_state;
    pipe->delete_fs_state = sz_delete_state;
+   pipe->delete_compute_state = sz_delete_state;
 
    pipe->create_vs_state = sz_create_vs_state;
    pipe->bind_vs_state = sz_bind_vs_state;

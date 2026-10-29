@@ -248,7 +248,8 @@ struct sz_translate {
    struct {
       SpvBuiltIn builtin;
       uint32_t var;
-   } int_builtins[4];
+      uint32_t type;
+   } int_builtins[8];
    unsigned num_int_builtins;
 
    /* Control flow. NIR is already structured, so the emitter walks its if/loop
@@ -4021,14 +4022,16 @@ sz_load_sample_mask_in(struct sz_translate *t)
  * all: Vulkan's VertexIndex already carries firstVertex and a vertexOffset, and
  * InstanceIndex carries firstInstance, which is what the instanced attribute
  * fetch uses in GL too. */
+/* The input variable for an integer builtin, declared once per module. Two
+ * variables carrying the same BuiltIn in the same storage class is an invalid
+ * module, so a shader that reads gl_GlobalInvocationID twice must find the
+ * first declaration. */
 static uint32_t
-sz_load_builtin_int(struct sz_translate *t, SpvBuiltIn builtin)
+sz_builtin_int_var(struct sz_translate *t, SpvBuiltIn builtin, uint32_t type)
 {
-   const uint32_t int_type = sz_spv_type_int32(t->m);
-
    for (unsigned i = 0; i < t->num_int_builtins; i++) {
       if (t->int_builtins[i].builtin == builtin)
-         return sz_spv_load(t->m, int_type, t->int_builtins[i].var);
+         return t->int_builtins[i].var;
    }
 
    if (t->num_int_builtins == ARRAY_SIZE(t->int_builtins)) {
@@ -4037,7 +4040,7 @@ sz_load_builtin_int(struct sz_translate *t, SpvBuiltIn builtin)
    }
 
    const uint32_t ptr_type =
-      sz_spv_type_ptr(t->m, SpvStorageClassInput, int_type);
+      sz_spv_type_ptr(t->m, SpvStorageClassInput, type);
    const uint32_t var = sz_spv_variable(t->m, ptr_type, SpvStorageClassInput);
    sz_spv_decorate(t->m, var, SpvDecorationBuiltIn, builtin);
    /* An integer fragment input has to be Flat whatever it names, gl_SampleID
@@ -4048,9 +4051,37 @@ sz_load_builtin_int(struct sz_translate *t, SpvBuiltIn builtin)
    sz_interface_add(t, var);
    t->int_builtins[t->num_int_builtins].builtin = builtin;
    t->int_builtins[t->num_int_builtins].var = var;
+   t->int_builtins[t->num_int_builtins].type = type;
    t->num_int_builtins++;
+   return var;
+}
 
-   return sz_spv_load(t->m, int_type, var);
+static uint32_t
+sz_load_builtin_scalar(struct sz_translate *t, SpvBuiltIn builtin,
+                       bool is_signed)
+{
+   const uint32_t type =
+      is_signed ? sz_spv_type_int32(t->m) : sz_spv_type_uint32(t->m);
+   const uint32_t var = sz_builtin_int_var(t, builtin, type);
+   return var == 0 ? 0 : sz_spv_load(t->m, type, var);
+}
+
+/* The compute stage's builtins are uvec3, not vec3: everything but gl_TessCoord
+ * and the tessellation levels is an integer input. */
+static uint32_t
+sz_load_builtin_uvec(struct sz_translate *t, SpvBuiltIn builtin, unsigned ncomp)
+{
+   const uint32_t uint_type = sz_spv_type_uint32(t->m);
+   const uint32_t type =
+      ncomp == 1 ? uint_type : sz_spv_type_vec(t->m, uint_type, ncomp);
+   const uint32_t var = sz_builtin_int_var(t, builtin, type);
+   return var == 0 ? 0 : sz_spv_load(t->m, type, var);
+}
+
+static uint32_t
+sz_load_builtin_int(struct sz_translate *t, SpvBuiltIn builtin)
+{
+   return sz_load_builtin_scalar(t, builtin, true);
 }
 
 static bool
@@ -4210,6 +4241,36 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
          return false;
       t->defs_id[intrin->def.index] = value;
       t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_FLOAT, 32, 2, 0};
+      return true;
+   }
+   case nir_intrinsic_load_global_invocation_id:
+   case nir_intrinsic_load_local_invocation_id:
+   case nir_intrinsic_load_workgroup_id:
+   case nir_intrinsic_load_num_workgroups: {
+      SpvBuiltIn builtin;
+      if (intrin->intrinsic == nir_intrinsic_load_global_invocation_id)
+         builtin = SpvBuiltInGlobalInvocationId;
+      else if (intrin->intrinsic == nir_intrinsic_load_local_invocation_id)
+         builtin = SpvBuiltInLocalInvocationId;
+      else if (intrin->intrinsic == nir_intrinsic_load_workgroup_id)
+         builtin = SpvBuiltInWorkgroupId;
+      else
+         builtin = SpvBuiltInNumWorkgroups;
+
+      const uint32_t value = sz_load_builtin_uvec(t, builtin, 3);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_UINT, 32, 3, 0};
+      return true;
+   }
+   case nir_intrinsic_load_local_invocation_index: {
+      const uint32_t value =
+         sz_load_builtin_scalar(t, SpvBuiltInLocalInvocationIndex, false);
+      if (value == 0)
+         return false;
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_UINT, 32, 1, 0};
       return true;
    }
    case nir_intrinsic_load_vertex_id:
@@ -4411,6 +4472,72 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
          sz_spv_alu(t->m, spv_op, result_type, ops, n);
       t->def_types[intrin->def.index] = type;
       (void)want;
+      return true;
+   }
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap: {
+      /* An atomic on a shader storage block is the same instruction as an image
+       * atomic with a different pointer: OpImageTexelPointer for an image,
+       * OpAccessChain for a block. */
+      const nir_const_value *index_value =
+         nir_src_as_const_value(intrin->src[0]);
+      if (!index_value) {
+         sz_fail(t, "indirect shader buffer selection is not supported");
+         return false;
+      }
+
+      const uint32_t array_ptr = sz_ssbo_array_ptr(t, index_value[0].u32);
+      if (array_ptr == 0)
+         return false;
+
+      const uint32_t word = sz_ssbo_word_offset(t, intrin->src[1], 0, 0);
+      if (word == 0)
+         return false;
+      const uint32_t ptr = sz_ssbo_word_ptr(t, array_ptr, word);
+
+      struct sz_dtype type = {0};
+      sz_guess_def_type(t, &intrin->def, &type);
+      const uint32_t result_type = sz_dtype_type(t, &type);
+      const struct sz_dtype want = {type.base, 32, 1, 0};
+
+      bool cmpxchg = false;
+      const SpvOp spv_op =
+         sz_image_atomic_op((nir_atomic_op)nir_intrinsic_atomic_op(intrin),
+                            &cmpxchg);
+      if (spv_op == SpvOpNop) {
+         sz_fail(t, "shader buffer atomic operation %d is not supported",
+                 (int)nir_intrinsic_atomic_op(intrin));
+         return false;
+      }
+
+      const uint32_t value =
+         sz_bitcast_to(t, sz_def_value(t, intrin->src[2].ssa),
+                       &t->def_types[intrin->src[2].ssa->index], &want);
+      if (value == 0)
+         return false;
+
+      uint32_t ops[6];
+      unsigned n = 0;
+      ops[n++] = ptr;
+      ops[n++] = sz_memory_scope(t);
+      if (cmpxchg) {
+         const uint32_t compare =
+            sz_bitcast_to(t, sz_def_value(t, intrin->src[3].ssa),
+                          &t->def_types[intrin->src[3].ssa->index], &want);
+         if (compare == 0)
+            return false;
+         ops[n++] = sz_memory_semantics(t);
+         ops[n++] = sz_memory_semantics_unequal(t);
+         ops[n++] = value;
+         ops[n++] = compare;
+      } else {
+         ops[n++] = sz_memory_semantics(t);
+         ops[n++] = value;
+      }
+
+      t->defs_id[intrin->def.index] =
+         sz_spv_alu(t->m, spv_op, result_type, ops, n);
+      t->def_types[intrin->def.index] = type;
       return true;
    }
    case nir_intrinsic_barrier: {
@@ -5281,6 +5408,9 @@ sz_nir_to_spirv(struct nir_shader *nir,
    case MESA_SHADER_TESS_EVAL:
       model = SpvExecutionModelTessellationEvaluation;
       break;
+   case MESA_SHADER_COMPUTE:
+      model = SpvExecutionModelGLCompute;
+      break;
    default:
       sz_fail(&t, "shader stage %d is not supported yet", (int)nir->info.stage);
       goto fail;
@@ -5344,6 +5474,16 @@ sz_nir_to_spirv(struct nir_shader *nir,
    const uint32_t function = sz_spv_id(t.m);
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       sz_spv_execution_mode(t.m, function, SpvExecutionModeOriginUpperLeft);
+
+   /* Vulkan has no default workgroup size, and a compute pipeline is created
+    * against the one the module states. */
+   if (nir->info.stage == MESA_SHADER_COMPUTE) {
+      const uint32_t size[] = { MAX2(nir->info.workgroup_size[0], 1u),
+                                MAX2(nir->info.workgroup_size[1], 1u),
+                                MAX2(nir->info.workgroup_size[2], 1u) };
+      sz_spv_execution_mode_literals(t.m, function, SpvExecutionModeLocalSize,
+                                     size, 3);
+   }
 
    /* A geometry shader has to declare both of its primitives and how many
     * vertices it may emit, because the pipeline is compiled against them: Vulkan

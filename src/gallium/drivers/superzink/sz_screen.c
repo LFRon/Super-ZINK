@@ -752,6 +752,26 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * driver does not have, so the flag stays off until they are gone. */
       caps->image_store_formatted = true;
 
+      /* Compute shaders. The launch grid is vkCmdDispatch's, and the workgroup
+       * size is the LocalSize the module declares, so both come straight from
+       * the device's limits. */
+      caps->compute = true;
+      {
+         const VkPhysicalDeviceLimits *clim = &screen->props.limits;
+         struct pipe_compute_caps *cc =
+            (struct pipe_compute_caps *)&screen->base.compute_caps;
+         cc->address_bits = 64;
+         cc->grid_dimension = 3;
+         for (unsigned i = 0; i < 3; i++) {
+            cc->max_grid_size[i] = clim->maxComputeWorkGroupCount[i];
+            cc->max_block_size[i] = clim->maxComputeWorkGroupSize[i];
+         }
+         cc->max_threads_per_block = clim->maxComputeWorkGroupInvocations;
+         /* st reads this one as GL_MAX_COMPUTE_SHARED_MEMORY_SIZE. */
+         cc->max_local_size = clim->maxComputeSharedMemorySize;
+         cc->max_global_size = UINT64_MAX;
+      }
+
       /* glCopyImageSubData. The flag names the hardest case -- a copy that
        * converts between a compressed and a plain format -- and st grants
        * ARB_copy_image on it alone. Copies that only differ in swizzle are
@@ -1045,7 +1065,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
                                                  MESA_SHADER_TESS_CTRL,
                                                  MESA_SHADER_TESS_EVAL,
                                                  MESA_SHADER_GEOMETRY,
-                                                 MESA_SHADER_FRAGMENT};
+                                                 MESA_SHADER_FRAGMENT,
+                                                 MESA_SHADER_COMPUTE};
    for (unsigned i = 0; i < ARRAY_SIZE(supported_stages); i++) {
       /* shader_caps is const in pipe_screen because the state tracker only
        * reads it; drivers fill it exactly once, here. */
@@ -1079,6 +1100,12 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
          sc->max_outputs =
             MIN2(MAX_VARYING, lim->maxGeometryOutputComponents / 4);
          break;
+      case MESA_SHADER_COMPUTE:
+         /* A compute shader has no inputs and no outputs; the numbers only keep
+          * the frontend's interface checks from dividing by zero. */
+         sc->max_inputs = 16;
+         sc->max_outputs = 16;
+         break;
       default:
          sc->max_inputs = MIN2(MAX_VARYING, lim->maxFragmentInputComponents / 4);
          sc->max_outputs = 16;
@@ -1094,7 +1121,10 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * cannot describe. */
       sc->max_texture_samplers = SZ_MAX_SAMPLERS;
       sc->max_sampler_views = SZ_MAX_SAMPLERS;
-      sc->max_shader_buffers = 8;
+      /* Twice the number of blocks a shader may bind: the frontend reserves
+       * half of the reported count for atomic-counter buffers, and the
+       * remaining half is what MaxShaderStorageBlocks becomes. */
+      sc->max_shader_buffers = SZ_MAX_SSBO * 2;
       sc->max_shader_images = 8;
       sc->supported_irs = 1u << PIPE_SHADER_IR_NIR;
       sc->cont_supported = true;

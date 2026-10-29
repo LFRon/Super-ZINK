@@ -150,6 +150,8 @@ struct sz_vk_entrypoints {
    /* Core 1.0, so no extension has to be enabled -- but the counts come out of
     * a buffer, which is the whole of GL_ARB_draw_indirect. */
    PFN_vkCmdDrawIndirect CmdDrawIndirect;
+   PFN_vkCmdDispatch CmdDispatch;
+   PFN_vkCmdDispatchIndirect CmdDispatchIndirect;
    PFN_vkCmdDrawIndexedIndirect CmdDrawIndexedIndirect;
    /* Core 1.2: the draw count itself comes from a buffer, which is what
     * ARB_indirect_parameters' GL_PARAMETER_BUFFER is. */
@@ -171,6 +173,7 @@ struct sz_vk_entrypoints {
    PFN_vkCreatePipelineLayout CreatePipelineLayout;
    PFN_vkDestroyPipelineLayout DestroyPipelineLayout;
    PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines;
+   PFN_vkCreateComputePipelines CreateComputePipelines;
    PFN_vkDestroyPipeline DestroyPipeline;
    PFN_vkCreatePipelineCache CreatePipelineCache;
    PFN_vkDestroyPipelineCache DestroyPipelineCache;

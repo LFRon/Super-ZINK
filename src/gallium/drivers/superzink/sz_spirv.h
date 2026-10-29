@@ -102,6 +102,11 @@ void sz_spv_execution_mode(struct sz_spv_module *m, uint32_t function,
  * Invocations, LocalSize and friends). */
 void sz_spv_execution_mode_literal(struct sz_spv_module *m, uint32_t function,
                                    SpvExecutionMode mode, uint32_t value);
+/* Same, for the modes that carry several literal operands (LocalSize takes
+ * three). */
+void sz_spv_execution_mode_literals(struct sz_spv_module *m, uint32_t function,
+                                    SpvExecutionMode mode,
+                                    const uint32_t *values, unsigned count);
 
 /* Annotations. */
 void sz_spv_decorate(struct sz_spv_module *m, uint32_t target,

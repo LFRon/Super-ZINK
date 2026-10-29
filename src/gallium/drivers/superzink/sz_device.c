@@ -565,6 +565,8 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CmdDraw, vkCmdDraw);
    SZ_DEV_PROC(CmdDrawIndexed, vkCmdDrawIndexed);
    SZ_DEV_PROC(CmdDrawIndirect, vkCmdDrawIndirect);
+   SZ_DEV_PROC(CmdDispatch, vkCmdDispatch);
+   SZ_DEV_PROC(CmdDispatchIndirect, vkCmdDispatchIndirect);
    SZ_DEV_PROC(CmdDrawIndexedIndirect, vkCmdDrawIndexedIndirect);
    /* Core 1.2 (VK_KHR_draw_indirect_count). vkGetDeviceProcAddr returns NULL
     * below 1.2, and the capability is gated on that. */
@@ -584,6 +586,7 @@ sz_load_device_entrypoints(struct sz_screen *screen)
    SZ_DEV_PROC(CreatePipelineLayout, vkCreatePipelineLayout);
    SZ_DEV_PROC(DestroyPipelineLayout, vkDestroyPipelineLayout);
    SZ_DEV_PROC(CreateGraphicsPipelines, vkCreateGraphicsPipelines);
+   SZ_DEV_PROC(CreateComputePipelines, vkCreateComputePipelines);
    SZ_DEV_PROC(DestroyPipeline, vkDestroyPipeline);
 
 #undef SZ_DEV_PROC

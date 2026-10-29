@@ -82,7 +82,8 @@ bool sz_descriptor_has_room(struct sz_context *ctx);
 /* Records the descriptors a draw needs, from the context's recorded constant
  * buffers. Must be called after the pipeline is bound: the push goes to the
  * layout the bound pipeline was created with. */
-void sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd);
+void sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd,
+                        VkPipelineBindPoint bind_point);
 
 /* True when at least one of the images the draw samples is not in the layout a
  * barrel-free sample needs. The caller uses it to decide whether an already open

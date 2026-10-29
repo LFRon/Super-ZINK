@@ -86,7 +86,7 @@
  * descriptor type, so it needs a third set. */
 #define SZ_DESCRIPTOR_SET_IMAGES 3
 #define SZ_DESCRIPTOR_SET_COUNT 4
-#define SZ_DESCRIPTOR_STAGES 5
+#define SZ_DESCRIPTOR_STAGES 6
 /* Shader storage blocks live in the same set as the uniform buffers: both are
  * VK_DESCRIPTOR_TYPE_*_BUFFER written per state change, so a second set would
  * cost an extra binding and an extra layout for no gain. */
@@ -128,6 +128,8 @@ sz_descriptor_stage_index(mesa_shader_stage stage)
       return 3;
    case MESA_SHADER_FRAGMENT:
       return 4;
+   case MESA_SHADER_COMPUTE:
+      return 5;
    default:
       return SZ_DESCRIPTOR_STAGES;
    }

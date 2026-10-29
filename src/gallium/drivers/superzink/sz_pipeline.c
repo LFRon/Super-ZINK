@@ -323,7 +323,7 @@ sz_pipeline_has_vertex_input(const struct sz_context *ctx)
 /* Returns a module for `stage`: the translated shader when one is bound, the
  * bootstrap shader otherwise. The bootstrap pair stays in use for the driver's
  * own selftest, which draws without a shader bound. */
-static VkShaderModule
+VkShaderModule
 sz_pipeline_module(struct sz_context *ctx, mesa_shader_stage stage)
 {
    struct sz_screen *screen = ctx->screen;

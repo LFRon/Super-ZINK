@@ -100,6 +100,12 @@ void sz_pipeline_screen_finish(struct sz_screen *screen);
 struct sz_gfx_pipeline *sz_pipeline_get(struct sz_context *ctx,
                                         VkPrimitiveTopology topology);
 
+/* The VkShaderModule for a bound stage, or VK_NULL_HANDLE. The caller destroys
+ * it; compute pipelines are the one place that needs a module of its own
+ * lifetime, because a dispatch does not go through the graphics cache. */
+VkShaderModule sz_pipeline_module(struct sz_context *ctx,
+                                  mesa_shader_stage stage);
+
 /* Frees the retired pipelines whose submission has completed. Called before a
  * cache entry is evicted and on context teardown. */
 void sz_pipeline_reclaim(struct sz_context *ctx);

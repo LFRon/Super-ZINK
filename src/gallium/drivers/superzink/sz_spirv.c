@@ -588,6 +588,20 @@ sz_spv_execution_mode_literal(struct sz_spv_module *m, uint32_t function,
 }
 
 void
+sz_spv_execution_mode_literals(struct sz_spv_module *m, uint32_t function,
+                               SpvExecutionMode mode, const uint32_t *values,
+                               unsigned count)
+{
+   uint32_t ops[1 + 4];
+   ops[0] = function;
+   ops[1] = mode;
+   for (unsigned i = 0; i < count && i < 4; i++)
+      ops[2 + i] = values[i];
+   sz_spv_emit_simple(m, SEC_EXECUTION_MODES, SpvOpExecutionMode, ops,
+                      2 + MIN2(count, 4));
+}
+
+void
 sz_spv_entry_point(struct sz_spv_module *m, SpvExecutionModel model,
                    uint32_t function, const char *name,
                    const uint32_t *interface, unsigned interface_count)

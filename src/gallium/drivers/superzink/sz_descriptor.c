@@ -30,6 +30,7 @@
 static const mesa_shader_stage sz_descriptor_stages[SZ_DESCRIPTOR_STAGES] = {
    MESA_SHADER_VERTEX,      MESA_SHADER_TESS_CTRL, MESA_SHADER_TESS_EVAL,
    MESA_SHADER_GEOMETRY,    MESA_SHADER_FRAGMENT,
+   MESA_SHADER_COMPUTE,
 };
 
 static bool
@@ -916,7 +917,8 @@ sz_descriptor_sampler_set(struct sz_context *ctx, VkCommandBuffer cmd,
  * silently writing past the end: a descriptor written out of bounds is a GPU
  * fault, not a validation error. */
 static bool
-sz_descriptor_db_emit(struct sz_context *ctx, VkCommandBuffer cmd)
+sz_descriptor_db_emit(struct sz_context *ctx, VkCommandBuffer cmd,
+                      VkPipelineBindPoint bind_point)
 {
    struct sz_screen *screen = ctx->screen;
    if (!screen->db.enabled || !ctx->batch)
@@ -1167,7 +1169,7 @@ sz_descriptor_db_emit(struct sz_context *ctx, VkCommandBuffer cmd)
                                                            texel_offset,
                                                            image_offset };
    screen->vk.CmdSetDescriptorBufferOffsetsEXT(
-      cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, screen->pipeline_layout,
+      cmd, bind_point, screen->pipeline_layout,
       SZ_DESCRIPTOR_SET_UBO, SZ_DESCRIPTOR_SET_COUNT, buffer_indices, offsets);
 
 
@@ -1200,7 +1202,8 @@ sz_descriptor_has_room(struct sz_context *ctx)
 }
 
 void
-sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd)
+sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd,
+                   VkPipelineBindPoint bind_point)
 {
    struct sz_screen *screen = ctx->screen;
    /* One layout for the whole screen (ADR-005c), so the push does not depend on
@@ -1216,7 +1219,7 @@ sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd)
     * to a layout that was not created for it is a validation error and binds
     * nothing, which shows up as a black frame rather than as a failure. */
    if (screen->db.enabled) {
-      if (!sz_descriptor_db_emit(ctx, cmd))
+      if (!sz_descriptor_db_emit(ctx, cmd, bind_point))
          sz_warn_once("the descriptor buffer for this batch is full");
       return;
    }
@@ -1314,8 +1317,8 @@ sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd)
       }
 
       if (count) {
-         screen->vk.CmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                            layout, SZ_DESCRIPTOR_SET_UBO, count,
+         screen->vk.CmdPushDescriptorSetKHR(cmd, bind_point, layout,
+                                            SZ_DESCRIPTOR_SET_UBO, count,
                                             writes);
       }
    }
