@@ -3159,18 +3159,27 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
     * Buffers therefore go through the staging path, where the copy is recorded at
     * the position of the upload and is ordered against the draws around it.
     *
-    * What is not staged is a map the caller declares it manages itself. The state
-    * tracker's uploader keeps one such map open across a whole batch and writes
-    * into it between draws, so staging it would put the copies after the draws
-    * that need them. Those writes are synchronised instead: the GPU is given the
-    * chance to finish reading the buffer before the CPU overwrites it, which is
-    * the same stall a read already pays for and happens once per batch rather
-    * than once per draw. Textures keep the direct path as well -- they are
-    * written once and then only sampled. */
+    * PIPE_MAP_UNSYNCHRONIZED_BIT used to be an exception, on the grounds that the
+    * application had taken responsibility for the overlap. It had not: what the
+    * flag promises is that the GL will not *block*, not that a draw the driver
+    * has queued and not yet submitted may be handed a pointer into memory it is
+    * going to read later. The application's fence cannot describe that draw -- it
+    * was never submitted -- so the batch is recorded with a pointer into bytes
+    * the CPU is about to overwrite, and every draw in it uses the last write of
+    * the frame. Minecraft maps its vertex and index buffers this way thousands of
+    * times a frame, which is why the flag showed up as a logo drawn with the
+    * panorama's transform instead of as a rare glitch.
+    *
+    * What is genuinely not staged is a mapping the caller holds open across
+    * draws. The state tracker's uploader keeps one such map alive for the life of
+    * the buffer, so there is no unmap to copy at, and staging it would put the
+    * copies after the draws that need them. Those writes are covered by the
+    * HOST_WRITE barrier instead, and the uploader's own offset advance is what
+    * keeps them off memory still in flight. Textures keep the direct path as
+    * well: they are written once and then only sampled. */
    const bool streaming_write =
       (usage & PIPE_MAP_WRITE) && res->target == PIPE_BUFFER &&
-      !(usage & (PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_FLUSH_EXPLICIT |
-                 PIPE_MAP_PERSISTENT));
+      !(usage & (PIPE_MAP_FLUSH_EXPLICIT | PIPE_MAP_PERSISTENT));
 
    void *direct = sz_resource_map(r);
    if (direct && !streaming_write) {
