@@ -1286,6 +1286,20 @@ sz_declare_variable(struct sz_translate *t, nir_variable *var)
        (type.base != SZ_BASE_FLOAT || var->data.interpolation == INTERP_MODE_FLAT))
       sz_spv_decorate_bare(t->m, id, SpvDecorationFlat);
 
+   /* Centroid and sample interpolation are decorations on the fragment input;
+    * GL's qualifiers arrive as flags on the variable. Without them every input
+    * is interpolated at the pixel centre, which is what the response of a
+    * derivative or a coverage-edge fragment is compared against -- so a
+    * centroid-qualified input reads the wrong sample's value at exactly the
+    * pixels the test looks at. */
+   if (!has_builtin && storage == SpvStorageClassInput &&
+       t->nir->info.stage == MESA_SHADER_FRAGMENT) {
+      if (var->data.centroid)
+         sz_spv_decorate_bare(t->m, id, SpvDecorationCentroid);
+      if (var->data.sample)
+         sz_spv_decorate_bare(t->m, id, SpvDecorationSample);
+   }
+
    t->vars[t->num_vars].var = var;
    t->vars[t->num_vars].id = id;
    t->vars[t->num_vars].pointee = pointee;
