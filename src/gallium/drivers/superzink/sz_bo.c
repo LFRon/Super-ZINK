@@ -238,7 +238,14 @@ sz_bo_alloc(struct sz_screen *screen, const VkMemoryRequirements *req,
                          screen->mem_props.memoryTypes[host_only].propertyFlags);
    }
 
-   const uint64_t alignment = MAX2(req->alignment, 1ull);
+   /* At least 64 bytes, because that is the alignment the screen advertises as
+    * min_map_buffer_alignment: glMapBufferRange promises a pointer aligned to
+    * it, a direct mapping hands out bo->map + the requested offset, and
+    * bo->map is the block's page-aligned base plus this offset. Without the
+    * floor, a suballocated buffer at offset 16 breaks the promise -- which is
+    * what piglit's map_buffer_range-invalidate checks, and what makes a caller
+    * that trusts the alignment read or write the wrong bytes. */
+   const uint64_t alignment = MAX2(req->alignment, 64ull);
    const uint64_t size = sz_align_up(req->size, alignment);
 
    /* Try existing blocks of the same memory type. */
