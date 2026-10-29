@@ -604,8 +604,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * version bootstrap -- st_extensions grants ARB_shader_precision on
        * `GLSLVersion >= 410`, and GLSLVersion is clamped to the version the
        * context already reached, so 4.1 is unreachable while this says 400. */
-      caps->glsl_feature_level = 430;
-      caps->glsl_feature_level_compatibility = 430;
+      caps->glsl_feature_level = 460;
+      caps->glsl_feature_level_compatibility = 460;
       caps->max_texture_2d_size = 16384;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
@@ -698,6 +698,20 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * lie and an out-of-range access would read another buffer's bytes. */
       caps->robust_buffer_access_behavior =
          screen->caps.core_features.robustBufferAccess;
+
+      /* ARB_clip_control: Vulkan's clip space is already the [0,1] depth range
+       * GL_LOWER_LEFT/GL_ZERO_TO_ONE names, which is what clip_halfz tells the
+       * frontend this driver's rasteriser works in. */
+      caps->clip_halfz = true;
+
+      /* ARB_cull_distance: two separate builtins, declared from the two separate
+       * varying slots the frontend hands over. */
+      caps->cull_distance = screen->caps.core_features.shaderCullDistance;
+
+      /* ARB_gl_spirv: the frontend turns a GL_SPIRV binary into the same NIR a
+       * GLSL shader arrives as, so accepting one costs nothing beyond saying so.
+       * ARB_spirv_extensions follows from the same flag. */
+      caps->gl_spirv = true;
 
       /* Not claimed:
        *  - caps->cull_distance: glsl's linker calls
