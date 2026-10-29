@@ -102,6 +102,9 @@ struct sz_image_info {
    enum sz_base base;
    SpvDim dim;
    bool arrayed;
+   /* Multisampled storage images keep the sample index in an ImageOperands
+    * word: without it OpImageRead/OpImageWrite have no sample to address. */
+   bool ms;
 };
 
 struct sz_translate {
@@ -2958,9 +2961,9 @@ sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
    }
 
    const uint32_t sampled_type = sz_scalar_type(t, sz_base, 32);
+   const bool ms = glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_MS;
    const uint32_t image_type = sz_spv_type_image(
-      t->m, sampled_type, dim, false, glsl_sampler_type_is_array(type), false,
-      2);
+      t->m, sampled_type, dim, false, glsl_sampler_type_is_array(type), ms, 2);
 
    for (unsigned i = 0; i < t->num_images; i++) {
       if (t->images[i].index != index)
@@ -2984,8 +2987,14 @@ sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
       sz_spv_variable(t->m, ptr_type, SpvStorageClassUniformConstant);
    sz_spv_decorate(t->m, id, SpvDecorationDescriptorSet,
                    SZ_DESCRIPTOR_SET_IMAGES);
+   /* A buffer bound to an image unit is a storage texel buffer, which is a
+    * different descriptor type and therefore a different binding. The shader's
+    * own declaration decides it, so the descriptor the driver writes and the
+    * one the module names cannot disagree. */
    sz_spv_decorate(t->m, id, SpvDecorationBinding,
-                   sz_image_binding(t->nir->info.stage, index));
+                   dim == SpvDimBuffer
+                      ? sz_image_buffer_binding(t->nir->info.stage, index)
+                      : sz_image_binding(t->nir->info.stage, index));
 
    sz_interface_add(t, id);
    const uint32_t value = sz_spv_load(t->m, image_type, id);
@@ -2997,7 +3006,7 @@ sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
    t->images[t->num_images].index = index;
    t->images[t->num_images].info =
       (struct sz_image_info){image_type, sz_base, dim,
-                             glsl_sampler_type_is_array(type)};
+                             glsl_sampler_type_is_array(type), ms};
    t->images[t->num_images].value = value;
    t->images[t->num_images].var = id;
    t->images[t->num_images].value_block = t->block_serial;
@@ -3007,6 +3016,7 @@ sz_image_get(struct sz_translate *t, const nir_deref_instr *deref,
    info->base = sz_base;
    info->dim = dim;
    info->arrayed = glsl_sampler_type_is_array(type);
+   info->ms = ms;
    return value;
 }
 
@@ -4319,10 +4329,23 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       struct sz_dtype type = {info.base, 32, 4, 0};
       const uint32_t result_type = sz_dtype_type(t, &type);
 
-      uint32_t ops[2];
+      uint32_t ops[4];
       unsigned n = 0;
       ops[n++] = image;
       ops[n++] = coord;
+      if (info.ms) {
+         /* A multisampled image has no single texel to read: the ImageOperands
+          * word names the sample, and the sample index is the intrinsic's third
+          * source. */
+         const uint32_t sample = sz_def_value(t, intrin->src[2].ssa);
+         if (sample == 0)
+            return false;
+         /* A literal, not the id of a constant: an ImageOperands word is part
+          * of the instruction, and an id there reads as a mask of whatever
+          * number it happens to be. */
+         ops[n++] = SpvImageOperandsSampleMask;
+         ops[n++] = sample;
+      }
       t->defs_id[intrin->def.index] =
          sz_spv_alu(t->m, SpvOpImageRead, result_type, ops, n);
       t->def_types[intrin->def.index] = type;
@@ -4353,10 +4376,18 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       const uint32_t cast = sz_bitcast_to(t, stored, &have, &want);
       const uint32_t value = cast ? cast : stored;
 
-      const uint32_t ops[] = {image, coord, value};
+      uint32_t ops[5] = {image, coord, value, 0, 0};
+      unsigned n = 3;
+      if (info.ms) {
+         const uint32_t sample = sz_def_value(t, intrin->src[2].ssa);
+         if (sample == 0)
+            return false;
+         ops[n++] = SpvImageOperandsSampleMask;
+         ops[n++] = sample;
+      }
       /* OpImageWrite has no result id and no result type: the plain
        * instruction is what belongs in the stream. */
-      sz_spv_raw_function_op(t->m, SpvOpImageWrite, ops, 3);
+      sz_spv_raw_function_op(t->m, SpvOpImageWrite, ops, n);
       return true;
    }
    case nir_intrinsic_image_deref_size:
@@ -4433,7 +4464,15 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
 
       const uint32_t ptr_type =
          sz_spv_type_ptr(t->m, SpvStorageClassImage, scalar);
-      const uint32_t sample = sz_spv_const_int32(t->m, 0);
+      /* The sample index: a single-sample storage image must be given zero, and
+       * a multisampled one the sample the atomic runs on, which is the
+       * intrinsic's third source. */
+      uint32_t sample = sz_spv_const_int32(t->m, 0);
+      if (info.ms) {
+         sample = sz_def_value(t, intrin->src[2].ssa);
+         if (sample == 0)
+            return false;
+      }
       const uint32_t texel_ops[] = {image_ptr, coord, sample};
       const uint32_t ptr =
          sz_spv_alu(t->m, SpvOpImageTexelPointer, ptr_type, texel_ops, 3);

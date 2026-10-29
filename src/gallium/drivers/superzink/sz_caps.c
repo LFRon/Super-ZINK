@@ -296,6 +296,8 @@ sz_caps_init(struct sz_caps *caps,
       caps->descriptor_size_uniform_texel_buffer =
          desc.uniformTexelBufferDescriptorSize;
       caps->descriptor_size_storage_image = desc.storageImageDescriptorSize;
+      caps->descriptor_size_storage_texel_buffer =
+         desc.storageTexelBufferDescriptorSize;
       caps->descriptor_size_storage_buffer = desc.storageBufferDescriptorSize;
    }
 

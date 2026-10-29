@@ -157,7 +157,8 @@ sz_descriptor_layout_create(struct sz_screen *screen, VkDescriptorSetLayout *out
     * read and write without a sampler, which is VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     * the format is part of the view, so unlike a sampled image the descriptor
     * needs nothing else. */
-   VkDescriptorSetLayoutBinding image_bindings[SZ_DESCRIPTOR_IMAGE_BINDINGS];
+   VkDescriptorSetLayoutBinding
+      image_bindings[SZ_DESCRIPTOR_IMAGE_BINDINGS_TOTAL];
 
    for (unsigned s = 0; s < ARRAY_SIZE(sz_descriptor_stages); s++) {
       const mesa_shader_stage stage = sz_descriptor_stages[s];
@@ -170,10 +171,18 @@ sz_descriptor_layout_create(struct sz_screen *screen, VkDescriptorSetLayout *out
             .descriptorCount = 1,
             .stageFlags = flags,
          };
+
+         const unsigned buffer_binding = sz_image_buffer_binding(stage, i);
+         image_bindings[buffer_binding] = (VkDescriptorSetLayoutBinding) {
+            .binding = buffer_binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = flags,
+         };
       }
    }
 
-   ci.bindingCount = SZ_DESCRIPTOR_IMAGE_BINDINGS;
+   ci.bindingCount = SZ_DESCRIPTOR_IMAGE_BINDINGS_TOTAL;
    ci.pBindings = image_bindings;
 
    result = screen->vk.CreateDescriptorSetLayout(screen->dev, &ci, NULL,
@@ -1168,6 +1177,40 @@ sz_descriptor_db_emit(struct sz_context *ctx, VkCommandBuffer cmd,
          const struct pipe_image_view *view = ctx->state.shader_images[stage][i];
          if (!view || !view->resource)
             continue;
+
+         /* A texture buffer bound to an image unit is a storage *texel* buffer:
+            * GL addresses it by texel index and Vulkan describes it by an
+            * address and a format, with no image view involved. */
+         if (view->resource->target == PIPE_BUFFER) {
+            struct sz_resource *res = sz_resource(view->resource);
+            if (res->buffer == VK_NULL_HANDLE)
+               continue;
+
+            sz_resource_access(screen, cmd, res, SZ_ACCESS_STORAGE_BUFFER);
+
+            VkDescriptorAddressInfoEXT address = {
+               .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+               .address = res->address + view->u.buf.offset,
+               .range = view->u.buf.size ? view->u.buf.size : VK_WHOLE_SIZE,
+               .format = sz_vk_format(screen, view->format),
+            };
+
+            VkDeviceSize buffer_offset = 0;
+            screen->vk.GetDescriptorSetLayoutBindingOffsetEXT(
+               screen->dev, image_layout, sz_image_buffer_binding(stage, i),
+               &buffer_offset);
+
+            const VkDescriptorGetInfoEXT buffer_info = {
+               .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+               .type = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+               .data.pStorageTexelBuffer = &address,
+            };
+            screen->vk.GetDescriptorEXT(
+               screen->dev, &buffer_info,
+               screen->caps.descriptor_size_storage_texel_buffer,
+               mapped + image_offset + buffer_offset);
+            continue;
+         }
 
          VkImageView image_view;
          if (!sz_shader_image_view(ctx, cmd, view, &image_view))

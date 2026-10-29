@@ -101,6 +101,13 @@
 #define SZ_DESCRIPTOR_SAMPLER_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
 #define SZ_DESCRIPTOR_TEXEL_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
 #define SZ_DESCRIPTOR_IMAGE_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_IMAGES)
+/* A buffer bound to an image unit -- GL's imageBuffer/iimageBuffer/uimageBuffer
+ * -- is a VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, a different descriptor type
+ * from the storage image next to it. VkDescriptorSetLayoutBinding fixes one type
+ * per binding, so the buffer flavour gets its own run of bindings in the same
+ * set. */
+#define SZ_DESCRIPTOR_IMAGE_BUFFER_BASE SZ_DESCRIPTOR_IMAGE_BINDINGS
+#define SZ_DESCRIPTOR_IMAGE_BINDINGS_TOTAL (SZ_DESCRIPTOR_IMAGE_BINDINGS * 2)
 
 /* How many distinct sampler-set contents to cache. Every draw that rebinds the
  * same textures and samplers hits an existing entry, so this is the number of
@@ -174,6 +181,14 @@ static inline unsigned
 sz_image_binding(mesa_shader_stage stage, unsigned slot)
 {
    return sz_descriptor_stage_index(stage) * SZ_MAX_IMAGES + slot;
+}
+
+/* The same unit, as a storage texel buffer instead of a storage image. */
+static inline unsigned
+sz_image_buffer_binding(mesa_shader_stage stage, unsigned slot)
+{
+   return SZ_DESCRIPTOR_IMAGE_BUFFER_BASE +
+          sz_descriptor_stage_index(stage) * SZ_MAX_IMAGES + slot;
 }
 
 /* The options for one shader stage. The returned pointer stays valid for the

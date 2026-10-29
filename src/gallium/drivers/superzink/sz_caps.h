@@ -277,6 +277,7 @@ struct sz_caps {
    size_t descriptor_size_combined_image_sampler;
    size_t descriptor_size_uniform_texel_buffer;
    size_t descriptor_size_storage_image;
+   size_t descriptor_size_storage_texel_buffer;
    size_t descriptor_size_storage_buffer;
 
    uint32_t instance_api_version;
