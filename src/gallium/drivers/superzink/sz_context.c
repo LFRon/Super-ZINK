@@ -223,14 +223,21 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
 
    sz_trace("flush flags=0x%x fence=%d", flags, fence != NULL);
 
-   /* The fence names the value the submission below will signal, so it covers
-    * exactly the work issued up to this point. The value is taken before the
-    * submit because submitting is what assigns it. */
-   if (fence)
-      *fence = sz_fence_create(ctx->screen,
-                               ctx->screen->batch_state.next_value + 1);
-
    sz_context_submit(ctx);
+
+   /* The fence names the value of the submission that carried the work just
+    * issued, which is only known once the submit has happened: submitting is
+    * what assigns the value.
+    *
+    * It used to be taken beforehand as next_value + 1. That is wrong whenever
+    * there is no batch to submit -- a glFenceSync after the draws have already
+    * been submitted, which is exactly what GL_ARB_sync is used for -- because
+    * no submission then takes that value, and the fence waits for the next one
+    * that does. If the application stops issuing work and waits on the fence,
+    * nothing ever signals it and the wait never returns: glClientWaitSync,
+    * glFinish and glMapBuffer after a draw all deadlock. */
+   if (fence)
+      *fence = sz_fence_create(ctx->screen, ctx->screen->batch_state.next_value);
 
    if (flags & PIPE_FLUSH_HINT_FINISH)
       sz_queue_wait_idle(&ctx->screen->batch_state);

@@ -385,9 +385,12 @@ sz_fence_finish(struct pipe_screen *pscreen, struct pipe_context *pipe,
    if (!f || f->timeline == VK_NULL_HANDLE)
       return true;
 
-   /* GL_ARB_sync allows a poll: a timeout of zero asks whether the work is done
-    * without blocking, which is what glClientWaitSync(GL_SYNC_FLUSH_COMMANDS_BIT
-    * absent) and every "is it ready yet" loop does. */
+   /* GL_ARB_sync allows both a poll (timeout 0) and a bounded wait, and both
+    * are the same call here: Gallium and Vulkan measure the timeout in
+    * nanoseconds. Blocking forever on a finite timeout is what made
+    * glClientWaitSync return CONDITION_SATISFIED for work that had not
+    * finished, which is worse than being late -- the caller then reads the
+    * buffer before the GPU has written it. */
    const VkSemaphoreWaitInfo wait = {
       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
       .semaphoreCount = 1,
@@ -395,8 +398,7 @@ sz_fence_finish(struct pipe_screen *pscreen, struct pipe_context *pipe,
       .pValues = &f->value,
    };
 
-   return screen->vk.WaitSemaphores(screen->dev, &wait,
-                                    timeout == 0 ? 0 : UINT64_MAX) == VK_SUCCESS;
+   return screen->vk.WaitSemaphores(screen->dev, &wait, timeout) == VK_SUCCESS;
 }
 
 struct pipe_fence_handle *
