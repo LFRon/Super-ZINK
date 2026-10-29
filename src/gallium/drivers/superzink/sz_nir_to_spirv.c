@@ -5293,7 +5293,8 @@ sz_spv_verify_cfg(struct sz_translate *t, const uint32_t *words, size_t count,
                  op == SpvOpVariable || op == SpvOpFunction ||
                  op == SpvOpFunctionParameter || op == SpvOpConstant ||
                  op == SpvOpConstantComposite || op == SpvOpConstantTrue ||
-                 op == SpvOpConstantFalse || op == SpvOpUndef ||
+                 op == SpvOpConstantFalse || op == SpvOpConstantNull ||
+                 op == SpvOpUndef ||
                  op == SpvOpExtInst || op == SpvOpExtInstImport ||
                  op == SpvOpSampledImage || op == SpvOpImage ||
                  op == SpvOpCompositeConstruct || op == SpvOpCompositeExtract ||
@@ -5708,7 +5709,9 @@ fail:
    free(t.interfaces);
    sz_spv_module_destroy(t.m);
 
-   if (!t.failed)
+   /* A failure that already explained itself -- sz_spv_verify_cfg() reports
+    * through the same pointer -- must not have its message replaced. */
+   if (!t.failed && !(error && *error))
       sz_fail(&t, "translation failed");
 
    if (error && *error)

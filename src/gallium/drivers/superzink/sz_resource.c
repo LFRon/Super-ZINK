@@ -246,13 +246,15 @@ sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
                                  ? sz_image_create_flags(tmpl->target)
                                  : 0;
 
-   /* A texture bound to an image unit is viewed with that unit's format, which
-    * need not be the one the texture was created with: GL lets an application
-    * bind an rgba16f image over an rg32f texture and reads the same bytes either
-    * way. Vulkan refuses a view whose format differs from the image's unless the
-    * image was created mutable. */
-   if (tmpl->bind & PIPE_BIND_SHADER_IMAGE)
-      flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+   /* GL lets any of these textures be looked at through another format: an
+    * image unit's format is the binding's, glTextureView names one at creation
+    * time, and a render target's comes from the surface. Vulkan refuses an image
+    * view whose format differs from the image's unless the image was created
+    * mutable (VUID-VkImageViewCreateInfo-image-01762), and the flag has to be
+    * decided when the image is created -- the storage, not the view, owns it.
+    * Nothing is lost by setting it always: the flag only says "views may name
+    * another format", and RADV does not derive anything else from it. */
+   flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 
    /* 3D images are never attachments in Gallium's model, and a 1D image cannot
     * have a depth/stencil attachment in Vulkan at all -- but GL has 1D depth
