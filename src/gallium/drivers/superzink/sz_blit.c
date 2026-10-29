@@ -643,7 +643,24 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
        * either: Vulkan will not reinterpret a depth value at all, and GL's own
        * conversion is defined numerically (a depth of 0.25 is 0.25 whatever the
        * format). util_format has the conversion, so the blit goes through the
-       * same CPU path the colour case uses. */
+       * same CPU path the colour case uses.
+       *
+       * A multisampled source is the exception: mapping it names one sample's
+       * texels, not the samples, so the transfer path cannot see what it is
+       * supposed to copy. A draw can: the blitter samples the source and writes
+       * the destination, and both ends are a float, so the conversion comes for
+       * free -- which is exactly what GL asks a depth blit to do. */
+      if (src_samples > 1 &&
+          (aspect == VK_IMAGE_ASPECT_DEPTH_BIT ||
+           aspect == VK_IMAGE_ASPECT_STENCIL_BIT)) {
+         struct pipe_blit_info sub = *info;
+         sub.mask = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? PIPE_MASK_Z
+                                                        : PIPE_MASK_S;
+         if (!sz_blit_blitter(ctx, &sub))
+            sz_warn_once("a multisampled depth or stencil blit that changes "
+                         "format");
+         return;
+      }
       sz_blit_cross_format(&ctx->base, info, aspect);
       return;
    }
@@ -809,14 +826,16 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                      src_format, dst_format, src_samples, dst_samples);
 
    if (info->mask & PIPE_MASK_S) {
-      if (src_format != dst_format && (src_samples > 1 || dst_samples > 1)) {
-         sz_warn_once("multisampled stencil blit across formats");
-      } else if (src_format != dst_format) {
+      if (src_format != dst_format && src_samples == 1 && dst_samples == 1) {
          /* Two images whose stencil aspects are both S8_UINT still differ in
           * format, and a copy cannot cross formats. The CPU path copies the
           * stencil bytes one at a time, which for S8 to S8 is the same byte. */
          sz_blit_cross_format(&ctx->base, info, VK_IMAGE_ASPECT_STENCIL_BIT);
-      } else if (src_samples > 1) {
+      } else if (src_format != dst_format || src_samples > 1) {
+         /* Everything else that touches stencil is a draw: the blitter writes
+          * the stencil export, which is the only way to move a stencil sample
+          * in Vulkan -- vkCmdCopyImage2 moves a single-sample stencil plane and
+          * nothing moves a multisampled one. */
          sz_blit_aspect(ctx, cmd, info, src, dst, VK_IMAGE_ASPECT_STENCIL_BIT,
                         src_format, dst_format, src_samples, dst_samples);
       } else {
