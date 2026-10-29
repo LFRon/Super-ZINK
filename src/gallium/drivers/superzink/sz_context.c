@@ -2595,6 +2595,17 @@ sz_draw_flush(struct sz_context *ctx)
    pipe_resource_reference(&ctx->pending.indirect.resource, NULL);
    ctx->pending.indirect.count_buffer = NULL;
    pipe_resource_reference(&ctx->pending.indirect.count_resource, NULL);
+
+   /* SZ_DEBUG=serialize: finish the batch on the device before anything else is
+    * recorded. Nothing can then be read before it was written, so a rendering
+    * error that survives this is not a race -- the data, the state or the
+    * command stream itself is wrong. Slow enough to be useless for playing. */
+   if (sz_debug_enabled(SZ_DEBUG_SERIALIZE)) {
+      sz_context_submit(ctx);
+      sz_queue_wait_idle(&ctx->screen->batch_state);
+   } else if (sz_debug_enabled(SZ_DEBUG_SUBMIT_EACH)) {
+      sz_context_submit(ctx);
+   }
 }
 
 static bool

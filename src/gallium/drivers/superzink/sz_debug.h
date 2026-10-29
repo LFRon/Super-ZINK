@@ -28,6 +28,8 @@ enum sz_debug_flag {
    SZ_DEBUG_QUIET     = (1 << 9),
    SZ_DEBUG_SELFTEST  = (1 << 10),
    SZ_DEBUG_TRACE     = (1 << 11),
+   SZ_DEBUG_SERIALIZE = (1 << 12),
+   SZ_DEBUG_SUBMIT_EACH = (1 << 13),
 };
 
 extern uint32_t sz_debug;

@@ -24,6 +24,8 @@ sz_debug_options[] = {
    { "quiet",     SZ_DEBUG_QUIET,     "Suppress warnings" },
    { "selftest",  SZ_DEBUG_SELFTEST,  "Round-trip buffers and images through the allocator at startup" },
    { "trace",     SZ_DEBUG_TRACE,     "Print the first resource/present events of the life cycle" },
+   { "serialize", SZ_DEBUG_SERIALIZE, "Submit and wait after every draw batch (tells a race apart from a data bug)" },
+   { "submit_each", SZ_DEBUG_SUBMIT_EACH, "Submit after every draw batch but do not wait" },
    DEBUG_NAMED_VALUE_END
 };
 
