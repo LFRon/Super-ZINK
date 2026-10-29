@@ -185,7 +185,6 @@ sz_blit_copy(struct sz_context *ctx, VkCommandBuffer cmd,
                        aspect, &region.dstSubresource);
 
    ctx->screen->stats.copies++;
-
    const VkCopyImageInfo2 copy = {
       .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2,
       .srcImage = src->image,
@@ -220,8 +219,9 @@ sz_blit_stencil(struct sz_context *ctx, VkCommandBuffer cmd,
  *
  * vkCmdBlitImage only accepts "compatible" formats -- same size and family --
  * so the format conversions GL allows (RGBA8 to RGBA32F, sRGB to linear, UINT to
- * float) have no vkCmd* equivalent at all. The state tracker hits this on the
- * ordinary glBlitFramebuffer path, not on some exotic one.
+ * float, and depth's float-to-unorm) have no vkCmd* equivalent at all. The state
+ * tracker hits this on the ordinary glBlitFramebuffer path, not on some exotic
+ * one.
  *
  * The conversion therefore happens where Mesa already has a complete and tested
  * implementation for it: util_format_translate. Both ends go through the same
@@ -231,17 +231,40 @@ sz_blit_stencil(struct sz_context *ctx, VkCommandBuffer cmd,
  * format. A shader-based blit would be faster and is the natural upgrade once
  * there is an internal pipeline to hang it on.
  *
+ * `aspect` says which half of the texel moves. A depth or stencil blit maps only
+ * that aspect, so the other one is neither read nor written, and the formats
+ * handed to the translator describe the aspect's bytes rather than the
+ * resource's -- a depth aspect is stored in the device's depth format, which may
+ * be wider than the pipe format names, and a stencil aspect is always one byte
+ * per texel.
+ *
  * Scaling is not supported here: util_format_translate converts a rectangle, it
  * does not resample. A cross-format blit that also scales is refused rather than
  * silently done without filtering.
  */
 static bool
 sz_blit_cross_format(struct pipe_context *pipe,
-                     const struct pipe_blit_info *info)
+                     const struct pipe_blit_info *info,
+                     VkImageAspectFlags aspect)
 {
    struct sz_context *ctx = sz_context(pipe);
-   const enum pipe_format src_format = info->src.resource->format;
-   const enum pipe_format dst_format = info->dst.resource->format;
+   const enum pipe_format src_res_format = info->src.resource->format;
+   const enum pipe_format dst_res_format = info->dst.resource->format;
+   enum pipe_format src_format = src_res_format;
+   enum pipe_format dst_format = dst_res_format;
+   unsigned map_flags = 0;
+
+   if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
+      map_flags = PIPE_MAP_DEPTH_ONLY;
+      src_format = sz_vk_depth_pipe_format(ctx->screen, src_res_format);
+      dst_format = sz_vk_depth_pipe_format(ctx->screen, dst_res_format);
+      if (src_format == PIPE_FORMAT_NONE || dst_format == PIPE_FORMAT_NONE)
+         return true;
+   } else if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) {
+      map_flags = PIPE_MAP_STENCIL_ONLY;
+      src_format = PIPE_FORMAT_S8_UINT;
+      dst_format = PIPE_FORMAT_S8_UINT;
+   }
 
    /* The source box may be flipped, which sz_box_equals() reads as a different
     * extent, so the sizes are compared directly. */
@@ -291,14 +314,16 @@ sz_blit_cross_format(struct pipe_context *pipe,
    const struct pipe_box dst_box = info->dst.box;
 
    const void *src = pipe->texture_map(pipe, info->src.resource, info->src.level,
-                                        PIPE_MAP_READ, &box, &src_transfer);
+                                        PIPE_MAP_READ | map_flags, &box,
+                                        &src_transfer);
    if (!src) {
       sz_warn_once("could not map the source of a cross-format blit");
       return true;
    }
 
    void *dst = pipe->texture_map(pipe, info->dst.resource, info->dst.level,
-                                  PIPE_MAP_WRITE, &dst_box, &dst_transfer);
+                                  PIPE_MAP_WRITE | map_flags, &dst_box,
+                                  &dst_transfer);
    if (!dst) {
       pipe->texture_unmap(pipe, src_transfer);
       sz_warn_once("could not map the destination of a cross-format blit");
@@ -343,15 +368,12 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
                unsigned dst_samples)
 {
    if (src_format != dst_format) {
-      /* Only the colour aspect has a generic conversion; a depth or stencil
-       * blit that also changes format has no equivalent anywhere in Vulkan or
-       * in util_format. */
-      if (aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
-         sz_warn_once("a depth or stencil blit that changes format is not "
-                      "implemented");
-         return;
-      }
-      sz_blit_cross_format(&ctx->base, info);
+      /* A depth or stencil blit that changes format has no vkCmd* equivalent
+       * either: Vulkan will not reinterpret a depth value at all, and GL's own
+       * conversion is defined numerically (a depth of 0.25 is 0.25 whatever the
+       * format). util_format has the conversion, so the blit goes through the
+       * same CPU path the colour case uses. */
+      sz_blit_cross_format(&ctx->base, info, aspect);
       return;
    }
 
@@ -463,8 +485,10 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
       if (src_samples > 1 || dst_samples > 1) {
          sz_warn_once("multisampled stencil blit is not implemented");
       } else if (src_format != dst_format) {
-         sz_warn_once("stencil blit between different formats is not "
-                      "implemented");
+         /* Two images whose stencil aspects are both S8_UINT still differ in
+          * format, and a copy cannot cross formats. The CPU path copies the
+          * stencil bytes one at a time, which for S8 to S8 is the same byte. */
+         sz_blit_cross_format(&ctx->base, info, VK_IMAGE_ASPECT_STENCIL_BIT);
       } else {
          sz_resource_access(screen, cmd, src, SZ_ACCESS_TRANSFER_SRC);
          sz_resource_access(screen, cmd, dst, SZ_ACCESS_TRANSFER_DST);

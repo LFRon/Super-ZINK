@@ -32,6 +32,18 @@ struct sz_screen;
  * two will disagree about what a texture actually is. */
 VkFormat sz_vk_format(struct sz_screen *screen, enum pipe_format format);
 
+/* The pipe format that describes the *depth aspect's* bytes the way the device
+ * stores them.
+ *
+ * sz_vk_format() may substitute a wider depth format than the pipe format names
+ * -- D24S8 becomes D32_SFLOAT_S8_UINT on hardware without 24-bit depth -- and a
+ * copy of one aspect carries that wider format's bytes. Anything that reads or
+ * writes depth through a transfer has to interpret them as this format, not as
+ * the resource's, or a depth of 0.25 comes back as the low 24 bits of the float
+ * 0x3E800000. PIPE_FORMAT_NONE means the format has no depth aspect at all. */
+enum pipe_format sz_vk_depth_pipe_format(struct sz_screen *screen,
+                                        enum pipe_format format);
+
 /* Probes the device for the depth formats sz_vk_format() has to choose between.
  * Called once, during screen creation. */
 void sz_format_probe(struct sz_screen *screen);

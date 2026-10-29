@@ -3275,6 +3275,19 @@ struct sz_transfer {
    /* Bytes per row in `staging`. Handed to the caller as base.stride, and used as
     * the copy's bufferRowLength. */
    unsigned row_pitch;
+
+   /* Combined depth-stencil only. One Vulkan copy carries one aspect, so a texel
+    * that holds both cannot arrive in one piece: the half that has no room in
+    * `staging` is copied into its own region of the same buffer, and the two are
+    * put back together on the CPU. These describe that region; 0 means "not
+    * used". */
+   unsigned depth_offset, depth_pitch;
+   unsigned stencil_offset, stencil_pitch;
+   /* The format the depth aspect's bytes are in, which is the depth side of the
+    * *device's* format and not necessarily the resource's. */
+   enum pipe_format depth_format;
+   /* Which aspects this transfer claimed, so unmap writes back exactly those. */
+   VkImageAspectFlags aspect;
 };
 
 static struct pipe_resource *
@@ -3304,8 +3317,14 @@ struct sz_copy_job {
    bool to_staging;
    unsigned row_pitch;
    /* Byte offset inside `staging` the copy reads from. Non-zero for a partial
-    * upload: a flush_region copies one range of a transfer that covers more. */
-   uint32_t staging_offset;
+    * upload: a flush_region copies one range of a transfer that covers more.
+    * Also points at the region a depth-stencil aspect was copied into. */
+   uint64_t staging_offset;
+   /* Which aspect of the image this copy moves, and how many bytes one of its
+    * texels occupies in the buffer. Not the pipe format's blocksize: the stencil
+    * aspect of D24S8 is one byte per texel, and its depth aspect four. */
+   VkImageAspectFlags aspect;
+   unsigned texel_bytes;
 };
 
 static void
@@ -3313,7 +3332,6 @@ sz_copy_job_record(struct sz_context *ctx, VkCommandBuffer cmd, void *user)
 {
    struct sz_copy_job *job = user;
    struct sz_screen *screen = ctx->screen;
-   const unsigned bs = util_format_get_blocksize(job->res->base.format);
 
    if (job->res->image == VK_NULL_HANDLE) {
       /* Buffer to buffer: the region is a plain byte range. */
@@ -3359,13 +3377,13 @@ sz_copy_job_record(struct sz_context *ctx, VkCommandBuffer cmd, void *user)
    const unsigned block_h = util_format_get_blockheight(job->res->base.format);
 
    VkBufferImageCopy region = {
-      .bufferOffset = 0,
+      .bufferOffset = job->staging_offset,
       /* In texels, not bytes; zero would mean "tightly packed", which is not the
        * pitch the caller sees. */
-      .bufferRowLength = (job->row_pitch / bs) * block_w,
+      .bufferRowLength = (job->row_pitch / job->texel_bytes) * block_w,
       .bufferImageHeight = 0,
       .imageSubresource = {
-         .aspectMask = sz_format_aspect(job->res->base.format),
+         .aspectMask = job->aspect,
          .mipLevel = job->level,
          .baseArrayLayer = is_3d ? 0 : job->box.z,
          .layerCount = is_3d ? 1 : job->box.depth,
@@ -3445,6 +3463,100 @@ sz_race_check(struct sz_context *ctx, struct sz_resource *r, uint64_t offset,
            ") still reads it",
            offset, offset + size, (uint64_t)(uintptr_t)r->buffer,
            r->last_use_value, completed);
+}
+
+/* Puts a packed depth-stencil texel back together, or takes it apart for an
+ * upload.
+ *
+ * `to_pipe` gathers the two aspect regions into the layout the state tracker
+ * unpacks; otherwise the packed rows the CPU wrote are split into the regions
+ * the two copies below will read. The per-format accessors come from the same
+ * table the state tracker uses, so Z24S8, S8X24, Z32F_S8X24 and the
+ * stencil-only formats are all placed by their own layout rather than by an
+ * assumed byte order. */
+static void
+sz_transfer_zs_repack(struct sz_transfer *t, const struct pipe_box *box,
+                      bool to_pipe)
+{
+   const enum pipe_format format = t->base.resource->format;
+   const struct util_format_description *desc = util_format_description(format);
+   const bool has_depth = util_format_has_depth(desc);
+   const bool has_stencil = util_format_has_stencil(desc);
+   const enum pipe_format depth_format = t->depth_format;
+   const unsigned pipe_bs = util_format_get_blocksize(format);
+
+   const unsigned width = box->width;
+   const unsigned rows = box->height;
+   const unsigned slices = MAX2(box->depth, 1);
+   const unsigned depth_pitch = t->depth_offset ? t->depth_pitch : t->row_pitch;
+   const unsigned stencil_pitch =
+      t->stencil_offset ? t->stencil_pitch : t->row_pitch;
+
+   uint8_t *base = sz_resource_map(sz_resource(t->staging));
+   if (!base)
+      return;
+
+   float *tmp_z = has_depth ? malloc(MAX2(width, 1) * sizeof(float)) : NULL;
+   uint8_t *tmp_s = has_stencil ? malloc(MAX2(width, 1)) : NULL;
+   uint8_t *row = to_pipe ? malloc(MAX2(pipe_bs * width, 1)) : NULL;
+
+   if ((has_depth && !tmp_z) || (has_stencil && !tmp_s) ||
+       (to_pipe && !row)) {
+      free(row);
+      free(tmp_s);
+      free(tmp_z);
+      return;
+   }
+
+   for (unsigned z = 0; z < slices; z++) {
+      for (unsigned y = 0; y < rows; y++) {
+         const size_t line = (size_t)z * rows + y;
+         uint8_t *packed = base + line * t->row_pitch;
+         uint8_t *depth_p = base + t->depth_offset + line * depth_pitch;
+         uint8_t *stencil_p = base + t->stencil_offset + line * stencil_pitch;
+
+         if (to_pipe) {
+            memset(row, 0, pipe_bs * width);
+            if (has_depth) {
+               util_format_unpack_z_float(depth_format,
+                                          tmp_z, t->depth_offset ? depth_p : packed,
+                                          width);
+               util_format_pack_z_float(format, row, tmp_z, width);
+            }
+            if (has_stencil) {
+               if (t->stencil_offset)
+                  util_format_unpack_s_8uint(PIPE_FORMAT_S8_UINT, tmp_s,
+                                             stencil_p, width);
+               else
+                  util_format_unpack_s_8uint(format, tmp_s, packed, width);
+               util_format_pack_s_8uint(format, row, tmp_s, width);
+            }
+            memcpy(packed, row, pipe_bs * width);
+         } else {
+            /* Both aspects are read out of the packed texel before anything is
+             * written back: the depth half's destination is that same texel
+             * whenever it fills it, and writing it first would overwrite the
+             * stencil byte before it is read. */
+            if (has_depth)
+               util_format_unpack_z_float(format, tmp_z, packed, width);
+            if (has_stencil)
+               util_format_unpack_s_8uint(format, tmp_s, packed, width);
+
+            if (has_depth)
+               util_format_pack_z_float(depth_format,
+                                        t->depth_offset ? depth_p : packed,
+                                        tmp_z, width);
+            if (has_stencil)
+               util_format_pack_s_8uint(PIPE_FORMAT_S8_UINT,
+                                        t->stencil_offset ? stencil_p : packed,
+                                        tmp_s, width);
+         }
+      }
+   }
+
+   free(row);
+   free(tmp_s);
+   free(tmp_z);
 }
 
 static void *
@@ -3532,15 +3644,74 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
       return (char *)direct + box->x;
    }
 
-   const unsigned bs = util_format_get_blocksize(res->format);
+   /* One Vulkan copy carries exactly one aspect of an image. A texel that holds
+    * both depth and stencil -- which is the layout GL hands the application, and
+    * the only layout the state tracker knows how to unpack -- therefore cannot
+    * arrive in one piece: `vkCmdCopyImageToBuffer` with both bits set is invalid
+    * (VUID-VkBufferImageCopy-aspectMask-09103), and it used to leave the staging
+    * buffer holding whatever was in it, so reading depth or stencil from the
+    * default framebuffer returned noise.
+    *
+    * The half that does not fit in the packed texel gets a region of its own in
+    * the same buffer, and the two are rejoined on the CPU below. */
+   const enum pipe_format format = res->format;
+   const struct util_format_description *desc = util_format_description(format);
+   const bool has_depth = desc && util_format_has_depth(desc);
+   const bool has_stencil = desc && util_format_has_stencil(desc);
+   const enum pipe_format depth_format = has_depth
+      ? sz_vk_depth_pipe_format(screen, format)
+      : PIPE_FORMAT_NONE;
+   const unsigned depth_bs =
+      depth_format == PIPE_FORMAT_NONE ? 0 : util_format_get_blocksize(depth_format);
+   const unsigned pipe_bs = util_format_get_blocksize(format);
+
+   VkImageAspectFlags aspect = sz_format_aspect(format);
+   const bool single_aspect =
+      res->target != PIPE_BUFFER &&
+      (usage & (PIPE_MAP_DEPTH_ONLY | PIPE_MAP_STENCIL_ONLY)) != 0;
+   if (single_aspect)
+      aspect = (usage & PIPE_MAP_DEPTH_ONLY) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                             : VK_IMAGE_ASPECT_STENCIL_BIT;
+
+   /* A request for one aspect wants only that aspect's bytes, so the texel is as
+    * wide as the aspect. Otherwise the caller expects the pipe format's layout. */
+   const unsigned bs = single_aspect
+                          ? ((usage & PIPE_MAP_DEPTH_ONLY) ? depth_bs : 1)
+                          : pipe_bs;
+   const bool want_depth =
+      (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 && res->target != PIPE_BUFFER;
+   const bool want_stencil =
+      (aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 && res->target != PIPE_BUFFER;
+
    const unsigned row_pitch =
       res->target == PIPE_BUFFER
          ? 0
          : (unsigned)sz_resource_linear_pitch(screen, box->width, bs);
-   const uint64_t size =
-      res->target == PIPE_BUFFER
-         ? box->width
-         : (uint64_t)row_pitch * box->height * box->depth;
+   const uint64_t rows = (uint64_t)box->height * box->depth;
+   uint64_t size = res->target == PIPE_BUFFER ? box->width
+                                              : (uint64_t)row_pitch * rows;
+
+   t->row_pitch = row_pitch;
+   t->depth_offset = 0;
+   t->depth_pitch = 0;
+   t->stencil_offset = 0;
+   t->stencil_pitch = 0;
+   t->depth_format = depth_format;
+   t->aspect = aspect;
+
+   /* Depth only needs its own region when it would not fill the packed texel;
+    * stencil needs one unless it is the whole texel already. */
+   if (want_depth && depth_bs != bs) {
+      t->depth_pitch =
+         (unsigned)sz_resource_linear_pitch(screen, box->width, depth_bs);
+      t->depth_offset = (unsigned)size;
+      size += (uint64_t)t->depth_pitch * rows;
+   }
+   if (want_stencil && bs != 1) {
+      t->stencil_pitch = (unsigned)sz_resource_linear_pitch(screen, box->width, 1);
+      t->stencil_offset = (unsigned)size;
+      size += (uint64_t)t->stencil_pitch * rows;
+   }
 
    t->staging = sz_transfer_staging_create(screen, (unsigned)size);
    if (!t->staging) {
@@ -3548,25 +3719,74 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
       return NULL;
    }
 
-   t->row_pitch = row_pitch;
-
-   if (usage & PIPE_MAP_READ) {
-      struct sz_copy_job job = {
+   /* The layout of each region decides what the copies below describe. */
+   struct sz_copy_job jobs[2];
+   unsigned njobs = 0;
+   if (res->target != PIPE_BUFFER) {
+      if (want_depth) {
+         jobs[njobs++] = (struct sz_copy_job){
+            .res = r,
+            .staging = sz_resource(t->staging),
+            .box = *box,
+            .level = level,
+            .to_staging = true,
+            .row_pitch = t->depth_offset ? t->depth_pitch : row_pitch,
+            .staging_offset = t->depth_offset,
+            .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+            .texel_bytes = depth_bs,
+         };
+      }
+      if (want_stencil) {
+         jobs[njobs++] = (struct sz_copy_job){
+            .res = r,
+            .staging = sz_resource(t->staging),
+            .box = *box,
+            .level = level,
+            .to_staging = true,
+            .row_pitch = t->stencil_offset ? t->stencil_pitch : row_pitch,
+            .staging_offset = t->stencil_offset,
+            .aspect = VK_IMAGE_ASPECT_STENCIL_BIT,
+            .texel_bytes = 1,
+         };
+      }
+      if (njobs == 0) {
+         jobs[njobs++] = (struct sz_copy_job){
+            .res = r,
+            .staging = sz_resource(t->staging),
+            .box = *box,
+            .level = level,
+            .to_staging = true,
+            .row_pitch = row_pitch,
+            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+            .texel_bytes = bs,
+         };
+      }
+   } else {
+      jobs[njobs++] = (struct sz_copy_job){
          .res = r,
          .staging = sz_resource(t->staging),
          .box = *box,
          .level = level,
          .to_staging = true,
-         .row_pitch = row_pitch,
+         .row_pitch = 0,
+         .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+         .texel_bytes = 1,
       };
+   }
 
-      if (!sz_oneshot(ctx, &job)) {
-         pipe_resource_reference(&t->staging, NULL);
-         free(t);
-         return NULL;
+   if (usage & PIPE_MAP_READ) {
+      for (unsigned i = 0; i < njobs; i++) {
+         if (!sz_oneshot(ctx, &jobs[i])) {
+            pipe_resource_reference(&t->staging, NULL);
+            free(t);
+            return NULL;
+         }
       }
 
       sz_bo_invalidate(sz_resource(t->staging)->bo, 0, size);
+
+      if (t->depth_offset || t->stencil_offset)
+         sz_transfer_zs_repack(t, box, true);
    }
 
    t->base.stride = res->target == PIPE_BUFFER ? box->width : row_pitch;
@@ -3622,14 +3842,55 @@ sz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
       sz_race_check(ctx, sz_resource(t->base.resource), t->base.box.x,
                     t->base.box.width);
 
-      struct sz_copy_job job = {
-         .res = sz_resource(t->base.resource),
-         .staging = staging,
-         .box = t->base.box,
-         .level = t->base.level,
-         .to_staging = false,
-         .row_pitch = t->row_pitch,
-      };
+      if (t->depth_offset || t->stencil_offset)
+         sz_transfer_zs_repack(t, &t->base.box, false);
+
+      struct sz_copy_job jobs[2];
+      unsigned njobs = 0;
+
+      if (t->base.resource->target == PIPE_BUFFER ||
+          (t->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT |
+                        VK_IMAGE_ASPECT_STENCIL_BIT)) == 0) {
+         jobs[njobs++] = (struct sz_copy_job){
+            .res = sz_resource(t->base.resource),
+            .staging = staging,
+            .box = t->base.box,
+            .level = t->base.level,
+            .to_staging = false,
+            .row_pitch = t->row_pitch,
+            .aspect = t->aspect,
+            .texel_bytes = util_format_get_blocksize(t->base.resource->format),
+         };
+      } else {
+         /* Only the aspects this transfer claimed are written back, so a
+          * depth-only map leaves the stencil buffer alone. */
+         if (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            jobs[njobs++] = (struct sz_copy_job){
+               .res = sz_resource(t->base.resource),
+               .staging = staging,
+               .box = t->base.box,
+               .level = t->base.level,
+               .to_staging = false,
+               .row_pitch = t->depth_offset ? t->depth_pitch : t->row_pitch,
+               .staging_offset = t->depth_offset,
+               .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+               .texel_bytes = util_format_get_blocksize(t->depth_format),
+            };
+         }
+         if (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
+            jobs[njobs++] = (struct sz_copy_job){
+               .res = sz_resource(t->base.resource),
+               .staging = staging,
+               .box = t->base.box,
+               .level = t->base.level,
+               .to_staging = false,
+               .row_pitch = t->stencil_offset ? t->stencil_pitch : t->row_pitch,
+               .staging_offset = t->stencil_offset,
+               .aspect = VK_IMAGE_ASPECT_STENCIL_BIT,
+               .texel_bytes = 1,
+            };
+         }
+      }
 
       /* Uploads are recorded into the command buffer that is already being
        * built, not submitted on their own.
@@ -3656,10 +3917,12 @@ sz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
       sz_draw_flush(ctx);
 
       VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
-      if (cmd != VK_NULL_HANDLE)
-         sz_copy_job_record(ctx, cmd, &job);
-      else
-         sz_oneshot(ctx, &job);
+      for (unsigned i = 0; i < njobs; i++) {
+         if (cmd != VK_NULL_HANDLE)
+            sz_copy_job_record(ctx, cmd, &jobs[i]);
+         else
+            sz_oneshot(ctx, &jobs[i]);
+      }
    }
 
    pipe_resource_reference(&t->staging, NULL);
