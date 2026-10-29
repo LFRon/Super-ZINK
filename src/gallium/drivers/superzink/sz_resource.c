@@ -245,6 +245,14 @@ sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
                                  ? sz_image_create_flags(tmpl->target)
                                  : 0;
 
+   /* A texture bound to an image unit is viewed with that unit's format, which
+    * need not be the one the texture was created with: GL lets an application
+    * bind an rgba16f image over an rg32f texture and reads the same bytes either
+    * way. Vulkan refuses a view whose format differs from the image's unless the
+    * image was created mutable. */
+   if (tmpl->bind & PIPE_BIND_SHADER_IMAGE)
+      flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
    /* 3D images are never attachments in Gallium's model, and a 1D image cannot
     * have a depth/stencil attachment in Vulkan at all -- but GL has 1D depth
     * textures, so the sampled use has to survive while the attachment use does

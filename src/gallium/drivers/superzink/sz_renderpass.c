@@ -58,11 +58,18 @@ sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format
    const unsigned first_layer = surf->first_layer;
    const unsigned layer_count = MAX2(surf->last_layer - surf->first_layer + 1, 1);
 
-   /* A view is only needed when it addresses less than the whole image. */
+   /* A view is only needed when it addresses less than the whole image, or when
+    * it reinterprets the texels. The whole-image view carries the resource's own
+    * format, and a storage image unit names the format it wants to read and
+    * write the texels with -- GL lets an application bind an r8_snorm image over
+    * an r8 texture, and reading through the resource's view then returns the
+    * texel as unorm. */
    const bool whole_levels = first_level == 0 && level_count > res->base.last_level;
    const bool whole_layers =
       first_layer == 0 && layer_count >= res->base.array_size;
-   if (whole_levels && whole_layers)
+   const bool same_format =
+      format == sz_vk_format(ctx->screen, res->base.format);
+   if (whole_levels && whole_layers && same_format)
       return res->view;
 
    /* A single layer of a cube or cube array is a 2D view of that face; a
