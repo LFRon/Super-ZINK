@@ -34,10 +34,6 @@ sz_renderpass_is_valid(struct sz_context *ctx)
 }
 
 
-/* A cache bound rather than a hard limit: past this, attachments use the
- * whole-image view. */
-#define SZ_MAX_SURFACE_VIEWS 64
-
 /* An image view for exactly the subresource a framebuffer attachment names.
  *
  * `res->view` addresses the whole image, which is right for a 2D texture but
@@ -46,9 +42,10 @@ sz_renderpass_is_valid(struct sz_context *ctx)
  * *all* of them. GL's glFramebufferTextureLayer and every cube map's per-face
  * FBO selection land here.
  *
- * The views are cached on the context and dropped whenever the framebuffer
- * changes, because that is exactly when the set is no longer needed; the
- * objects themselves live until the image does. */
+ * The views are cached on the resource they belong to, so they are destroyed
+ * with the image rather than outliving it; a context-wide cache keyed by the
+ * resource pointer handed out handles of already-destroyed images as soon as a
+ * new resource reused an old address. */
 VkImageView
 sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format,
                 const struct pipe_surface *surf)
@@ -102,9 +99,9 @@ sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format
       break;
    }
 
-   for (unsigned i = 0; i < ctx->num_surface_views; i++) {
-      const struct sz_surface_view *v = &ctx->surface_views[i];
-      if (v->res == res && v->format == format && v->type == type &&
+   for (unsigned i = 0; i < res->num_subresource_views; i++) {
+      const struct sz_subresource_view *v = &res->subresource_views[i];
+      if (v->format == format && v->type == type &&
           v->first_level == first_level && v->level_count == level_count &&
           v->first_layer == first_layer && v->layer_count == layer_count)
          return v->view;
@@ -115,17 +112,19 @@ sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format
     * whole-image view then, which is correct for an unlayered attachment and is
     * what happened for every attachment before this cache existed. Growing
     * without a bound would leak a view per FBO rebind. */
-   if (ctx->num_surface_views == SZ_MAX_SURFACE_VIEWS)
+   if (res->num_subresource_views == SZ_MAX_SUBRESOURCE_VIEWS)
       return res->view;
 
-   if (ctx->num_surface_views == ctx->surface_views_capacity) {
-      const unsigned capacity = MIN2(MAX2(ctx->surface_views_capacity * 2, 8),
-                                     SZ_MAX_SURFACE_VIEWS);
-      void *grown = realloc(ctx->surface_views, capacity * sizeof(*ctx->surface_views));
+   if (res->num_subresource_views == res->subresource_views_capacity) {
+      const unsigned capacity =
+         MIN2(MAX2(res->subresource_views_capacity * 2, 8),
+              SZ_MAX_SUBRESOURCE_VIEWS);
+      void *grown = realloc(res->subresource_views,
+                            capacity * sizeof(*res->subresource_views));
       if (!grown)
          return res->view;
-      ctx->surface_views = grown;
-      ctx->surface_views_capacity = capacity;
+      res->subresource_views = grown;
+      res->subresource_views_capacity = capacity;
    }
 
    const VkImageViewCreateInfo ci = {
@@ -147,10 +146,10 @@ sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format
        VK_SUCCESS)
       return res->view;
 
-   struct sz_surface_view *v = &ctx->surface_views[ctx->num_surface_views++];
-   *v = (struct sz_surface_view) {
+   struct sz_subresource_view *v =
+      &res->subresource_views[res->num_subresource_views++];
+   *v = (struct sz_subresource_view) {
       .view = view,
-      .res = res,
       .format = format,
       .first_level = first_level,
       .level_count = level_count,

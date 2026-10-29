@@ -4139,13 +4139,6 @@ sz_context_destroy(struct pipe_context *pipe)
       pipe_so_target_reference(&ctx->so_prev_targets[i], NULL);
    }
 
-   for (unsigned i = 0; i < ctx->num_surface_views; i++)
-      if (ctx->surface_views[i].view != VK_NULL_HANDLE &&
-          ctx->surface_views[i].view != ctx->surface_views[i].res->view)
-         ctx->screen->vk.DestroyImageView(ctx->screen->dev,
-                                          ctx->surface_views[i].view, NULL);
-   free(ctx->surface_views);
-
    if (ctx->so_counter_buffer != VK_NULL_HANDLE) {
       sz_bo_free(ctx->so_counter_bo);
       ctx->screen->vk.DestroyBuffer(ctx->screen->dev, ctx->so_counter_buffer,

@@ -669,6 +669,13 @@ sz_resource_destroy_now(struct sz_screen *screen, struct pipe_resource *pres)
 
    if (res->buffer != VK_NULL_HANDLE)
       screen->vk.DestroyBuffer(screen->dev, res->buffer, NULL);
+   /* Before the image, which Vulkan will not let go while a view of it exists.
+    * The submission that could still name them is known to have retired: only
+    * sz_resource_reclaim() and teardown call this. */
+   for (unsigned i = 0; i < res->num_subresource_views; i++)
+      screen->vk.DestroyImageView(screen->dev,
+                                  res->subresource_views[i].view, NULL);
+   free(res->subresource_views);
    if (res->view != VK_NULL_HANDLE)
       screen->vk.DestroyImageView(screen->dev, res->view, NULL);
    if (res->image != VK_NULL_HANDLE)

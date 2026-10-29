@@ -22,6 +22,25 @@
 #include "sz_bo.h"
 #include "sz_types.h"
 
+/* One view of a subresource range of an image, remembered so a framebuffer that
+ * names the same layer twice does not create a second object.
+ *
+ * These live on the resource, not on the context, because their lifetime is the
+ * image's: Vulkan requires every view of an image to be destroyed before the
+ * image, and a cache that outlived the resource handed out handles that had
+ * already been destroyed whenever a new resource reused the old address. */
+struct sz_subresource_view {
+   VkImageView view;
+   VkFormat format;
+   VkImageViewType type;
+   unsigned first_level, level_count;
+   unsigned first_layer, layer_count;
+};
+
+/* A cache bound rather than a hard limit: past this, callers fall back to the
+ * whole-image view for unlayered attachments. */
+#define SZ_MAX_SUBRESOURCE_VIEWS 32
+
 struct sz_resource {
    struct pipe_resource base;
 
@@ -48,6 +67,13 @@ struct sz_resource {
     * reinterpret the format or address a sub-range need their own object and
     * arrive with the sampler-view work. */
    VkImageView view;
+
+   /* Views of the subresource ranges of `image` that a framebuffer attachment
+    * or a storage image unit named: one cube face, one array layer, or a
+    * format reinterpretation of the whole thing. Destroyed with the image. */
+   struct sz_subresource_view *subresource_views;
+   unsigned num_subresource_views;
+   unsigned subresource_views_capacity;
 
    /* Current layout, or VK_IMAGE_LAYOUT_UNDEFINED for buffers.
     *

@@ -102,16 +102,9 @@ struct sz_sampler_view {
    VkBufferView buffer_view;
 };
 
-/* Views of the subresources a framebuffer attachment names, cached per
- * framebuffer. Defined here because the context owns the array. */
-struct sz_surface_view {
-   VkImageView view;
-   struct sz_resource *res;
-   VkFormat format;
-   VkImageViewType type;
-   unsigned first_level, level_count;
-   unsigned first_layer, layer_count;
-};
+/* Views of the subresources a framebuffer attachment names are cached on the
+ * resource (struct sz_subresource_view in sz_resource.h), so that they are
+ * destroyed with the image they are a view of. */
 
 struct sz_gfx_pipeline;
 
@@ -236,11 +229,8 @@ struct sz_context {
     * many. */
    bool so_counter_dirty;
 
-   /* Cached image views for the layers a framebuffer names. Dropped whenever
-    * the framebuffer changes, since that is when a different set is wanted. */
-   struct sz_surface_view *surface_views;
-   unsigned num_surface_views;
-   unsigned surface_views_capacity;
+   /* Cached image views for the layers a framebuffer names live on the resource
+    * they belong to (sz_resource::subresource_views), not here. */
 
    /* Draw stream: draws accumulate here and leave as one vkCmdDrawMulti* call.
     *
