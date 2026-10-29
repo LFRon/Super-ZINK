@@ -138,14 +138,19 @@ sz_vk_format(struct sz_screen *screen, enum pipe_format format)
    case PIPE_FORMAT_S8_UINT:
    case PIPE_FORMAT_X24S8_UINT:
    case PIPE_FORMAT_S8X24_UINT:
+   case PIPE_FORMAT_X32_S8X24_UINT:
       /* GL's stencil-only texture formats. Mesa's pipe-to-Vulkan table has no
        * entry for the two combined layouts -- they are the stencil view of a
        * depth/stencil image whose depth half the format ignores -- and Vulkan's
        * own stencil-only format is S8_UINT, which RADV can both attach and
-       * sample. Backing all three with it is what makes
+       * sample. Backing all four with it is what makes
        * GL_DEPTH_STENCIL_TEXTURE_MODE = GL_STENCIL_INDEX expressible at all: a
        * view may name only one aspect of a combined image, and a stencil-only
-       * image names exactly that one. */
+       * image names exactly that one. X32_S8X24_UINT is what
+       * util_format_stencil_only() makes of a D32_SFLOAT_S8_UINT texel, i.e.
+       * the stencil half of the temp texture glDrawPixels builds for
+       * GL_DEPTH_STENCIL -- without the mapping that view had no format and the
+       * draw came back as GL_OUT_OF_MEMORY. */
       return VK_FORMAT_S8_UINT;
    default:
       break;
@@ -167,18 +172,31 @@ sz_vk_format(struct sz_screen *screen, enum pipe_format format)
       return ret;
 
    case VK_FORMAT_X8_D24_UNORM_PACK32:
-      /* Unlike the depth/stencil case above this one is deliberately *not*
-       * substituted. A 24-bit depth texture has no stencil aspect to preserve,
-       * so the state tracker can pick another format itself -- and it picks
-       * Z32_FLOAT, whose texel layout matches what the transfer path copies.
-       * Substituting D32_SFLOAT here would make GL_DEPTH_COMPONENT24 images
-       * claim one layout and store another, and every readback of them would
-       * come back as float bits reinterpreted as a 24-bit unorm: exactly the
-       * failure mode the substitution for DEPTH24_STENCIL8 has and that cannot
-       * be avoided there, because dropping *that* one removes stencil support
-       * entirely. */
-      if (!screen->have_x8_d24_unorm_pack32)
+      /* GL_DEPTH_COMPONENT24, with no stencil aspect to preserve, and the same
+       * substitution the depth/stencil case above makes: RADV has no 24-bit
+       * depth at all, so the choice is between a 32-bit float and whatever the
+       * state tracker falls back to on its own.
+       *
+       * Left unsupported, that fallback is Z16_UNORM -- not Z32_FLOAT. Mesa
+       * searches GL_DEPTH_COMPONENT24's list in order (Z24X8, X8Z24, then
+       * DEFAULT_DEPTH_FORMATS = Z24X8, X8Z24, Z16, Z24S8, S8Z24) and Z16 is the
+       * first entry a device without 24-bit depth can back. A 24-bit depth
+       * buffer that is silently 16 bits wide is already a wrong picture; worse,
+       * it makes the attachment format differ from the 24-bit depth/stencil
+       * every other framebuffer uses, which turns glBlitFramebuffer between the
+       * two into GL_INVALID_OPERATION ("depth attachment format mismatch") and
+       * drops the blit entirely -- that is what
+       * ext_framebuffer_multisample@no-color depth saw as an empty image.
+       *
+       * Storing the depth in D32 keeps every bit GL was promised, and the
+       * transfer path already reads a D32 image back as Z32_FLOAT (see
+       * sz_vk_depth_pipe_format), so a readback converts from float to whatever
+       * the application asked for exactly as it does for DEPTH24_STENCIL8. */
+      if (!screen->have_x8_d24_unorm_pack32) {
+         if (screen->have_d32_sfloat)
+            return VK_FORMAT_D32_SFLOAT;
          return VK_FORMAT_UNDEFINED;
+      }
       return ret;
 
    default:
