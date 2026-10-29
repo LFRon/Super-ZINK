@@ -47,14 +47,10 @@ sz_renderpass_is_valid(struct sz_context *ctx)
  * resource pointer handed out handles of already-destroyed images as soon as a
  * new resource reused an old address. */
 VkImageView
-sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format,
-                const struct pipe_surface *surf)
+sz_resource_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format,
+                 VkImageAspectFlags aspects, unsigned first_level,
+                 unsigned level_count, unsigned first_layer, unsigned layer_count)
 {
-   const unsigned first_level = surf->level;
-   const unsigned level_count = 1;
-   const unsigned first_layer = surf->first_layer;
-   const unsigned layer_count = MAX2(surf->last_layer - surf->first_layer + 1, 1);
-
    /* A view is only needed when it addresses less than the whole image, or when
     * it reinterprets the texels. The whole-image view carries the resource's own
     * format, and a storage image unit names the format it wants to read and
@@ -66,7 +62,8 @@ sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format
       first_layer == 0 && layer_count >= res->base.array_size;
    const bool same_format =
       format == sz_vk_format(ctx->screen, res->base.format);
-   if (whole_levels && whole_layers && same_format)
+   const bool whole_aspects = aspects == sz_format_aspect(res->base.format);
+   if (whole_levels && whole_layers && same_format && whole_aspects)
       return res->view;
 
    /* A single layer of a cube or cube array is a 2D view of that face; a
@@ -102,6 +99,7 @@ sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format
    for (unsigned i = 0; i < res->num_subresource_views; i++) {
       const struct sz_subresource_view *v = &res->subresource_views[i];
       if (v->format == format && v->type == type &&
+          v->aspects == aspects &&
           v->first_level == first_level && v->level_count == level_count &&
           v->first_layer == first_layer && v->layer_count == layer_count)
          return v->view;
@@ -133,7 +131,7 @@ sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format
       .viewType = type,
       .format = format,
       .subresourceRange = {
-         .aspectMask = sz_format_aspect(res->base.format),
+         .aspectMask = aspects,
          .baseMipLevel = first_level,
          .levelCount = level_count,
          .baseArrayLayer = first_layer,
@@ -154,10 +152,23 @@ sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format
       .first_level = first_level,
       .level_count = level_count,
       .type = type,
+      .aspects = aspects,
       .first_layer = first_layer,
       .layer_count = layer_count,
    };
    return view;
+}
+
+/* The attachment view for a framebuffer surface: the whole aspect mask of the
+ * resource, one level, the layers the surface names. */
+VkImageView
+sz_surface_view(struct sz_context *ctx, struct sz_resource *res, VkFormat format,
+                const struct pipe_surface *surf)
+{
+   return sz_resource_view(ctx, res, format,
+                           sz_format_aspect(res->base.format), surf->level, 1,
+                           surf->first_layer,
+                           MAX2(surf->last_layer - surf->first_layer + 1, 1));
 }
 
 bool

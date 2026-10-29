@@ -14,6 +14,10 @@
 
 #include "sz_context.h"
 
+#include "nir/tgsi_to_nir.h"
+
+#include "util/u_blitter.h"
+
 #include "sz_descriptor.h"
 
 #include "sz_batch.h"
@@ -712,20 +716,34 @@ sz_create_shader_state(struct pipe_context *pipe,
     * created it by design (cso_context keeps the bound object and rebinds it).
     * Pointing at the caller's copy works until the caller frees it, which happens
     * on the very next program change. */
-   if (templ->type != PIPE_SHADER_IR_NIR || !templ->ir.nir) {
-      sz_warn_once("only NIR shaders are supported");
-      state->u.shader.base.ir.nir = NULL;
-      return state;
-   }
-
    state->u.shader.mem_ctx = ralloc_context(NULL);
    if (!state->u.shader.mem_ctx) {
       free(state);
       return NULL;
    }
 
-   state->u.shader.nir = nir_shader_clone(state->u.shader.mem_ctx, templ->ir.nir);
-   state->u.shader.base.ir.nir = state->u.shader.nir;
+   if (templ->type == PIPE_SHADER_IR_TGSI && templ->tokens) {
+      /* Only the internal shaders arrive as TGSI: util_blitter's MSAA resolve
+       * and depth/stencil blit shaders are written in it, and every driver is
+       * expected to accept them through the same entry point as GLSL. */
+      state->u.shader.nir =
+         tgsi_to_nir(templ->tokens, pipe->screen, false);
+      if (!state->u.shader.nir) {
+         ralloc_free(state->u.shader.mem_ctx);
+         free(state);
+         return NULL;
+      }
+      state->u.shader.base.ir.nir = state->u.shader.nir;
+   } else if (templ->type != PIPE_SHADER_IR_NIR || !templ->ir.nir) {
+      sz_warn_once("only NIR shaders are supported");
+      state->u.shader.base.ir.nir = NULL;
+      ralloc_free(state->u.shader.mem_ctx);
+      state->u.shader.mem_ctx = NULL;
+      return state;
+   } else {
+      state->u.shader.nir = nir_shader_clone(state->u.shader.mem_ctx, templ->ir.nir);
+      state->u.shader.base.ir.nir = state->u.shader.nir;
+   }
 
    sz_lower_nir(state->u.shader.nir);
 
@@ -2210,13 +2228,20 @@ sz_emit_viewport(struct sz_context *ctx, VkCommandBuffer cmd)
       const struct pipe_viewport_state *vp =
          ctx->state.num_viewports == 0 ? &fallback
                                        : &ctx->state.viewports[slot];
+      /* The depth range is clamped to Vulkan's [0, 1]: without
+       * VK_EXT_depth_range_unrestricted a viewport may not name anything
+       * outside it. A GL depth range of [-1, 1] -- which is what a viewport with
+       * translate 0 and scale 1 means, and what util_blitter uses for its own
+       * quads -- therefore becomes the identity transform, which is also what a
+       * shader writing gl_FragDepth expects: that value is already in window
+       * coordinates and must not be remapped. */
       viewports[i] = (VkViewport) {
          .x = vp->translate[0] - vp->scale[0],
          .y = vp->translate[1] - vp->scale[1],
          .width = 2.0f * vp->scale[0],
          .height = 2.0f * vp->scale[1],
-         .minDepth = vp->translate[2] - vp->scale[2],
-         .maxDepth = vp->translate[2] + vp->scale[2],
+         .minDepth = CLAMP(vp->translate[2] - vp->scale[2], 0.0f, 1.0f),
+         .maxDepth = CLAMP(vp->translate[2] + vp->scale[2], 0.0f, 1.0f),
       };
    }
 
@@ -4152,6 +4177,20 @@ sz_set_debug_callback(struct pipe_context *pipe,
 {
 }
 
+/* Mesa's blitter disables queries around its own draws, which is a request to
+ * keep them out of the results.
+ *
+ * Vulkan has no way to suspend a query: a query may only be begun again after a
+ * reset, and a reset throws away what it had counted. Announcing the hook
+ * anyway is still better than leaving it NULL -- util_blitter calls it
+ * unconditionally, so its absence is a null call the first time any blit needs a
+ * draw. The inaccuracy it leaves behind is bounded and rare: an occlusion query
+ * that spans a blit counts the blitter's fragments as well. */
+static void
+sz_set_active_query_state(struct pipe_context *pipe, bool enable)
+{
+}
+
 static void
 sz_context_destroy(struct pipe_context *pipe)
 {
@@ -4207,6 +4246,8 @@ sz_context_destroy(struct pipe_context *pipe)
    if (ctx->compute_pipeline != VK_NULL_HANDLE)
       ctx->screen->vk.DestroyPipeline(ctx->screen->dev, ctx->compute_pipeline,
                                       NULL);
+
+   util_blitter_destroy(ctx->blitter);
 
    u_upload_destroy(ctx->base.const_uploader);
    u_upload_destroy(ctx->base.stream_uploader);
@@ -4748,6 +4789,7 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->set_patch_vertices = sz_set_patch_vertices;
    pipe->set_stream_output_targets = sz_set_stream_output_targets;
    pipe->set_debug_callback = sz_set_debug_callback;
+   pipe->set_active_query_state = sz_set_active_query_state;
 
    /* Drawing. */
    pipe->draw_vbo = sz_draw_vbo;
@@ -4806,6 +4848,15 @@ sz_context_create(struct sz_screen *screen, unsigned flags)
    pipe->const_uploader = u_upload_create_default(pipe);
    if (!pipe->const_uploader) {
       mesa_loge("SZ: could not create the constant uploader");
+      u_upload_destroy(pipe->stream_uploader);
+      free(ctx);
+      return NULL;
+   }
+
+   ctx->blitter = util_blitter_create(pipe);
+   if (!ctx->blitter) {
+      mesa_loge("SZ: could not create the blitter");
+      u_upload_destroy(pipe->const_uploader);
       u_upload_destroy(pipe->stream_uploader);
       free(ctx);
       return NULL;

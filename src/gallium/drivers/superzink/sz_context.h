@@ -190,6 +190,13 @@ struct sz_context {
     * the command buffer. */
    unsigned dirty;
 
+   /* Mesa's generic blitter, used for the blits no single Vulkan command can
+    * express: an MSAA depth or stencil copy, a scaled stencil blit, a depth
+    * resolve whose two corners do not line up. It is a set of shaders and draws,
+    * so it composes with the same pipeline as everything else instead of needing
+    * a second renderer. */
+   struct blitter_context *blitter;
+
    /* Conditional rendering. The predicate is resolved when glBeginConditional-
     * Render is called -- the GL specification allows blocking there, and doing
     * it once is far cheaper than testing the condition per draw. Draws recorded

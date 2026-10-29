@@ -33,6 +33,7 @@ struct sz_subresource_view {
    VkImageView view;
    VkFormat format;
    VkImageViewType type;
+   VkImageAspectFlags aspects;
    unsigned first_level, level_count;
    unsigned first_layer, layer_count;
 };

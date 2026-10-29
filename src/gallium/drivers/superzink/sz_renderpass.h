@@ -25,6 +25,13 @@
 VkImageView sz_surface_view(struct sz_context *ctx, struct sz_resource *res,
                             VkFormat format, const struct pipe_surface *surf);
 
+/* The same cache, for a caller that is not a framebuffer attachment: any
+ * aspect mask, level and layer range. */
+VkImageView sz_resource_view(struct sz_context *ctx, struct sz_resource *res,
+                             VkFormat format, VkImageAspectFlags aspects,
+                             unsigned first_level, unsigned level_count,
+                             unsigned first_layer, unsigned layer_count);
+
 bool sz_renderpass_is_valid(struct sz_context *ctx);
 
 /* Transitions the attachments and starts dynamic rendering.

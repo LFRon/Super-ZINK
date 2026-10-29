@@ -23,14 +23,18 @@
 
 #include "sz_context.h"
 #include "sz_format.h"
+#include "sz_renderpass.h"
 #include "sz_resource.h"
 #include "sz_sync.h"
 
 #include "util/format/u_format.h"
 #include "util/format/u_formats.h"
 #include "util/log.h"
+#include "util/u_blitter.h"
 #include "util/macros.h"
+#include "util/u_math.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* Gallium boxes are signed and may describe a flip for the source. Vulkan's
@@ -89,11 +93,274 @@ sz_box_equals(const struct pipe_box *a, const struct pipe_box *b)
    return ea.width == eb.width && ea.height == eb.height && ea.depth == eb.depth;
 }
 
+/* Whether vkCmdBlitImage2 can read and write this format.
+ *
+ * Depth is the reason this is asked: a copy is the obvious way to move depth
+ * between two single-sampled images, but on RADV a depth image written by
+ * vkCmdCopyImage2 and then attached as a depth buffer reads back as the
+ * fast-clear value in scattered tiles -- HTILE is only brought up to date by the
+ * render pass paths, not by a transfer. A blit of a depth format goes through
+ * the driver's own depth blit instead, which does maintain it. */
+static bool
+sz_format_can_blit(struct sz_screen *screen, VkFormat format)
+{
+   VkFormatProperties props;
+   screen->vk.GetPhysicalDeviceFormatProperties(screen->pdev, format, &props);
+   const VkFormatFeatureFlags needed =
+      VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+   return (props.optimalTilingFeatures & needed) == needed;
+}
+
+/* The blits no single Vulkan command can express, handed to Mesa's blitter.
+ *
+ * Three of them are worth spelling out, because each is a legal GL request with
+ * no Vulkan counterpart at all:
+ *
+ *  - a multisampled blit whose source and destination have the *same* sample
+ *    count (glBlitFramebuffer on a multisampled framebuffer, or glCopyPixels
+ *    with one). Vulkan forbids blits, copies and resolves between multisampled
+ *    images; the blitter draws each sample instead.
+ *  - a multisampled blit with different extents, which GL defines as "resolve,
+ *    then scale" and Vulkan cannot do in one step.
+ *  - a depth or stencil resolve whose two corners do not line up, which the
+ *    render pass resolve cannot express because a render pass reads and writes
+ *    the same coordinates.
+ *
+ * The blitter builds its shaders in TGSI and draws them through the ordinary
+ * pipeline, so this costs the driver no second renderer. */
+static bool
+sz_blit_blitter(struct sz_context *ctx, const struct pipe_blit_info *info)
+{
+   struct blitter_context *blitter = ctx->blitter;
+   if (!blitter || !util_blitter_is_blit_supported(blitter, info))
+      return false;
+
+   util_blitter_save_framebuffer(blitter, &ctx->state.framebuffer);
+   util_blitter_save_vertex_buffers(blitter, ctx->state.vertex_buffers,
+                                    ctx->state.num_vertex_buffers);
+   util_blitter_save_vertex_elements(blitter, ctx->state.vertex_elements);
+   util_blitter_save_viewport(blitter, ctx->state.viewports);
+   util_blitter_save_scissor(blitter, ctx->state.scissors);
+   util_blitter_save_rasterizer(blitter, ctx->state.rasterizer);
+   util_blitter_save_depth_stencil_alpha(blitter,
+                                         ctx->state.depth_stencil_alpha);
+   util_blitter_save_blend(blitter, ctx->state.blend);
+   util_blitter_save_stencil_ref(blitter, &ctx->state.stencil_ref);
+   util_blitter_save_sample_mask(blitter, ctx->state.sample_mask, 1);
+   util_blitter_save_vertex_shader(blitter,
+                                   ctx->state.shaders[MESA_SHADER_VERTEX]);
+   util_blitter_save_tessctrl_shader(blitter,
+                                     ctx->state.shaders[MESA_SHADER_TESS_CTRL]);
+   util_blitter_save_tesseval_shader(blitter,
+                                     ctx->state.shaders[MESA_SHADER_TESS_EVAL]);
+   util_blitter_save_geometry_shader(blitter,
+                                     ctx->state.shaders[MESA_SHADER_GEOMETRY]);
+   util_blitter_save_fragment_shader(blitter,
+                                     ctx->state.shaders[MESA_SHADER_FRAGMENT]);
+   util_blitter_save_so_targets(blitter, ctx->num_so_targets, ctx->so_targets,
+                               MESA_PRIM_UNKNOWN);
+   util_blitter_save_fragment_sampler_states(
+      blitter, PIPE_MAX_SAMPLERS,
+      ctx->state.sampler_states[MESA_SHADER_FRAGMENT]);
+   util_blitter_save_fragment_sampler_views(
+      blitter, PIPE_MAX_SAMPLERS,
+      ctx->state.sampler_views[MESA_SHADER_FRAGMENT]);
+   util_blitter_save_fragment_constant_buffer_slot(
+      blitter, &ctx->state.constant_buffers[MESA_SHADER_FRAGMENT][0]);
+
+   util_blitter_blit(blitter, info, NULL);
+   return true;
+}
+
+/* A depth or stencil resolve.
+ *
+ * vkCmdResolveImage2 is not available here: it may only touch those aspects
+ * with the maintenance10 feature, which RADV does not enable (and without the
+ * VkResolveImageModeInfoKHR this driver has no way to pass, its depth path
+ * dereferences NULL and crashes outright).
+ *
+ * Vulkan's other resolve mechanism is the render pass: VkRenderingAttachmentInfo
+ * names a resolve image, and the resolve runs over the render area when the pass
+ * ends. No draw is recorded at all -- the attachment is loaded, resolved, and
+ * stored with DONT_CARE, so the multisampled image is left untouched. Sample
+ * zero is GL's rule for both aspects: unlike colour, neither is averaged. */
+static void
+sz_blit_resolve_ds(struct sz_context *ctx, VkCommandBuffer cmd,
+                   const struct pipe_blit_info *info, struct sz_resource *src,
+                   struct sz_resource *dst, VkImageAspectFlags aspect)
+{
+   struct sz_screen *screen = ctx->screen;
+
+   VkOffset3D src_off[2], dst_off[2];
+   sz_blit_offsets(&info->src.box, false, src_off);
+   sz_blit_offsets(&info->dst.box, false, dst_off);
+
+   /* The render area is measured in the destination image, and the attachment
+    * is read from the same coordinates, so the two corners have to agree. */
+   if (src_off[0].x != dst_off[0].x || src_off[0].y != dst_off[0].y) {
+      sz_warn_once("a depth or stencil resolve from an offset");
+      return;
+   }
+
+   const unsigned first_layer = MAX2(info->dst.box.z, 0);
+   const unsigned layer_count = MAX2(info->dst.box.depth, 1);
+   const VkFormat format = sz_vk_format(screen, info->dst.format);
+   const VkImageAspectFlags src_aspects =
+      aspect == VK_IMAGE_ASPECT_DEPTH_BIT
+         ? VK_IMAGE_ASPECT_DEPTH_BIT
+         : VK_IMAGE_ASPECT_STENCIL_BIT;
+
+   /* Both images are read and written as attachments for the duration of the
+    * resolve, so this is the layout pair the render pass expects. */
+   sz_resource_access_levels(screen, cmd, src, SZ_ACCESS_DEPTH_ATTACH,
+                             info->src.level, 1);
+   sz_resource_access_levels(screen, cmd, dst, SZ_ACCESS_DEPTH_ATTACH,
+                             info->dst.level, 1);
+
+   const VkImageView src_view =
+      sz_resource_view(ctx, src, format, src_aspects, info->src.level, 1,
+                       first_layer, layer_count);
+   const VkImageView dst_view =
+      sz_resource_view(ctx, dst, format, src_aspects, info->dst.level, 1,
+                       first_layer, layer_count);
+   if (src_view == VK_NULL_HANDLE || dst_view == VK_NULL_HANDLE) {
+      sz_warn_once("a depth or stencil resolve without a view");
+      return;
+   }
+
+   const VkRenderingAttachmentInfo attachment = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = src_view,
+      .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .resolveImageView = dst_view,
+      .resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+      .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+   };
+
+   const VkExtent3D extent = sz_box_extent(&info->dst.box, false);
+   const VkRenderingInfo resolve = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = {
+         .offset = { dst_off[0].x, dst_off[0].y },
+         .extent = { extent.width, extent.height },
+      },
+      .layerCount = 1,
+      .pDepthAttachment =
+         aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? &attachment : NULL,
+      .pStencilAttachment =
+         aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? &attachment : NULL,
+   };
+
+   ctx->screen->stats.resolves++;
+
+   screen->vk.CmdBeginRendering(cmd, &resolve);
+   screen->vk.CmdEndRendering(cmd);
+}
+
+static void sz_blit_copy(struct sz_context *ctx, VkCommandBuffer cmd,
+                         const struct pipe_blit_info *info,
+                         struct sz_resource *src, struct sz_resource *dst,
+                         VkImageAspectFlags aspect);
+
+/* A depth or stencil resolve whose two corners do not line up.
+ *
+ * The render pass resolve reads and writes the same coordinates, so it can only
+ * express "resolve this rectangle onto itself". glBlitFramebuffer asks for
+ * exactly that in the common case -- but glBlitFramebuffer between two regions
+ * of one multisampled framebuffer, and glCopyPixels, both move the result. The
+ * resolve therefore lands in a temporary single-sampled image at the source's
+ * own coordinates, and a copy moves it to the destination.
+ *
+ * Both halves are operations this file already performs, so no new Vulkan
+ * feature is involved. The temporary is released through the screen's retire
+ * list, which keeps it alive until the submission that names it has completed. */
+static bool
+sz_blit_resolve_offset(struct sz_context *ctx, VkCommandBuffer cmd,
+                       const struct pipe_blit_info *info,
+                       struct sz_resource *src, struct sz_resource *dst,
+                       VkImageAspectFlags aspect)
+{
+   struct sz_screen *screen = ctx->screen;
+
+   /* A copy cannot mirror, and neither can a render pass: a flipped source has
+    * no path here and is left to the blitter. */
+   if (info->src.box.width < 0 || info->src.box.height < 0 ||
+       info->dst.box.width < 0 || info->dst.box.height < 0)
+      return false;
+
+   const unsigned width = u_minify(info->src.resource->width0, info->src.level);
+   const unsigned height = u_minify(info->src.resource->height0, info->src.level);
+
+   const struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = info->src.resource->format,
+      .bind = PIPE_BIND_DEPTH_STENCIL,
+      .usage = PIPE_USAGE_DEFAULT,
+      .width0 = width,
+      .height0 = height,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 0,
+      .nr_samples = 1,
+      .nr_storage_samples = 1,
+   };
+
+   struct pipe_resource *temp =
+      screen->base.resource_create(&screen->base, &templ);
+   if (!temp) {
+      sz_warn_once("no temporary for a depth or stencil resolve");
+      return false;
+   }
+   struct sz_resource *tmp = sz_resource(temp);
+
+   if (tmp->image == VK_NULL_HANDLE) {
+      screen->base.resource_destroy(&screen->base, temp);
+      return false;
+   }
+
+   const struct pipe_box box = {
+      .x = info->src.box.x,
+      .y = info->src.box.y,
+      .z = 0,
+      .width = info->src.box.width,
+      .height = info->src.box.height,
+      .depth = 1,
+   };
+
+   struct pipe_blit_info resolve = *info;
+   resolve.dst.resource = temp;
+   resolve.dst.level = 0;
+   resolve.dst.format = info->src.resource->format;
+   resolve.dst.box = box;
+   resolve.mask = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? PIPE_MASK_Z
+                                                       : PIPE_MASK_S;
+   resolve.filter = PIPE_TEX_FILTER_NEAREST;
+   resolve.swizzle_enable = false;
+   sz_blit_resolve_ds(ctx, cmd, &resolve, src, tmp, aspect);
+
+   struct pipe_blit_info copy = *info;
+   copy.src.resource = temp;
+   copy.src.level = 0;
+   copy.src.format = info->src.resource->format;
+   copy.src.box = box;
+   sz_blit_copy(ctx, cmd, &copy, tmp, dst, aspect);
+
+   screen->base.resource_destroy(&screen->base, temp);
+   return true;
+}
+
 static void
 sz_blit_resolve(struct sz_context *ctx, VkCommandBuffer cmd,
                 const struct pipe_blit_info *info, struct sz_resource *src,
                 struct sz_resource *dst, VkImageAspectFlags aspect)
 {
+   if (aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
+      sz_blit_resolve_ds(ctx, cmd, info, src, dst, aspect);
+      return;
+   }
+
    const bool src_3d = info->src.resource->target == PIPE_TEXTURE_3D;
    const bool dst_3d = info->dst.resource->target == PIPE_TEXTURE_3D;
 
@@ -157,7 +424,10 @@ sz_blit_image(struct sz_context *ctx, VkCommandBuffer cmd,
       .dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       .regionCount = 1,
       .pRegions = &region,
-      .filter = info->filter == PIPE_TEX_FILTER_LINEAR ? VK_FILTER_LINEAR
+      /* Vulkan requires NEAREST for a depth or stencil format, and GL ignores
+       * the filter for them too: neither value has anything to interpolate. */
+      .filter = aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+                info->filter == PIPE_TEX_FILTER_LINEAR ? VK_FILTER_LINEAR
                                                        : VK_FILTER_NEAREST,
    };
 
@@ -399,21 +669,56 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
     * nothing is scaled, so that is the path taken first. */
    const bool same_size = sz_box_equals(&info->src.box, &info->dst.box);
    const bool resolve = src_samples > 1 && dst_samples == 1 && same_size;
+
+   if (resolve) {
+      /* The resolve names its own layouts: a depth or stencil one runs through
+       * a render pass, where the images are attachments rather than transfer
+       * sources. vkCmdResolveImage2 moves the region itself, a render pass does
+       * not, so a depth or stencil resolve with two different corners goes
+       * through a temporary image. */
+      const bool aligned = info->src.box.x == info->dst.box.x &&
+                           info->src.box.y == info->dst.box.y;
+
+      if (aspect == VK_IMAGE_ASPECT_COLOR_BIT || aligned) {
+         sz_blit_resolve(ctx, cmd, info, src, dst, aspect);
+         return;
+      }
+
+      if (sz_blit_resolve_offset(ctx, cmd, info, src, dst, aspect))
+         return;
+
+      struct pipe_blit_info sub = *info;
+      sub.mask = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? PIPE_MASK_Z
+                                                     : PIPE_MASK_S;
+      if (!sz_blit_blitter(ctx, &sub))
+         sz_warn_once("a depth or stencil resolve from an offset");
+      return;
+   }
+
+   sz_resource_access_levels(ctx->screen, cmd, src, SZ_ACCESS_TRANSFER_SRC,
+                             info->src.level, 1);
+   sz_resource_access_levels(ctx->screen, cmd, dst, SZ_ACCESS_TRANSFER_DST,
+                             info->dst.level, 1);
+
    const bool depth_copy =
       aspect == VK_IMAGE_ASPECT_DEPTH_BIT && same_size && src_samples == 1 &&
       dst_samples == 1 && info->src.box.width >= 0 && info->src.box.height >= 0;
 
-   if (resolve)
-      sz_blit_resolve(ctx, cmd, info, src, dst, aspect);
-   else if (src_samples > 1 || dst_samples > 1) {
-      /* vkCmdBlitImage cannot read or write a multisampled image at all
-       * (VUID-VkBlitImageInfo2-srcImage-00233): the only operation that crosses
-       * that boundary is a resolve, and a resolve cannot scale or reinterpret.
-       * GL's own rules leave nothing else reachable here, so a request that
-       * arrives this way has no Vulkan command behind it. */
-      sz_warn_once("a multisampled blit that is not a same-size resolve");
+   if (src_samples > 1 || dst_samples > 1) {
+      /* vkCmdBlitImage cannot read or write a multisampled image at all, and a
+       * resolve needs a single-sampled destination: a blit between two images
+       * of the *same* sample count, or one that also scales, is a draw. */
+      struct pipe_blit_info sub = *info;
+      sub.mask = aspect == VK_IMAGE_ASPECT_DEPTH_BIT
+                    ? PIPE_MASK_Z
+                    : aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? PIPE_MASK_S
+                                                            : PIPE_MASK_RGBA;
+      if (!sz_blit_blitter(ctx, &sub))
+         sz_warn_once("a multisampled blit that is not a same-size resolve");
       return;
-   } else if (depth_copy)
+   } else if (depth_copy &&
+              !sz_format_can_blit(ctx->screen, sz_vk_format(ctx->screen,
+                                                           info->dst.format)))
       sz_blit_copy(ctx, cmd, info, src, dst, aspect);
    else
       sz_blit_image(ctx, cmd, info, src, dst, aspect);
@@ -456,6 +761,7 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    ctx->screen->stats.blits++;
 
 
+
    /* Both commands are illegal inside a render pass, and anything already
     * queued must land before the blit does.
     *
@@ -482,13 +788,16 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                      src_format, dst_format, src_samples, dst_samples);
 
    if (info->mask & PIPE_MASK_S) {
-      if (src_samples > 1 || dst_samples > 1) {
-         sz_warn_once("multisampled stencil blit is not implemented");
+      if (src_format != dst_format && (src_samples > 1 || dst_samples > 1)) {
+         sz_warn_once("multisampled stencil blit across formats");
       } else if (src_format != dst_format) {
          /* Two images whose stencil aspects are both S8_UINT still differ in
           * format, and a copy cannot cross formats. The CPU path copies the
           * stencil bytes one at a time, which for S8 to S8 is the same byte. */
          sz_blit_cross_format(&ctx->base, info, VK_IMAGE_ASPECT_STENCIL_BIT);
+      } else if (src_samples > 1) {
+         sz_blit_aspect(ctx, cmd, info, src, dst, VK_IMAGE_ASPECT_STENCIL_BIT,
+                        src_format, dst_format, src_samples, dst_samples);
       } else {
          sz_resource_access(screen, cmd, src, SZ_ACCESS_TRANSFER_SRC);
          sz_resource_access(screen, cmd, dst, SZ_ACCESS_TRANSFER_DST);
