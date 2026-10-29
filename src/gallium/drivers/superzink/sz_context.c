@@ -1466,8 +1466,24 @@ sz_resource_copy_region(struct pipe_context *pipe, struct pipe_resource *dst,
    if (cmd == VK_NULL_HANDLE)
       return;
 
+   /* The aspect comes from the format: a depth texture copied level by level --
+    * which is what the state tracker does when glTexImage2D redefines a texture
+    * and the old levels have to follow -- is a depth copy, and naming the colour
+    * aspect on a depth image is not a copy at all
+    * (VUID-vkCmdCopyImage-aspectMask-00142). */
+   const struct util_format_description *copy_desc =
+      util_format_description(src->format);
+   VkImageAspectFlags copy_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+   if (copy_desc && util_format_has_depth(copy_desc) &&
+       util_format_has_stencil(copy_desc))
+      copy_aspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+   else if (copy_desc && util_format_has_depth(copy_desc))
+      copy_aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+   else if (copy_desc && util_format_has_stencil(copy_desc))
+      copy_aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+
    const VkImageSubresourceLayers layers = {
-      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .aspectMask = copy_aspect,
       .mipLevel = 0,
       .baseArrayLayer = 0,
       .layerCount = 1,
