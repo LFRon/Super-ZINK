@@ -4746,7 +4746,8 @@ sz_emit_instr_inner(struct sz_translate *t, nir_instr *instr)
       nir_undef_instr *undef = nir_instr_as_undef(instr);
       struct sz_dtype type = { 0 };
       sz_guess_def_type(t, &undef->def, &type);
-      t->defs_id[undef->def.index] = sz_spv_undef(t->m, sz_dtype_type(t, &type));
+      t->defs_id[undef->def.index] =
+         sz_spv_const_null(t->m, sz_dtype_type(t, &type));
       t->def_types[undef->def.index] = type;
       return true;
    }

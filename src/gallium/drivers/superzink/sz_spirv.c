@@ -791,6 +791,30 @@ sz_spv_undef(struct sz_spv_module *m, uint32_t type)
    return id;
 }
 
+/* The zero value of a type, as OpConstantNull.
+ *
+ * NIR's undef means "the value is not defined here", and OpUndef is the direct
+ * spelling of that. The SPIR-V consumer is then free to propagate the undefined
+ * value anywhere the result is used, and RADV does: a position built with an
+ * OpUndef component -- what a store with a partial write mask produces for the
+ * components it does not write -- reaches the tessellation setup as NaN and the
+ * patch is discarded. OpConstantNull says the same thing about intent (the
+ * application cannot observe the value) without giving the consumer a value it
+ * can spread, so the rest of the store survives. */
+uint32_t
+sz_spv_const_null(struct sz_spv_module *m, uint32_t type)
+{
+   uint32_t id = sz_spv_type_lookup(m, SpvOpConstantNull, type, 0, 0);
+   if (id)
+      return id;
+
+   id = sz_spv_id(m);
+   const uint32_t ops[] = { type, id };
+   sz_spv_emit_simple(m, SEC_TYPES, SpvOpConstantNull, ops, 2);
+   sz_spv_type_record(m, SpvOpConstantNull, type, 0, 0, id);
+   return id;
+}
+
 uint32_t
 sz_spv_access_chain(struct sz_spv_module *m, uint32_t result_type,
                     uint32_t base, const uint32_t *indices, unsigned count)

@@ -183,6 +183,7 @@ void sz_spv_return(struct sz_spv_module *m);
  * while a raw opcode with the operands spelled out keeps the NIR-to-SPIR-V
  * mapping readable in one place. */
 uint32_t sz_spv_undef(struct sz_spv_module *m, uint32_t type);
+uint32_t sz_spv_const_null(struct sz_spv_module *m, uint32_t type);
 uint32_t sz_spv_access_chain(struct sz_spv_module *m, uint32_t result_type,
                              uint32_t base, const uint32_t *indices,
                              unsigned count);
