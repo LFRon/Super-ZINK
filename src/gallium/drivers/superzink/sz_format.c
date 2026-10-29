@@ -254,7 +254,7 @@ sz_format_aspect(enum pipe_format format)
 }
 
 VkFormatFeatureFlags
-sz_format_features_from_bindings(unsigned bindings)
+sz_format_features_from_bindings(enum pipe_format format, unsigned bindings)
 {
    VkFormatFeatureFlags f = 0;
 
@@ -262,8 +262,20 @@ sz_format_features_from_bindings(unsigned bindings)
       f |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
 
    if (bindings & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE |
-                   PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT))
-      f |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+                   PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT)) {
+      /* Mesa uses RENDER_TARGET to ask "may a draw or a blit write into this?",
+       * not "is this a colour format": its glCopyPixels depth path gates the
+       * fast pipe->blit on exactly this bit. A depth format has no colour
+       * attachment bit, so requiring that one answers "no" and forces that
+       * path onto a meta draw instead of the blit that works. */
+      const struct util_format_description *desc =
+         util_format_description(format);
+      const bool depth_stencil =
+         desc && (util_format_has_depth(desc) || util_format_has_stencil(desc));
+
+      f |= depth_stencil ? VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
+                         : VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+   }
 
    if (bindings & PIPE_BIND_DEPTH_STENCIL)
       f |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
@@ -294,8 +306,12 @@ sz_image_usage_from_bindings(struct sz_screen *screen, unsigned bindings,
 
    VkImageUsageFlags usage = 0;
 
-   if (bindings & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE |
-                   PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT))
+   /* A depth/stencil format is never a colour attachment, whatever the
+    * bindings ask for; claiming both bits makes the image illegal. */
+   if (!(desc && (util_format_has_depth(desc) ||
+                  util_format_has_stencil(desc))) &&
+       (bindings & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE |
+                    PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT)))
       usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
    if (depth_stencil)
@@ -419,7 +435,7 @@ sz_format_supported_buffer(struct sz_screen *screen,
    screen->vk.GetPhysicalDeviceFormatProperties(screen->pdev, vkformat, &props);
 
    const VkFormatFeatureFlags required =
-      sz_format_features_from_bindings(bindings) & SZ_BUFFER_FEATURES;
+      sz_format_features_from_bindings(format, bindings) & SZ_BUFFER_FEATURES;
 
    return (props.bufferFeatures & required) == required;
 }
@@ -514,7 +530,7 @@ sz_format_supported_image(struct sz_screen *screen,
    const VkFormatFeatureFlags features =
       sz_tiling_features(screen, vkformat, tiling);
    const VkFormatFeatureFlags required =
-      sz_format_features_from_bindings(bindings) & ~SZ_BUFFER_FEATURES;
+      sz_format_features_from_bindings(format, bindings) & ~SZ_BUFFER_FEATURES;
 
    return (features & required) == required;
 }

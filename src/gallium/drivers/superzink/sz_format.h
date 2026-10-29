@@ -55,7 +55,8 @@ VkImageUsageFlags sz_image_usage_from_bindings(struct sz_screen *screen,
                                               enum pipe_format format);
 
 /* Translate Gallium bindings to the VkFormatFeatureFlags that must be present. */
-VkFormatFeatureFlags sz_format_features_from_bindings(unsigned bindings);
+VkFormatFeatureFlags sz_format_features_from_bindings(enum pipe_format format,
+                                                  unsigned bindings);
 
 /* Mapping tables shared with sz_resource, so image creation and image support
  * queries can never disagree about what a target means. */
