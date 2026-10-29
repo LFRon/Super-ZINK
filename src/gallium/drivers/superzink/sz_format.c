@@ -9,6 +9,7 @@
  * vkCreateBuffer will actually accept.
  */
 
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/u_math.h"
 
@@ -40,10 +41,42 @@ sz_format_probe(struct sz_screen *screen)
       sz_format_has_depth_features(screen, VK_FORMAT_D32_SFLOAT_S8_UINT);
 }
 
+void
+sz_format_debug_print(struct sz_screen *screen)
+{
+   static const enum pipe_format probe[] = {
+      PIPE_FORMAT_X24S8_UINT, PIPE_FORMAT_S8X24_UINT, PIPE_FORMAT_S8_UINT,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(probe); i++)
+      mesa_logi("SZ: fmt %s -> %d (sampled %d)",
+                util_format_name(probe[i]),
+                (int)sz_vk_format(screen, probe[i]),
+                sz_format_supported(screen, probe[i], PIPE_TEXTURE_2D, 0, 0,
+                                    PIPE_BIND_DEPTH_STENCIL |
+                                       PIPE_BIND_SAMPLER_VIEW));
+}
+
 VkFormat
 sz_vk_format(struct sz_screen *screen, enum pipe_format format)
 {
    const VkFormat ret = vk_format_from_pipe_format(format);
+
+   switch (format) {
+   case PIPE_FORMAT_S8_UINT:
+   case PIPE_FORMAT_X24S8_UINT:
+   case PIPE_FORMAT_S8X24_UINT:
+      /* GL's stencil-only texture formats. Mesa's pipe-to-Vulkan table has no
+       * entry for the two combined layouts -- they are the stencil view of a
+       * depth/stencil image whose depth half the format ignores -- and Vulkan's
+       * own stencil-only format is S8_UINT, which RADV can both attach and
+       * sample. Backing all three with it is what makes
+       * GL_DEPTH_STENCIL_TEXTURE_MODE = GL_STENCIL_INDEX expressible at all: a
+       * view may name only one aspect of a combined image, and a stencil-only
+       * image names exactly that one. */
+      return VK_FORMAT_S8_UINT;
+   default:
+      break;
+   }
 
    switch (ret) {
    case VK_FORMAT_D24_UNORM_S8_UINT:
@@ -103,6 +136,16 @@ sz_vk_sample_count(unsigned sample_count)
 VkImageAspectFlags
 sz_format_aspect(enum pipe_format format)
 {
+   /* The image behind a stencil-only format has no depth aspect to sample. */
+   switch (format) {
+   case PIPE_FORMAT_S8_UINT:
+   case PIPE_FORMAT_X24S8_UINT:
+   case PIPE_FORMAT_S8X24_UINT:
+      return VK_IMAGE_ASPECT_STENCIL_BIT;
+   default:
+      break;
+   }
+
    const struct util_format_description *desc = util_format_description(format);
    if (!desc)
       return VK_IMAGE_ASPECT_COLOR_BIT;

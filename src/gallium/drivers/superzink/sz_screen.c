@@ -527,6 +527,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
    /* Which depth/stencil formats the device can actually back, so that the
     * pipe-format to VkFormat mapping is decided once rather than per image. */
    sz_format_probe(screen);
+   if (sz_debug_enabled(SZ_DEBUG_INFO))
+      sz_format_debug_print(screen);
 
    sz_bo_init(screen);
    sz_resource_screen_init(screen);
@@ -602,8 +604,8 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * version bootstrap -- st_extensions grants ARB_shader_precision on
        * `GLSLVersion >= 410`, and GLSLVersion is clamped to the version the
        * context already reached, so 4.1 is unreachable while this says 400. */
-      caps->glsl_feature_level = 420;
-      caps->glsl_feature_level_compatibility = 420;
+      caps->glsl_feature_level = 430;
+      caps->glsl_feature_level_compatibility = 430;
       caps->max_texture_2d_size = 16384;
       caps->max_texture_cube_levels = 15;
       caps->max_texture_3d_levels = 12;
@@ -683,6 +685,19 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * component. The translator has emitted the Component decoration from
        * location_frac since 3.2. */
       caps->shader_array_components = true;
+
+      /* ARB_texture_view: a sampler view may name a different target than the
+       * texture, and sz_sampler_view_create() builds the VkImageView from the
+       * view's target rather than the resource's. */
+      caps->sampler_view_target = true;
+
+      /* ARB_robust_buffer_access_behavior: every buffer access a shader makes is
+       * bounds-checked against the range its descriptor names, which is what
+       * robustBufferAccess asks the implementation to do and what GL promises the
+       * application. A device without it is not driven: GL's guarantee would be a
+       * lie and an out-of-range access would read another buffer's bytes. */
+      caps->robust_buffer_access_behavior =
+         screen->caps.core_features.robustBufferAccess;
 
       /* Not claimed:
        *  - caps->cull_distance: glsl's linker calls

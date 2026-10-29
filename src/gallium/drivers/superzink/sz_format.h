@@ -35,6 +35,7 @@ VkFormat sz_vk_format(struct sz_screen *screen, enum pipe_format format);
 /* Probes the device for the depth formats sz_vk_format() has to choose between.
  * Called once, during screen creation. */
 void sz_format_probe(struct sz_screen *screen);
+void sz_format_debug_print(struct sz_screen *screen);
 
 /* Translate Gallium usage bits to the VkImageUsageFlags they require. */
 VkImageUsageFlags sz_image_usage_from_bindings(unsigned bindings,

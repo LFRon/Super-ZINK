@@ -34,7 +34,10 @@
  * reads is this minus the first slot, which holds the default uniform block.
  * With the samplers moved to their own descriptor set, two stages of 14 still
  * fit inside the 32 push descriptors a conformant device guarantees. */
-#define SZ_MAX_CONST_BUFFERS 14
+/* One more than the fourteen uniform blocks GL 4.3 requires: the frontend counts
+ * this as the total and reserves slot 0 for the default uniform block, so
+ * MaxUniformBlocks comes out at one less than the number declared here. */
+#define SZ_MAX_CONST_BUFFERS 15
 
 /* Combined image samplers per stage, i.e. GL's texture image units after the
  * driver had its say. The binding budget below is what fixes this number: a
