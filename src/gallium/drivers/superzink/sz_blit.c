@@ -996,6 +996,38 @@ sz_blit_clip(const struct pipe_blit_info *info, unsigned dst_w, unsigned dst_h,
    return true;
 }
 
+/* Moves the swizzle onto the channels the destination actually stores.
+ *
+ * The state tracker's swizzle is defined over the destination's *GL* components:
+ * for a GL_ALPHA target it says (0, 0, 0, alpha), because GL numbers the
+ * result of a blit from R. Vulkan numbers a target from its first stored
+ * channel whatever GL calls it, and an alpha-only target is an R8 image, so the
+ * value GL wants in A has to arrive in R. A blit into GL_ALPHA stored zero and
+ * read zero for exactly that reason.
+ *
+ * So for every stored channel, find the GL component it corresponds to -- the
+ * destination format's own description says which -- and take that component's
+ * swizzle entry from the state tracker's map. */
+static void
+sz_blit_swizzle_to_storage(const struct pipe_blit_info *info,
+                           struct pipe_blit_info *out)
+{
+   const struct util_format_description *desc =
+      util_format_description(info->dst.format);
+   if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->nr_channels >= 4)
+      return;
+
+   for (unsigned stored = 0; stored < desc->nr_channels; stored++) {
+      for (unsigned c = 0; c < 4; c++) {
+         if (desc->swizzle[c] != stored)
+            continue;
+         out->swizzle[stored] = info->swizzle[c];
+         break;
+      }
+   }
+   out->swizzle_enable = true;
+}
+
 void
 sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
@@ -1084,9 +1116,12 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * The state tracker asks for this whenever the source and destination base
     * formats differ -- a GL_RGBA framebuffer blitted to a BGRX window, which is
     * every glBlitFramebuffer to the screen on a little-endian display server. */
-   if (info->alpha_blend) {
+   if (info->alpha_blend || info->swizzle_enable) {
+      struct pipe_blit_info sub = *info;
+      if (info->swizzle_enable)
+         sz_blit_swizzle_to_storage(info, &sub);
       ctx->screen->stats.blits++;
-      if (!sz_blit_blitter(ctx, info))
+      if (!sz_blit_blitter(ctx, &sub))
          sz_warn_once("a blit with a swizzle or blending that the blitter "
                       "cannot draw");
       return;
