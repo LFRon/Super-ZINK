@@ -950,14 +950,18 @@ sz_pipeline_build(struct sz_context *ctx, struct sz_gfx_pipeline *p,
          : VK_FORMAT_UNDEFINED;
 
    /* GL's depth test is off by default; a draw that enables it without a depth
-    * attachment is a state-tracker bug, not something to honour.
-    *
-    * Depth writes without a depth test are what a "renders but looks wrong"
-    * picture is made of: without the compare, later primitives overwrite earlier
-    * ones regardless of distance, so a scene comes out with its back faces on
-    * top. Both bits come from the same Gallium state. */
+    * attachment is a state-tracker bug, not something to honour. */
    const bool depth_enabled = has_depth && dsa && dsa->depth_enabled;
-   const bool depth_write = depth_enabled && dsa->depth_writemask;
+
+   /* Depth *writes* are independent of the test on both sides. GL's glDepthMask
+    * decides whether a fragment that passed -- and with the test disabled every
+    * fragment passes -- is written, and Vulkan's depthWriteEnable means the same
+    * thing while depthTestEnable is what the compare is gated on. Tying the
+    * write to the test turned the state tracker's own depth clear into a no-op:
+    * it clears by drawing a quad with the test off and the mask on, which is
+    * `glClear` on a scissored region, and every one of those left the attachment
+    * at zero. */
+   const bool depth_write = has_depth && dsa && dsa->depth_writemask;
 
    /* Stencil, both faces.
     *
