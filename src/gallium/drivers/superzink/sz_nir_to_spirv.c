@@ -3440,8 +3440,26 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
    unsigned n = 0;
    ops[n++] = sampled_image;
    ops[n++] = coord_value;
-   if (tex->is_shadow)
-      ops[n++] = sz_def_value(t, dref);
+   if (tex->is_shadow) {
+      uint32_t dref_value = sz_def_value(t, dref);
+
+      /* textureProj: the spec divides the *whole* coordinate by the last
+       * component, and for a shadow sampler the reference is part of that
+       * coordinate -- "the resulting value is assigned to (s/q), (t/q) and
+       * (r/q)" where r is the reference. Dividing only the texture coordinate
+       * compares the raw r against a depth that has been scaled, so every
+       * projective shadow lookup answers wrongly even though the position is
+       * right. */
+      if (projector != NULL && dref_value != 0) {
+         const uint32_t projector_value = sz_def_value(t, projector);
+         if (projector_value != 0) {
+            const uint32_t divide[] = { dref_value, projector_value };
+            dref_value = sz_spv_alu(t->m, SpvOpFDiv,
+                                    sz_spv_type_float32(t->m), divide, 2);
+         }
+      }
+      ops[n++] = dref_value;
+   }
    if (tex->op == nir_texop_tg4)
       ops[n++] = sz_spv_const_int32(t->m, tex->component);
    if (mask != 0)
