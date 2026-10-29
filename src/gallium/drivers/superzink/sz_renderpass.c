@@ -191,8 +191,21 @@ sz_renderpass_begin(struct sz_context *ctx, VkCommandBuffer cmd)
    unsigned color_count = 0;
 
    for (unsigned i = 0; i < fb->nr_cbufs; i++) {
-      if (!fb->cbufs[i].texture)
-         break;
+      /* A draw buffer with nothing bound is a *hole*, not the end of the list:
+       * glDrawBuffers lets an application leave buffer zero unbound and draw to
+       * the ones after it. Vulkan expresses that as a NULL entry in
+       * pColorAttachments with VK_FORMAT_UNDEFINED for the same index in the
+       * pipeline, which is what the loop keeps the index for -- dropping it
+       * would move every later attachment one location down, and
+       * GL_SAMPLE_ALPHA_TO_COVERAGE would read its alpha from the wrong
+       * fragment output. */
+      if (!fb->cbufs[i].texture) {
+         color[color_count] = (VkRenderingAttachmentInfo) {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         };
+         color_count++;
+         continue;
+      }
 
       struct sz_resource *res = sz_resource(fb->cbufs[i].texture);
       color_formats[color_count] = sz_vk_format(screen, fb->cbufs[i].format);
