@@ -174,6 +174,21 @@ sz_vk_format(struct sz_screen *screen, enum pipe_format format)
       }
       return ret;
 
+   case VK_FORMAT_UNDEFINED:
+      /* GL_DEPTH_COMPONENT32 is a 32-bit *unorm*, and Vulkan has no such depth
+       * format at all -- Mesa's table maps it to nothing. Left unsupported, the
+       * state tracker falls through GL_DEPTH_COMPONENT32's list and lands on
+       * Z16, so a 32-bit depth buffer was stored at 16 bits.
+       *
+       * D32_SFLOAT is the closest thing Vulkan has: the same width, the same
+       * [0, 1] range and more precision than unorm. The transfer path already
+       * reads a D32 image as Z32_FLOAT, so a readback converts, and the only
+       * difference an application can observe is that its clear value survives
+       * exactly instead of being quantised. */
+      if (format == PIPE_FORMAT_Z32_UNORM && screen->have_d32_sfloat)
+         return VK_FORMAT_D32_SFLOAT;
+      return ret;
+
    case VK_FORMAT_X8_D24_UNORM_PACK32:
       /* GL_DEPTH_COMPONENT24, with no stencil aspect to preserve, and the same
        * substitution the depth/stencil case above makes: RADV has no 24-bit
