@@ -4188,7 +4188,10 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
        * emits the OpMemoryBarrier that backs them. A control barrier has
        * nothing to synchronise without a compute stage. */
       const uint32_t ops[] = {sz_memory_scope(t), sz_memory_semantics(t)};
-      sz_spv_result_only(t->m, SpvOpMemoryBarrier, ops, 2);
+      /* OpMemoryBarrier has no result: both operands are the instruction's
+       * own, and the emitter that prepends a result id would have left one
+       * extra word in the stream. */
+      sz_spv_raw_function_op(t->m, SpvOpMemoryBarrier, ops, 2);
       return true;
    }
    case nir_intrinsic_load_ubo:
