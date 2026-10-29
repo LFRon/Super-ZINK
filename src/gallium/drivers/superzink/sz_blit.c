@@ -30,7 +30,6 @@
 #include "util/format/u_format.h"
 #include "util/format/u_formats.h"
 #include "util/log.h"
-#include "util/u_debug.h"
 #include "util/u_blitter.h"
 #include "util/macros.h"
 #include "util/u_math.h"
@@ -693,7 +692,17 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
     * always allowed and is also exactly what glBlitFramebuffer means when
     * nothing is scaled, so that is the path taken first. */
    const bool same_size = sz_box_equals(&info->src.box, &info->dst.box);
-   const bool resolve = src_samples > 1 && dst_samples == 1 && same_size;
+   /* A resolve copies a rectangle onto itself: vkCmdResolveImage2 and a render
+    * pass resolve both name one region, and neither has a way to say that the
+    * source runs the other way. GL allows glBlitFramebuffer to flip while it
+    * resolves, so a flipped box is not a resolve at all -- it is a draw, and
+    * treating it as one is what makes ext_framebuffer_multisample@blit-flipped
+    * produce an image instead of the resolved source in its original
+    * orientation. */
+   const bool flipped = info->src.box.width < 0 || info->src.box.height < 0 ||
+                        info->dst.box.width < 0 || info->dst.box.height < 0;
+   const bool resolve =
+      src_samples > 1 && dst_samples == 1 && same_size && !flipped;
 
    if (resolve) {
       /* The resolve names its own layouts: a depth or stencil one runs through
@@ -952,17 +961,6 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    const VkFormat dst_format = sz_vk_format(screen, info->dst.resource->format);
    const unsigned src_samples = MAX2(info->src.resource->nr_samples, 1);
    const unsigned dst_samples = MAX2(info->dst.resource->nr_samples, 1);
-
-   if (debug_get_bool_option("SZ_BLIT_LOG", false))
-      fprintf(stderr,
-              "SZBLIT mask=%#x src=%s dst=%s srcbox=%d,%d %dx%d dstbox=%d,%d "
-              "%dx%d scissor=%d swz=%d ab=%d\n",
-              info->mask, util_format_name(info->src.resource->format),
-              util_format_name(info->dst.resource->format), info->src.box.x,
-              info->src.box.y, info->src.box.width, info->src.box.height,
-              info->dst.box.x, info->dst.box.y, info->dst.box.width,
-              info->dst.box.height, info->scissor_enable,
-              info->swizzle_enable, info->alpha_blend);
 
    ctx->screen->stats.blits++;
 
