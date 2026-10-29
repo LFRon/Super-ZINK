@@ -35,6 +35,7 @@
 #include "util/u_math.h"
 
 #include <stdlib.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Gallium boxes are signed and may describe a flip for the source. Vulkan's
@@ -716,12 +717,32 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
       if (!sz_blit_blitter(ctx, &sub))
          sz_warn_once("a multisampled blit that is not a same-size resolve");
       return;
-   } else if (depth_copy &&
-              !sz_format_can_blit(ctx->screen, sz_vk_format(ctx->screen,
-                                                           info->dst.format)))
-      sz_blit_copy(ctx, cmd, info, src, dst, aspect);
-   else
+   } else if (depth_copy && sz_format_can_blit(ctx->screen,
+                                              sz_vk_format(ctx->screen,
+                                                           info->dst.format))) {
+      /* A native blit is the cheapest and the most precise thing for a depth
+       * copy, and the only path RADV gets right on every format. */
       sz_blit_image(ctx, cmd, info, src, dst, aspect);
+   } else if (depth_copy && src != dst) {
+      /* No blit for this depth format, and the two images differ, so the copy is
+       * not the only option -- and it is the wrong one. A depth image written by
+       * vkCmdCopyImage2 and then sampled or attached reads back as the
+       * fast-clear value in whole 8-row HTILE tiles on RADV, which is what made
+       * ext_framebuffer_multisample@accuracy fail only at samples = 0: that
+       * sub-case is a plain depth blit between two single-sampled images.
+       * Drawing the copy instead keeps the image in the state the renderer
+       * expects, at the cost of a pipeline and a quad. */
+      struct pipe_blit_info sub = *info;
+      sub.mask = PIPE_MASK_Z;
+      sz_blit_blitter(ctx, &sub);
+   } else if (depth_copy) {
+      /* Source and destination are the same image, which the blitter cannot
+       * read and write in one draw: GL's own copies within one attachment keep
+       * the transfer path. */
+      sz_blit_copy(ctx, cmd, info, src, dst, aspect);
+   } else {
+      sz_blit_image(ctx, cmd, info, src, dst, aspect);
+   }
 }
 
 void
