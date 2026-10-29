@@ -191,6 +191,14 @@ sz_lower_nir(struct nir_shader *nir)
    case MESA_SHADER_VERTEX:
    case MESA_SHADER_TESS_EVAL:
    case MESA_SHADER_GEOMETRY:
+      /* Only the last stage before rasterisation writes the clip-space position
+       * the viewport sees. A vertex shader followed by a tessellation control or
+       * geometry shader feeds *that* stage instead, and the pass would then run
+       * twice: z' = (z + w) / 2 applied twice is z / 4 + 3w / 4, so the whole
+       * scene lands in the wrong part of the depth range. */
+      if (nir->info.next_stage != MESA_SHADER_NONE &&
+          nir->info.next_stage != MESA_SHADER_FRAGMENT)
+         break;
       nir_lower_clip_halfz(nir);
       break;
    default:
