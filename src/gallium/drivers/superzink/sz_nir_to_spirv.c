@@ -3175,6 +3175,43 @@ sz_image_atomic_op(nir_atomic_op op, bool *is_cmpxchg)
 
 /* The sampled image value for `tex`'s texture unit, declaring the descriptor
  * variable the first time the unit appears in the shader. */
+/* The texel component type of the sampler bound to `index`.
+ *
+ * A GLSL sampler's type names it -- sampler2D is float, isampler2D signed,
+ * usampler2D unsigned -- and that is the only reliable source. textureSize() and
+ * textureQueryLevels() return integers whatever the texels hold, so a texture
+ * instruction's own result type says nothing about the image when the op is a
+ * query. Taking it from there declared an int image for the query and then
+ * sampled the same unit with a float result, which is invalid SPIR-V (the
+ * result type of a sample must match the image's sampled type); RADV's parser
+ * crashes on the module rather than reporting it. */
+static bool
+sz_sampler_base(struct sz_translate *t, unsigned index, enum sz_base *out)
+{
+   nir_foreach_variable_with_modes (var, t->nir, nir_var_uniform) {
+      if ((unsigned)var->data.binding != index)
+         continue;
+
+      const struct glsl_type *type = glsl_without_array(var->type);
+      if (!glsl_type_is_sampler(type))
+         continue;
+
+      switch (glsl_get_sampler_result_type(type)) {
+      case GLSL_TYPE_UINT:
+         *out = SZ_BASE_UINT;
+         return true;
+      case GLSL_TYPE_INT:
+         *out = SZ_BASE_INT;
+         return true;
+      default:
+         *out = SZ_BASE_FLOAT;
+         return true;
+      }
+   }
+
+   return false;
+}
+
 static uint32_t
 sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
 {
@@ -3222,9 +3259,12 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
 
    /* The texel component type: GLSL samplers are float, integer and unsigned
     * integer textures, and SPIR-V needs the matching scalar type because it is
-    * what decides how the sampled values are converted. */
+    * what decides how the sampled values are converted. The sampler's own type
+    * decides it; the instruction's result type is only a fallback for a unit no
+    * declared variable names (see sz_sampler_base()). */
    enum sz_base base;
-   if (!sz_base_from_alu_type(tex->dest_type, &base)) {
+   if (!sz_sampler_base(t, index, &base) &&
+       !sz_base_from_alu_type(tex->dest_type, &base)) {
       sz_fail(t, "unsupported texture result type %d", (int)tex->dest_type);
       return 0;
    }
