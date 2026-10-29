@@ -214,6 +214,18 @@ sz_pipeline_bootstrap_fs(struct sz_screen *screen)
 /* Pipeline                                                                   */
 /* ------------------------------------------------------------------------- */
 
+/* The modules a pipeline built without a bound shader names are the screen's
+ * bootstrap ones, not copies: destroying them with the pipeline would leave the
+ * next pipeline holding a handle that is already gone, and would free them a
+ * second time when the screen is torn down. */
+static bool
+sz_pipeline_module_is_shared(const struct sz_screen *screen, VkShaderModule module)
+{
+   return module == screen->bootstrap_vs ||
+          module == screen->bootstrap_vs_empty ||
+          module == screen->bootstrap_fs;
+}
+
 static void
 sz_pipeline_destroy_objects(struct sz_screen *screen, struct sz_gfx_pipeline *p)
 {
@@ -222,15 +234,15 @@ sz_pipeline_destroy_objects(struct sz_screen *screen, struct sz_gfx_pipeline *p)
    /* The pipeline layout is shared by every pipeline on the screen, so it is
     * destroyed by sz_pipeline_screen_finish(), not here. Modules and the
     * pipeline itself belong to the one pipeline that was built with them. */
-   if (p->vs != VK_NULL_HANDLE)
+   if (p->vs != VK_NULL_HANDLE && !sz_pipeline_module_is_shared(screen, p->vs))
       screen->vk.DestroyShaderModule(screen->dev, p->vs, NULL);
-   if (p->tcs != VK_NULL_HANDLE)
+   if (p->tcs != VK_NULL_HANDLE && !sz_pipeline_module_is_shared(screen, p->tcs))
       screen->vk.DestroyShaderModule(screen->dev, p->tcs, NULL);
-   if (p->tes != VK_NULL_HANDLE)
+   if (p->tes != VK_NULL_HANDLE && !sz_pipeline_module_is_shared(screen, p->tes))
       screen->vk.DestroyShaderModule(screen->dev, p->tes, NULL);
-   if (p->gs != VK_NULL_HANDLE)
+   if (p->gs != VK_NULL_HANDLE && !sz_pipeline_module_is_shared(screen, p->gs))
       screen->vk.DestroyShaderModule(screen->dev, p->gs, NULL);
-   if (p->fs != VK_NULL_HANDLE)
+   if (p->fs != VK_NULL_HANDLE && !sz_pipeline_module_is_shared(screen, p->fs))
       screen->vk.DestroyShaderModule(screen->dev, p->fs, NULL);
    memset(p, 0, sizeof(*p));
 }
