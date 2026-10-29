@@ -30,6 +30,7 @@
 #include "util/format/u_format.h"
 #include "util/format/u_formats.h"
 #include "util/log.h"
+#include "util/u_debug.h"
 #include "util/u_blitter.h"
 #include "util/macros.h"
 #include "util/u_math.h"
@@ -638,18 +639,24 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
                VkFormat src_format, VkFormat dst_format, unsigned src_samples,
                unsigned dst_samples)
 {
-   if (src_format != dst_format) {
-      /* A depth or stencil blit that changes format has no vkCmd* equivalent
-       * either: Vulkan will not reinterpret a depth value at all, and GL's own
-       * conversion is defined numerically (a depth of 0.25 is 0.25 whatever the
-       * format). util_format has the conversion, so the blit goes through the
-       * same CPU path the colour case uses.
-       *
-       * A multisampled source is the exception: mapping it names one sample's
-       * texels, not the samples, so the transfer path cannot see what it is
-       * supposed to copy. A draw can: the blitter samples the source and writes
-       * the destination, and both ends are a float, so the conversion comes for
-       * free -- which is exactly what GL asks a depth blit to do. */
+   /* Two different VkFormats is not by itself a conversion Vulkan cannot do:
+    * formats in one compatibility class blit into each other by channel, and
+    * RGBA8 to BGRA8 -- every glBlitFramebuffer to the window of a little-endian
+    * display -- is exactly that. Anything else is a numeric conversion GL spells
+    * out (a depth of 0.25 stays 0.25 whatever the format, float becomes unorm,
+    * 32 bits become 16) and has no vkCmd* equivalent at all.
+    *
+    * A multisampled source is the one case that cannot go through the CPU path
+    * even then: mapping it names one sample's texels, not the samples, so the
+    * transfer cannot see what it is supposed to copy. A draw can, and the
+    * blitter's shader reads and writes both ends as floats. */
+   const bool natively_blittable =
+      src_format == dst_format ||
+      (sz_format_blit_compatible(info->src.format, info->dst.format) &&
+       sz_format_can_blit(ctx->screen, src_format) &&
+       sz_format_can_blit(ctx->screen, dst_format));
+
+   if (!natively_blittable) {
       if (src_samples > 1 &&
           (aspect == VK_IMAGE_ASPECT_DEPTH_BIT ||
            aspect == VK_IMAGE_ASPECT_STENCIL_BIT)) {
@@ -762,6 +769,127 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
    }
 }
 
+/* One axis of a blit, clipped to what the destination can hold.
+ *
+ * Vulkan requires every blit region to lie inside the image
+ * (VUID-VkBlitImageInfo2-dstOffset-00248), and GL's own rule is that a blit is
+ * clipped to the framebuffer and to the scissor box. The state tracker clips
+ * too, but it clips against the framebuffer's reported bounds -- which for the
+ * winsys framebuffer are not the attachment's, so a glBlitFramebuffer whose
+ * destination is INT_MAX wide arrives here with its extent intact. RADV
+ * silently drops such a blit, which is why fbo-blit-check-limits saw nothing
+ * happen.
+ *
+ * Both boxes describe the same mapping, so clipping the destination and
+ * carrying the fraction over to the source keeps the scale. Rounding is
+ * outwards on the source side: a destination pixel has to read the source texel
+ * it lands in, not the one next to it. */
+struct sz_blit_axis {
+   int dst_pos, dst_len;
+   int src_pos, src_len;
+};
+
+static bool
+sz_blit_clip_axis(struct sz_blit_axis *a, int dst_lo, int dst_hi, int src_limit)
+{
+   /* A zero-length axis has nothing to copy. */
+   if (a->dst_len == 0 || a->src_len == 0)
+      return false;
+
+   /* Signed boxes mean a flip: the span runs from pos+len up to pos. Both ends
+    * are made positive here and the sign is restored on the way out. */
+   const int dsign = a->dst_len < 0 ? -1 : 1;
+   const int ssign = a->src_len < 0 ? -1 : 1;
+   int dlo = a->dst_pos, dhi = a->dst_pos + a->dst_len;
+   int slo = a->src_pos, shi = a->src_pos + a->src_len;
+   if (dlo > dhi) { int t = dlo; dlo = dhi; dhi = t; }
+   if (slo > shi) { int t = slo; slo = shi; shi = t; }
+
+   const int new_dlo = MAX2(dlo, dst_lo);
+   const int new_dhi = MIN2(dhi, dst_hi);
+   if (new_dlo >= new_dhi)
+      return false;
+
+   /* The source range the clipped destination range covers. The scale is
+    * (shi - slo) / (dhi - dlo), and it is applied to both ends. */
+   const int64_t dspan = dhi - dlo;
+   const int64_t sspan = shi - slo;
+   int new_slo = slo;
+   int new_shi = shi;
+   if (new_dlo != dlo || new_dhi != dhi) {
+      /* Where the kept destination endpoints land in the source. A flipped
+       * source runs the other way, so the destination's low end lands at its
+       * high end -- cropping the wrong edge there is what put the texture's top
+       * rows at the bottom of a window blit. The source end is rounded outwards:
+       * a destination pixel has to read the whole texel it lands in. */
+      const int64_t lo_at = (int64_t)(new_dlo - dlo) * sspan;
+      const int64_t hi_at = (int64_t)(new_dhi - dlo) * sspan;
+      if (ssign > 0) {
+         new_slo = slo + (int)(lo_at / dspan);
+         new_shi = slo + (int)((hi_at + dspan - 1) / dspan);
+      } else {
+         new_slo = shi - (int)((hi_at + dspan - 1) / dspan);
+         new_shi = shi - (int)(lo_at / dspan);
+      }
+      new_slo = CLAMP(new_slo, 0, src_limit);
+      new_shi = CLAMP(new_shi, 0, src_limit);
+      if (new_dlo == dlo)
+         ssign > 0 ? (new_slo = slo) : (new_shi = shi);
+      if (new_dhi == dhi)
+         ssign > 0 ? (new_shi = shi) : (new_slo = slo);
+      if (new_slo >= new_shi)
+         new_shi = MIN2(new_slo + 1, src_limit);
+      if (new_slo >= new_shi)
+         return false;
+   }
+
+   /* A negative length means a flip: Gallium stores such a box with `pos` at
+    * the far end, covering [pos + len, pos). */
+   a->dst_pos = dsign < 0 ? new_dhi : new_dlo;
+   a->dst_len = (new_dhi - new_dlo) * dsign;
+   a->src_pos = ssign < 0 ? new_shi : new_slo;
+   a->src_len = (new_shi - new_slo) * ssign;
+   return true;
+}
+
+/* The blit restricted to what the destination image and the scissor box can
+ * hold. Returns false when nothing is left. */
+static bool
+sz_blit_clip(const struct pipe_blit_info *info, unsigned dst_w, unsigned dst_h,
+             unsigned src_w, unsigned src_h, struct pipe_blit_info *out)
+{
+   *out = *info;
+   out->scissor_enable = false;
+
+   int dst_xlo = 0, dst_ylo = 0;
+   int dst_xhi = (int)dst_w, dst_yhi = (int)dst_h;
+   if (info->scissor_enable) {
+      dst_xlo = MAX2(dst_xlo, (int)info->scissor.minx);
+      dst_ylo = MAX2(dst_ylo, (int)info->scissor.miny);
+      dst_xhi = MIN2(dst_xhi, (int)info->scissor.maxx);
+      dst_yhi = MIN2(dst_yhi, (int)info->scissor.maxy);
+   }
+
+   struct sz_blit_axis x = { info->dst.box.x, info->dst.box.width,
+                             info->src.box.x, info->src.box.width };
+   struct sz_blit_axis y = { info->dst.box.y, info->dst.box.height,
+                             info->src.box.y, info->src.box.height };
+
+   if (!sz_blit_clip_axis(&x, dst_xlo, dst_xhi, (int)src_w) ||
+       !sz_blit_clip_axis(&y, dst_ylo, dst_yhi, (int)src_h))
+      return false;
+
+   out->dst.box.x = x.dst_pos;
+   out->dst.box.width = x.dst_len;
+   out->src.box.x = x.src_pos;
+   out->src.box.width = x.src_len;
+   out->dst.box.y = y.dst_pos;
+   out->dst.box.height = y.dst_len;
+   out->src.box.y = y.src_pos;
+   out->src.box.height = y.src_len;
+   return true;
+}
+
 void
 sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
@@ -776,18 +904,47 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    if (src->image == VK_NULL_HANDLE || dst->image == VK_NULL_HANDLE)
       return;
 
-   /* Window rectangles, conditional rendering, blending and swizzling each need
-    * a different mechanism (scissored blits, predication, a shader). Refusing is
-    * honest; doing half of it is a wrong picture.
+   /* A blit that the destination cannot hold, or that a scissor restricts, goes
+    * to the blitter: it draws the rectangle, so the rasteriser clips and scissors
+    * it exactly the way GL says. Vulkan's transfer commands have neither, and
+    * clipping them here means recomputing the source rectangle from the fraction
+    * that survived -- arithmetic that has to agree with what the application's
+    * own shader does for the same blit, which is what a scaled-blit test compares
+    * against.
+    *
+    * The clipped native path below is the fallback for when the blitter declines
+    * (a format it cannot sample, for instance). Vulkan requires the regions to be
+    * inside the images, so the boxes still have to be brought into range. */
+   const unsigned src_w = u_minify(info->src.resource->width0, info->src.level);
+   const unsigned src_h = u_minify(info->src.resource->height0, info->src.level);
+   const unsigned dst_w = u_minify(info->dst.resource->width0, info->dst.level);
+   const unsigned dst_h = u_minify(info->dst.resource->height0, info->dst.level);
+   const struct pipe_box *db = &info->dst.box;
+   const bool dst_out_of_range =
+      db->x < 0 || db->y < 0 ||
+      db->x + abs(db->width) > (int)dst_w ||
+      db->y + abs(db->height) > (int)dst_h;
+
+   struct pipe_blit_info clipped;
+   if (info->scissor_enable || dst_out_of_range) {
+      if (sz_blit_blitter(ctx, info))
+         return;
+      if (!sz_blit_clip(info, dst_w, dst_h, src_w, src_h, &clipped))
+         return;
+      info = &clipped;
+   }
+
+   /* Window rectangles and conditional rendering need a mechanism of their own
+    * (scissored blits, predication). Refusing is honest; doing half of it is a
+    * wrong picture.
     *
     * The condition is taken from our own state rather than from
     * pipe_blit_info::render_condition_enable: the state tracker only fills that
     * field in its glDrawPixels path, so on the glBlitFramebuffer path it is
     * uninitialised stack garbage (observed as 1 with no condition set). */
-   if (info->num_window_rectangles || ctx->condition_query ||
-       info->alpha_blend || info->swizzle_enable) {
-      sz_warn_once("blit with window rectangles, a render condition, alpha "
-                   "blending or swizzle is not implemented");
+   if (info->num_window_rectangles || ctx->condition_query) {
+      sz_warn_once("blit with window rectangles or a render condition is not "
+                   "implemented");
       return;
    }
 
@@ -795,6 +952,17 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    const VkFormat dst_format = sz_vk_format(screen, info->dst.resource->format);
    const unsigned src_samples = MAX2(info->src.resource->nr_samples, 1);
    const unsigned dst_samples = MAX2(info->dst.resource->nr_samples, 1);
+
+   if (debug_get_bool_option("SZ_BLIT_LOG", false))
+      fprintf(stderr,
+              "SZBLIT mask=%#x src=%s dst=%s srcbox=%d,%d %dx%d dstbox=%d,%d "
+              "%dx%d scissor=%d swz=%d ab=%d\n",
+              info->mask, util_format_name(info->src.resource->format),
+              util_format_name(info->dst.resource->format), info->src.box.x,
+              info->src.box.y, info->src.box.width, info->src.box.height,
+              info->dst.box.x, info->dst.box.y, info->dst.box.width,
+              info->dst.box.height, info->scissor_enable,
+              info->swizzle_enable, info->alpha_blend);
 
    ctx->screen->stats.blits++;
 
@@ -811,6 +979,23 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * renderer presents) then shows the previous frame's content, or the clear
     * colour, forever. */
    sz_draw_flush(ctx);
+
+   /* A per-channel swizzle or alpha blending is a draw and nothing else:
+    * vkCmdBlitImage, vkCmdCopyImage2 and vkCmdResolveImage2 all move texels the
+    * way they are, and Vulkan has no render-target swizzle to apply on the way
+    * out. util_blitter does both (the swizzle on the sampler view, the blending
+    * through a blend state), so the whole mask goes there.
+    *
+    * The state tracker asks for this whenever the source and destination base
+    * formats differ -- a GL_RGBA framebuffer blitted to a BGRX window, which is
+    * every glBlitFramebuffer to the screen on a little-endian display server. */
+   if (info->alpha_blend) {
+      ctx->screen->stats.blits++;
+      if (!sz_blit_blitter(ctx, info))
+         sz_warn_once("a blit with a swizzle or blending that the blitter "
+                      "cannot draw");
+      return;
+   }
 
    VkCommandBuffer cmd = sz_context_cmd_no_pass(ctx);
    if (cmd == VK_NULL_HANDLE)
