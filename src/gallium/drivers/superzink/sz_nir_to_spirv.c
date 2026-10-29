@@ -5568,6 +5568,34 @@ sz_nir_to_spirv(struct nir_shader *nir,
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       sz_spv_execution_mode(t.m, function, SpvExecutionModeOriginUpperLeft);
 
+   /* A fragment shader that computes gl_FragDepth has to declare it: Vulkan
+    * requires an execution mode for the FragDepth builtin
+    * (VUID-FragDepth-FragDepth-04216), and a module without one is rejected by
+    * spirv-val -- so the depth the shader computed never reaches the pipeline
+    * and the attachment keeps whatever it held. Plain gl_FragDepth writes are
+    * DepthReplacing; GL's layout(depth_greater/less/unchanged) qualifiers map
+    * onto the three narrower modes, which is also the only way to keep early
+    * depth testing possible. */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+       (nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_DEPTH))) {
+      SpvExecutionMode mode;
+      switch (nir->info.fs.depth_layout) {
+      case FRAG_DEPTH_LAYOUT_GREATER:
+         mode = SpvExecutionModeDepthGreater;
+         break;
+      case FRAG_DEPTH_LAYOUT_LESS:
+         mode = SpvExecutionModeDepthLess;
+         break;
+      case FRAG_DEPTH_LAYOUT_UNCHANGED:
+         mode = SpvExecutionModeDepthUnchanged;
+         break;
+      default:
+         mode = SpvExecutionModeDepthReplacing;
+         break;
+      }
+      sz_spv_execution_mode(t.m, function, mode);
+   }
+
    /* Vulkan has no default workgroup size, and a compute pipeline is created
     * against the one the module states. */
    if (nir->info.stage == MESA_SHADER_COMPUTE) {
