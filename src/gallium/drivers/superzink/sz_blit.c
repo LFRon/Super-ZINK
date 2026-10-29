@@ -631,6 +631,96 @@ sz_blit_cross_format(struct pipe_context *pipe,
    return true;
 }
 
+/* A multisampled draw cannot read and write one image.
+ *
+ * The blitter samples the source through a descriptor and writes the destination
+ * through the framebuffer, so when the two are the same image every fragment it
+ * writes is a texel it is still reading -- glBlitFramebuffer between two regions
+ * of one multisampled attachment, which is what glBlitFramebuffer on a
+ * multisampled window framebuffer is, and what glCopyPixels(GL_DEPTH_STENCIL) in
+ * the same window does. Nothing at all lands, because the sampler reads the
+ * samples the draw has already replaced.
+ *
+ * The copy therefore goes through a temporary with the source's own format and
+ * sample count: source to temporary, temporary to destination, two draws that
+ * each name two different images. */
+static bool
+sz_blit_ms_same_image(struct sz_context *ctx, const struct pipe_blit_info *info,
+                      struct sz_resource *src, struct sz_resource *dst,
+                      VkImageAspectFlags aspect)
+{
+   struct sz_screen *screen = ctx->screen;
+   const unsigned samples = MAX2(info->src.resource->nr_samples, 1);
+   const unsigned width = u_minify(info->src.resource->width0, info->src.level);
+   const unsigned height = u_minify(info->src.resource->height0, info->src.level);
+
+   const struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = info->src.resource->format,
+      .bind = util_format_has_depth(util_format_description(
+                 info->src.resource->format))
+                 ? PIPE_BIND_DEPTH_STENCIL
+                 : PIPE_BIND_RENDER_TARGET,
+      .usage = PIPE_USAGE_DEFAULT,
+      .width0 = width,
+      .height0 = height,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 0,
+      .nr_samples = samples,
+      .nr_storage_samples = samples,
+   };
+
+   struct pipe_resource *temp = screen->base.resource_create(&screen->base,
+                                                            &templ);
+   if (!temp)
+      return false;
+   struct sz_resource *tmp = sz_resource(temp);
+   if (tmp->image == VK_NULL_HANDLE) {
+      screen->base.resource_destroy(&screen->base, temp);
+      return false;
+   }
+
+   const struct pipe_box box = {
+      .x = info->src.box.x,
+      .y = info->src.box.y,
+      .z = 0,
+      .width = info->src.box.width,
+      .height = info->src.box.height,
+      .depth = 1,
+   };
+
+   struct pipe_blit_info save = *info;
+   save.dst.resource = temp;
+   save.dst.level = 0;
+   save.dst.format = info->src.resource->format;
+   save.dst.box = (struct pipe_box) {
+      .x = 0, .y = 0, .z = 0,
+      .width = box.width, .height = box.height, .depth = 1,
+   };
+   save.mask = aspect == VK_IMAGE_ASPECT_DEPTH_BIT
+                  ? PIPE_MASK_Z
+                  : aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? PIPE_MASK_S
+                                                          : PIPE_MASK_RGBA;
+   save.swizzle_enable = false;
+   if (!sz_blit_blitter(ctx, &save)) {
+      screen->base.resource_destroy(&screen->base, temp);
+      return false;
+   }
+
+   struct pipe_blit_info restore = *info;
+   restore.src.resource = temp;
+   restore.src.level = 0;
+   restore.src.format = info->src.resource->format;
+   restore.src.box = save.dst.box;
+   restore.mask = save.mask;
+   restore.swizzle_enable = false;
+   const bool ok = sz_blit_blitter(ctx, &restore);
+
+   screen->base.resource_destroy(&screen->base, temp);
+   return ok;
+}
+
 static void
 sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
                const struct pipe_blit_info *info, struct sz_resource *src,
@@ -742,6 +832,13 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
       /* vkCmdBlitImage cannot read or write a multisampled image at all, and a
        * resolve needs a single-sampled destination: a blit between two images
        * of the *same* sample count, or one that also scales, is a draw. */
+      if (src == dst && (src_samples > 1 || dst_samples > 1)) {
+         if (sz_blit_ms_same_image(ctx, info, src, dst, aspect))
+            return;
+         sz_warn_once("a multisampled blit within one image");
+         return;
+      }
+
       struct pipe_blit_info sub = *info;
       sub.mask = aspect == VK_IMAGE_ASPECT_DEPTH_BIT
                     ? PIPE_MASK_Z
