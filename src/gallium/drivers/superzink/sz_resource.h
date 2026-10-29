@@ -76,8 +76,22 @@ struct sz_resource {
     * the device only after a barrier from HOST/HOST_WRITE, and the uploaders
     * write vertices and uniforms this way, so the flag is what turns "the
     * buffer is already bound" into "there is nothing to synchronise" -- which
-    * was wrong and showed up as intermittent garbage geometry. */
+    * was wrong and showed up as intermittent garbage geometry.
+    *
+    * Cleared once a barrier has covered the writes, but only while no write
+    * mapping is still open: see write_maps. */
    bool host_written;
+
+   /* How many direct write mappings the CPU currently holds on this buffer.
+    *
+    * Non-zero means the CPU may write at any time, so the flag above cannot be
+    * cleared -- there is no later event that would mark the next write. This is
+    * not an edge case: u_upload_mgr maps its streaming buffer once and keeps it
+    * mapped, so every vertex and index upload Minecraft makes lands in a buffer
+    * whose mapping never closes, and the barrier that the flag exists to emit
+    * was therefore emitted exactly never. The visible symptom is one vertex of
+    * a quad reading another draw's data, which turns the logo into a bow tie. */
+   unsigned write_maps;
 
    /* Set when the resource was created with linear tiling, which forbids
     * VK_IMAGE_TILING_OPTIMAL-only usage and needs explicit cache flushes. */

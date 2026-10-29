@@ -3171,6 +3171,15 @@ sz_transfer_map(struct pipe_context *pipe, struct pipe_resource *res,
          sz_queue_wait_idle(&screen->batch_state);
          sz_bo_invalidate(r->bo, box->x, box->width);
       }
+      if (usage & PIPE_MAP_WRITE) {
+         /* Marked here rather than at unmap, because the mapping may never be
+          * unmapped before the draws that read it. u_upload_mgr maps once and
+          * writes many times, so waiting for unmap means waiting for the end of
+          * the process, and every draw in between reads vertices with no
+          * HOST_WRITE dependency in front of it. */
+         r->write_maps++;
+         r->host_written = true;
+      }
       t->base.stride = box->width;
       t->base.layer_stride = 0;
       *transfer = &t->base;
@@ -3234,8 +3243,15 @@ sz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
          struct sz_resource *r = sz_resource(t->base.resource);
          if (r->bo) {
             sz_bo_flush(r->bo, t->base.box.x, t->base.box.width);
-            if (t->base.resource->target == PIPE_BUFFER)
+            if (t->base.resource->target == PIPE_BUFFER) {
+               /* The barrier is still owed: the writes happened before this
+                * unmap, and nothing has ordered a device read after them yet.
+                * host_written stays set until a barrier covers it, while
+                * write_maps is what says whether another write can follow. */
                r->host_written = true;
+               if (r->write_maps)
+                  r->write_maps--;
+            }
          }
       }
       free(t);
@@ -3248,6 +3264,14 @@ sz_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
       const uint64_t size = sz_bo_size(staging->bo);
 
       sz_bo_flush(staging->bo, 0, size);
+
+      /* The staging bytes were written by the CPU through a plain mapping, so
+       * the copy below reads data the device has never been told about. Without
+       * this the barrier sz_copy_job_record() emits for the source has no
+       * source stage at all -- it is a no-op -- and the copy may read whatever
+       * was in that memory before the upload. The result is a draw whose vertex
+       * or index data is one frame stale, in exactly one place on screen. */
+      staging->host_written = true;
 
       struct sz_copy_job job = {
          .res = sz_resource(t->base.resource),
@@ -3326,8 +3350,32 @@ sz_transfer_flush_region(struct pipe_context *pipe,
                          struct pipe_transfer *transfer,
                          const struct pipe_box *box)
 {
-   /* A mapped write is synchronised at map time (see sz_transfer_map), so the
-    * whole box is copied at unmap and there is nothing to flush early. */
+   struct sz_transfer *t = (struct sz_transfer *)transfer;
+
+   /* glFlushMappedBufferRange(GL_MAP_FLUSH_EXPLICIT_BIT): the application says
+    * the bytes in `box` are written and will be read by the draws that follow,
+    * while the mapping itself stays open. Mesa's u_upload_mgr does the same
+    * thing with its own internal flush.
+    *
+    * The data is already in the buffer -- a direct mapping writes straight into
+    * it -- so there is nothing to copy here. What is missing is the promise to
+    * the device: the flush has to make the range visible, and the read that
+    * comes next has to be ordered after it. The flag does the second part, since
+    * the barrier is emitted from sz_resource_access(). */
+   if (!t->staging) {
+      struct sz_resource *r = sz_resource(t->base.resource);
+      if (r->bo && (t->base.usage & PIPE_MAP_WRITE)) {
+         sz_bo_flush(r->bo, box->x, box->width);
+         r->host_written = true;
+      }
+      return;
+   }
+
+   /* A staged write is copied at unmap, so a mid-mapping flush only has to make
+    * the staging bytes visible; the copy itself covers the whole box. */
+   struct sz_resource *staging = sz_resource(t->staging);
+   if (staging && staging->bo)
+      sz_bo_flush(staging->bo, 0, sz_bo_size(staging->bo));
 }
 
 /* glTextureBarrier (NV_texture_barrier).

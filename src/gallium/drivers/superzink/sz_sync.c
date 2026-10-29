@@ -5,6 +5,7 @@
 
 #include "sz_sync.h"
 
+#include "sz_bo.h"
 #include "sz_format.h"
 
 #include "util/format/u_format.h"
@@ -328,6 +329,11 @@ sz_resource_access_levels(struct sz_screen *screen, VkCommandBuffer cmd,
       if (res->host_written) {
          src_stages |= VK_PIPELINE_STAGE_2_HOST_BIT;
          src_access |= VK_ACCESS_2_HOST_WRITE_BIT;
+
+         /* Cheap and a no-op for coherent memory, but the only place that can
+          * make a non-coherent mapping visible: the CPU may have written
+          * anywhere in the buffer, so the whole allocation goes. */
+         sz_bo_flush(res->bo, 0, sz_bo_size(res->bo));
       }
 
       if (src_stages != 0) {
@@ -353,7 +359,13 @@ sz_resource_access_levels(struct sz_screen *screen, VkCommandBuffer cmd,
          screen->vk.CmdPipelineBarrier2(cmd, &dep);
          res->pending_write_stages = 0;
          res->pending_write_access = 0;
-         res->host_written = false;
+         /* Only clearable when the CPU is done writing. While a write mapping is
+          * still open -- u_upload_mgr holds one for the life of the buffer --
+          * anything after this barrier may have been written by the CPU, and
+          * clearing the flag would leave that write unordered against every
+          * later read. */
+         if (res->write_maps == 0)
+            res->host_written = false;
       }
 
       /* Marked before the write is recorded, not after: the caller issues the
