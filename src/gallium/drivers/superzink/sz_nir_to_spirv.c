@@ -3218,11 +3218,13 @@ sz_sampler_get(struct sz_translate *t, const nir_tex_instr *tex, SpvDim dim)
    const unsigned index = tex->sampler_index;
    const bool arrayed = tex->is_array;
    const bool depth = tex->is_shadow;
-   /* A sample index is only meaningful on a multisampled image, so the presence
-    * of one is what makes the declared OpTypeImage carry MS = 1. Without it the
-    * module is invalid: an ImageOperand of Sample requires the image to be
-    * multisampled (spirv-val rejects the mismatch). */
-   const bool ms = tex->op == nir_texop_txf_ms;
+   /* Multisampling is a property of the sampler, not of the instruction that
+    * uses it: textureSize() on a sampler2DMS fetches nothing and still names an
+    * MS image. Deriving it from the op declared the same unit as a plain 2D
+    * image for the query and as a multisampled one for the fetch, which the
+    * consistency check below then reported as a conflict -- that is what an
+    * MSAA depth resolve through util_blitter hit. */
+   const bool ms = tex->sampler_dim == GLSL_SAMPLER_DIM_MS;
 
    for (unsigned i = 0; i < t->num_samplers; i++) {
       if (t->samplers[i].index != index)
@@ -3600,11 +3602,15 @@ sz_emit_tex(struct sz_translate *t, nir_tex_instr *tex)
          return;
       }
 
+      /* OpImageQuerySizeLod cannot name a multisampled image (SPIR-V says its
+       * "MS" operand must be 0), and an MS image has no mip levels to ask
+       * about either: the plain query is the one that answers. */
+      const bool no_lod = dim == SpvDimBuffer ||
+                          tex->sampler_dim == GLSL_SAMPLER_DIM_MS;
       const uint32_t value =
          sz_spv_alu(t->m,
-                    dim == SpvDimBuffer ? SpvOpImageQuerySize
-                                        : SpvOpImageQuerySizeLod,
-                    type, ops, dim == SpvDimBuffer ? 1 : 2);
+                    no_lod ? SpvOpImageQuerySize : SpvOpImageQuerySizeLod,
+                    type, ops, no_lod ? 1 : 2);
       t->defs_id[tex->def.index] = value;
       t->def_types[tex->def.index] = result_type;
       return;
