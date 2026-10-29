@@ -574,6 +574,29 @@ sz_descriptor_sampled_needs_transition(struct sz_context *ctx)
    return false;
 }
 
+bool
+sz_descriptor_storage_needs_transition(struct sz_context *ctx)
+{
+   for (unsigned s = 0; s < ARRAY_SIZE(sz_descriptor_stages); s++) {
+      for (unsigned i = 0; i < SZ_MAX_IMAGES; i++) {
+         const struct pipe_image_view *view =
+            ctx->state.shader_images[sz_descriptor_stages[s]][i];
+         if (!view || !view->resource)
+            continue;
+
+         struct sz_resource *res = sz_resource(view->resource);
+         if (!res || res->image == VK_NULL_HANDLE)
+            continue;
+
+         if (res->undefined_contents ||
+             res->layout != VK_IMAGE_LAYOUT_GENERAL)
+            return true;
+      }
+   }
+
+   return false;
+}
+
 /* Whether the resource is one of the attachments of the render pass that is
  * currently open. The layout alone cannot answer this: an image keeps
  * COLOR_ATTACHMENT_OPTIMAL after its pass has ended, and sampling it then is
@@ -706,6 +729,25 @@ sz_descriptor_dummy_prepare(struct sz_screen *screen, VkCommandBuffer cmd)
    screen->vk.CmdPipelineBarrier2(cmd, &dep);
 
    screen->dummy_sampler.ready = true;
+}
+
+void
+sz_descriptor_prepare_storage(struct sz_context *ctx, VkCommandBuffer cmd)
+{
+   for (unsigned s = 0; s < ARRAY_SIZE(sz_descriptor_stages); s++) {
+      for (unsigned i = 0; i < SZ_MAX_IMAGES; i++) {
+         const struct pipe_image_view *view =
+            ctx->state.shader_images[sz_descriptor_stages[s]][i];
+         if (!view || !view->resource)
+            continue;
+
+         struct sz_resource *res = sz_resource(view->resource);
+         if (!res || res->image == VK_NULL_HANDLE)
+            continue;
+
+         sz_resource_access(ctx->screen, cmd, res, SZ_ACCESS_STORAGE);
+      }
+   }
 }
 
 void

@@ -4439,9 +4439,19 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
          sz_spv_alu(t->m, SpvOpImageTexelPointer, ptr_type, texel_ops, 3);
 
       const uint32_t want = scalar;
+      /* A storage image has no samples, but the intrinsic still carries the
+       * sample index: the sources are (image, coord, sample, data) -- and
+       * (image, coord, sample, compare, data) for a compare-exchange, in that
+       * order, because the frontend appends the GLSL arguments as written.
+       *
+       * Reading the value from src[2] therefore takes the sample index, which
+       * the frontend leaves undefined: the atomic adds an undefined register
+       * and the texel comes back unchanged with the right old value, which is
+       * exactly what a lost store looks like from outside. */
+      const unsigned value_src = cmpxchg ? 4 : 3;
       const uint32_t value =
-         sz_bitcast_to(t, sz_def_value(t, intrin->src[2].ssa),
-                       &t->def_types[intrin->src[2].ssa->index],
+         sz_bitcast_to(t, sz_def_value(t, intrin->src[value_src].ssa),
+                       &t->def_types[intrin->src[value_src].ssa->index],
                        &(struct sz_dtype){type.base, type.bits, 1, 0});
       if (value == 0)
          return false;
@@ -4451,6 +4461,8 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       ops[n++] = ptr;
       ops[n++] = sz_memory_scope(t);
       if (cmpxchg) {
+         /* src[3] is the comparator; OpAtomicCompareExchange wants the value
+          * first and the comparator second. */
          const uint32_t compare =
             sz_bitcast_to(t, sz_def_value(t, intrin->src[3].ssa),
                           &t->def_types[intrin->src[3].ssa->index],

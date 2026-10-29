@@ -92,6 +92,16 @@ void sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd,
  * image in a layout the descriptor does not claim -- is undefined reads. */
 bool sz_descriptor_sampled_needs_transition(struct sz_context *ctx);
 
+/* The same question for the storage images a draw binds: they have to be in
+ * GENERAL, which is not where a texture that was just uploaded or sampled is,
+ * and the barrier that moves one there may not be inside a render pass. */
+bool sz_descriptor_storage_needs_transition(struct sz_context *ctx);
+
+/* Transitions every bound storage image into GENERAL. Must be called while no
+ * render pass is open, and before the pass that will bind the descriptors
+ * begins -- the transition itself is illegal inside one. */
+void sz_descriptor_prepare_storage(struct sz_context *ctx, VkCommandBuffer cmd);
+
 /* Transitions every sampled image into SHADER_READ_ONLY_OPTIMAL. Must be called
  * while no render pass is open. */
 void sz_descriptor_prepare_sampled(struct sz_context *ctx, VkCommandBuffer cmd);

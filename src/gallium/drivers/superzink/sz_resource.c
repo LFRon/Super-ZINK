@@ -240,7 +240,8 @@ sz_image_create_info(struct sz_screen *screen, const struct pipe_resource *tmpl)
    const VkImageType type = sz_image_vk_type(screen, tmpl->target, tmpl->format);
    const bool linear = sz_bindings_require_linear(tmpl->bind);
 
-   VkImageUsageFlags usage = sz_image_usage_from_bindings(tmpl->bind, tmpl->format);
+   VkImageUsageFlags usage = sz_image_usage_from_bindings(screen, tmpl->bind,
+                                                         tmpl->format);
    VkImageCreateFlags flags = type == VK_IMAGE_TYPE_2D
                                  ? sz_image_create_flags(tmpl->target)
                                  : 0;

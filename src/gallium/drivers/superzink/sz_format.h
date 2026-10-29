@@ -50,7 +50,8 @@ void sz_format_probe(struct sz_screen *screen);
 void sz_format_debug_print(struct sz_screen *screen);
 
 /* Translate Gallium usage bits to the VkImageUsageFlags they require. */
-VkImageUsageFlags sz_image_usage_from_bindings(unsigned bindings,
+VkImageUsageFlags sz_image_usage_from_bindings(struct sz_screen *screen,
+                                              unsigned bindings,
                                               enum pipe_format format);
 
 /* Translate Gallium bindings to the VkFormatFeatureFlags that must be present. */

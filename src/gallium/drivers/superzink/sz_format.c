@@ -28,6 +28,19 @@ sz_format_has_depth_features(struct sz_screen *screen, VkFormat format)
            VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
 }
 
+/* Whether the device can store into an image of this format from a shader. */
+static bool
+sz_format_can_store(struct sz_screen *screen, VkFormat format)
+{
+   if (format == VK_FORMAT_UNDEFINED)
+      return false;
+
+   VkFormatProperties props;
+   screen->vk.GetPhysicalDeviceFormatProperties(screen->pdev, format, &props);
+   return (props.optimalTilingFeatures &
+           VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+}
+
 void
 sz_format_probe(struct sz_screen *screen)
 {
@@ -211,7 +224,8 @@ sz_format_features_from_bindings(unsigned bindings)
 }
 
 VkImageUsageFlags
-sz_image_usage_from_bindings(unsigned bindings, enum pipe_format format)
+sz_image_usage_from_bindings(struct sz_screen *screen, unsigned bindings,
+                            enum pipe_format format)
 {
    const struct util_format_description *desc = util_format_description(format);
    const bool depth_stencil =
@@ -231,6 +245,18 @@ sz_image_usage_from_bindings(unsigned bindings, enum pipe_format format)
       usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
 
    if (bindings & PIPE_BIND_SHADER_IMAGE)
+      usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+
+   /* A texture can be bound to an image unit long after it was created: GL has
+    * no way to say "a shader will write this" at allocation time, so an
+    * application calls glTexImage2D and only later glBindImageTexture. Without
+    * the bit declared here that descriptor points at an image Vulkan never
+    * allowed to be written (VUID-VkDescriptorGetInfoEXT-type-12218), and there
+    * is no way to add it afterwards.
+    *
+    * The format's own features decide it, so a format that cannot be a storage
+    * image gets nothing -- the frontend rejects binding such a texture anyway. */
+   if (sz_format_can_store(screen, sz_vk_format(screen, format)))
       usage |= VK_IMAGE_USAGE_STORAGE_BIT;
 
    /* Every image is a legal transfer source and destination. The paths that need
@@ -366,7 +392,7 @@ sz_format_supported_image(struct sz_screen *screen,
     * Gallium's model. */
    const VkImageCreateFlags flags =
       type == VK_IMAGE_TYPE_2D ? sz_image_create_flags(target) : 0;
-   VkImageUsageFlags usage = sz_image_usage_from_bindings(bindings, format);
+   VkImageUsageFlags usage = sz_image_usage_from_bindings(screen, bindings, format);
    if (type == VK_IMAGE_TYPE_3D) {
       usage &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);

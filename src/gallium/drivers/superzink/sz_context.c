@@ -2545,13 +2545,18 @@ sz_draw_flush(struct sz_context *ctx)
    /* A layout transition is illegal inside a render pass, so a batch whose
     * descriptors changed may have to close it first. */
    if ((ctx->dirty & SZ_DIRTY_DESCRIPTORS) && ctx->rendering &&
-       sz_descriptor_sampled_needs_transition(ctx)) {
+       (sz_descriptor_sampled_needs_transition(ctx) ||
+        sz_descriptor_storage_needs_transition(ctx))) {
       ctx->screen->vk.CmdEndRendering(cmd);
       ctx->rendering = false;
    }
 
-   if (ctx->dirty & SZ_DIRTY_DESCRIPTORS)
+   if (ctx->dirty & SZ_DIRTY_DESCRIPTORS) {
       sz_descriptor_prepare_sampled(ctx, cmd);
+      /* Storage images move to GENERAL here, before the pass that binds them
+       * starts: the barrier that does it may not be recorded inside one. */
+      sz_descriptor_prepare_storage(ctx, cmd);
+   }
 
    /* Zeroing the capture counters may not be recorded inside a render pass, so
     * it forces the pass closed -- only when a capture actually starts, not on
@@ -3081,6 +3086,12 @@ sz_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 
       const VkComputePipelineCreateInfo ci = {
          .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+         /* Same promise the graphics pipeline makes: a pipeline whose
+          * descriptors come from a descriptor buffer has to say so, or the
+          * dispatch that binds one is invalid (VUID-vkCmdDispatch-None-08117). */
+         .flags = screen->db.enabled
+                     ? VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT
+                     : 0,
          .stage = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -4137,6 +4148,12 @@ sz_context_destroy(struct pipe_context *pipe)
       ctx->screen->vk.DestroyBuffer(ctx->screen->dev, ctx->so_counter_buffer,
                                     NULL);
    }
+
+   /* The compute pipeline is cached per shader on the context, not owned by any
+    * state object, so nothing else destroys it. */
+   if (ctx->compute_pipeline != VK_NULL_HANDLE)
+      ctx->screen->vk.DestroyPipeline(ctx->screen->dev, ctx->compute_pipeline,
+                                      NULL);
 
    u_upload_destroy(ctx->base.const_uploader);
    u_upload_destroy(ctx->base.stream_uploader);

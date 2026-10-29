@@ -353,7 +353,8 @@ sz_screen_resource_from_handle(struct pipe_screen *pscreen,
       .samples = VK_SAMPLE_COUNT_1_BIT,
       .tiling = use_modifier ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
                              : VK_IMAGE_TILING_LINEAR,
-      .usage = sz_image_usage_from_bindings(tmpl->bind, tmpl->format) |
+      .usage = sz_image_usage_from_bindings(screen, tmpl->bind,
+                                            tmpl->format) |
                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
