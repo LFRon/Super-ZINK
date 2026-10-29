@@ -186,6 +186,17 @@ struct sz_translate {
    } ubos[SZ_MAX_UBOS];
    unsigned num_ubos;
 
+   /* Shader storage blocks, declared on first use for the same reason: after
+    * gl_nir_lower_buffers the variable is gone and only load_ssbo/store_ssbo
+    * with a constant buffer index remain. */
+   struct {
+      unsigned index;
+      uint32_t array_ptr;
+      /* The block variable itself: OpArrayLength takes a pointer to the struct. */
+      uint32_t var;
+   } ssbos[SZ_MAX_SSBO];
+   unsigned num_ssbos;
+
    /* Samplers are declared on first use for the same reason uniform blocks are:    * nir_lower_samplers() has already replaced every sampler deref with a plain
     * sampler_index, so the NIR no longer carries a type to declare from -- but
     * that index is exactly the texture unit whose binding the layout holds. */
@@ -2299,6 +2310,211 @@ sz_word_as_type(struct sz_translate *t, uint32_t word, enum sz_base base)
    return 0;
 }
 
+/* Declares (once) the storage block for gallium shader buffer slot `index` and
+ * returns a pointer to its runtime array of 32-bit words.
+ *
+ * Untyped for the same reason the uniform blocks are: load_ssbo and store_ssbo
+ * address the block by byte offset and say which type the bytes are, so a
+ * std140/std430 member layout here would only have to agree with the frontend's
+ * offsets, and a disagreement would be silent.
+ *
+ * Block is the right decoration for a StorageBuffer pointer: BufferBlock is the
+ * pre-1.3 spelling of the same idea and is deprecated once SSBOs are core. */
+static uint32_t
+sz_ssbo_array_ptr(struct sz_translate *t, unsigned index)
+{
+   for (unsigned i = 0; i < t->num_ssbos; i++) {
+      if (t->ssbos[i].index == index)
+         return t->ssbos[i].array_ptr;
+   }
+
+   if (t->num_ssbos == SZ_MAX_SSBO) {
+      sz_fail(t, "more than %d shader storage blocks in one shader", SZ_MAX_SSBO);
+      return 0;
+   }
+
+   const uint32_t uint_type = sz_spv_type_uint32(t->m);
+   const uint32_t array_type = sz_spv_type_runtime_array(t->m, uint_type);
+   /* The runtime array type is shared by every block in the module, so it is
+    * decorated once. */
+   if (t->num_ssbos == 0)
+      sz_spv_decorate(t->m, array_type, SpvDecorationArrayStride, 4);
+
+   const uint32_t block_type = sz_spv_type_struct(t->m, &array_type, 1);
+   sz_spv_decorate_bare(t->m, block_type, SpvDecorationBlock);
+   sz_spv_member_decorate(t->m, block_type, 0, SpvDecorationOffset, 0);
+
+   const uint32_t block_ptr =
+      sz_spv_type_ptr(t->m, SpvStorageClassStorageBuffer, block_type);
+   const uint32_t var =
+      sz_spv_variable(t->m, block_ptr, SpvStorageClassStorageBuffer);
+
+   sz_spv_decorate(t->m, var, SpvDecorationDescriptorSet,
+                   SZ_DESCRIPTOR_SET_UBO);
+   sz_spv_decorate(t->m, var, SpvDecorationBinding,
+                   sz_ssbo_binding(t->nir->info.stage, index));
+
+   const uint32_t member0 = sz_spv_const_uint32(t->m, 0);
+   const uint32_t array_ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassStorageBuffer, array_type);
+   const uint32_t array_ptr =
+      sz_spv_access_chain(t->m, array_ptr_type, var, &member0, 1);
+
+   t->ssbos[t->num_ssbos].index = index;
+   t->ssbos[t->num_ssbos].array_ptr = array_ptr;
+   t->ssbos[t->num_ssbos].var = var;
+   t->num_ssbos++;
+
+   sz_interface_add(t, var);
+   return array_ptr;
+}
+
+/* The byte offset a shader buffer access names, as a word index.
+ *
+ * NIR gives the offset in bytes and as a signed 32-bit value; the array behind
+ * the block is of 32-bit words, and GL requires every access to be naturally
+ * aligned, so a shift is exact. */
+static uint32_t
+sz_ssbo_word_offset(struct sz_translate *t, nir_src src, unsigned base,
+                    unsigned extra_words)
+{
+   const uint32_t uint_type = sz_spv_type_uint32(t->m);
+   const uint32_t two = sz_spv_const_uint32(t->m, 2);
+   const uint32_t extra = sz_spv_const_uint32(t->m, extra_words);
+
+   uint32_t words;
+   const nir_const_value *offset_value = nir_src_as_const_value(src);
+   if (offset_value) {
+      const uint64_t bytes = base + (uint64_t)offset_value[0].u32;
+      if (bytes % 4) {
+         sz_fail(t, "shader buffer access at byte offset %" PRIu64
+                    " is not word aligned", bytes);
+         return 0;
+      }
+      const uint32_t at = sz_spv_const_uint32(t->m, (uint32_t)(bytes / 4));
+      if (extra_words == 0)
+         return at;
+      const uint32_t ops[] = { at, extra };
+      return sz_spv_alu(t->m, SpvOpIAdd, uint_type, ops, 2);
+   }
+
+   const uint32_t bytes = t->defs_id[src.ssa->index];
+   if (bytes == 0)
+      return 0;
+
+   const uint32_t shift_ops[] = { bytes, two };
+   words = sz_spv_alu(t->m, SpvOpShiftRightLogical, uint_type, shift_ops, 2);
+   if (extra_words == 0)
+      return words;
+   const uint32_t ops[] = { words, extra };
+   return sz_spv_alu(t->m, SpvOpIAdd, uint_type, ops, 2);
+}
+
+/* The pointer to one word of a storage block. */
+static uint32_t
+sz_ssbo_word_ptr(struct sz_translate *t, uint32_t array_ptr, uint32_t word)
+{
+   const uint32_t ptr_type =
+      sz_spv_type_ptr(t->m, SpvStorageClassStorageBuffer,
+                      sz_spv_type_uint32(t->m));
+   return sz_spv_access_chain(t->m, ptr_type, array_ptr, &word, 1);
+}
+
+/* The 32 bits of a component, as a uint, for storing into a block. */
+static uint32_t
+sz_type_as_word(struct sz_translate *t, uint32_t value, enum sz_base base)
+{
+   const uint32_t uint_type = sz_spv_type_uint32(t->m);
+   switch (base) {
+   case SZ_BASE_UINT:
+      return value;
+   case SZ_BASE_BOOL: {
+      /* A bool is one bit in SPIR-V and a word here. */
+      const uint32_t one = sz_spv_const_uint32(t->m, 1);
+      const uint32_t zero = sz_spv_const_uint32(t->m, 0);
+      const uint32_t ops[] = { value, one, zero };
+      return sz_spv_alu(t->m, SpvOpSelect, uint_type, ops, 3);
+   }
+   default:
+      return sz_spv_alu(t->m, SpvOpBitcast, uint_type, &value, 1);
+   }
+}
+
+static void
+sz_emit_load_ssbo(struct sz_translate *t, nir_intrinsic_instr *intrin)
+{
+   const nir_def *def = &intrin->def;
+   const unsigned ncomp = def->num_components;
+
+   const nir_const_value *index_value = nir_src_as_const_value(intrin->src[0]);
+   if (!index_value) {
+      sz_fail(t, "indirect shader buffer selection is not supported");
+      return;
+   }
+
+   const uint32_t array_ptr = sz_ssbo_array_ptr(t, index_value[0].u32);
+   if (!array_ptr)
+      return;
+
+   struct sz_dtype type = {.base = SZ_BASE_FLOAT, .bits = 32, .ncomp = ncomp};
+   if (!sz_base_from_alu_type(nir_intrinsic_instr_dest_type(intrin), &type.base))
+      sz_guess_def_type(t, def, &type);
+
+   uint32_t comps[4];
+   for (unsigned i = 0; i < ncomp; i++) {
+      const uint32_t word = sz_ssbo_word_offset(t, intrin->src[1], 0, i);
+      if (word == 0)
+         return;
+      const uint32_t ptr = sz_ssbo_word_ptr(t, array_ptr, word);
+      comps[i] = sz_word_as_type(
+         t, sz_spv_load(t->m, sz_spv_type_uint32(t->m), ptr), type.base);
+   }
+
+   t->def_types[def->index] = type;
+   t->defs_id[def->index] =
+      ncomp == 1 ? comps[0]
+                 : sz_spv_composite_construct(t->m, sz_dtype_type(t, &type),
+                                              comps, ncomp);
+}
+
+static void
+sz_emit_store_ssbo(struct sz_translate *t, nir_intrinsic_instr *intrin)
+{
+   /* A store names its operands value first, then the buffer and the byte offset;
+    * a load names the buffer first. */
+   const nir_const_value *index_value = nir_src_as_const_value(intrin->src[1]);
+   if (!index_value) {
+      sz_fail(t, "indirect shader buffer selection is not supported");
+      return;
+   }
+
+   const uint32_t array_ptr = sz_ssbo_array_ptr(t, index_value[0].u32);
+   if (!array_ptr)
+      return;
+
+   const nir_src value_src = intrin->src[0];
+   const struct sz_dtype type = t->def_types[value_src.ssa->index];
+   const unsigned ncomp = MAX2(type.ncomp, 1);
+   const uint32_t value = sz_def_value(t, value_src.ssa);
+   if (value == 0)
+      return;
+
+   const uint32_t uint_type = sz_spv_type_uint32(t->m);
+   for (unsigned i = 0; i < ncomp; i++) {
+      uint32_t comp = value;
+      if (ncomp > 1)
+         comp = sz_spv_composite_extract(
+            t->m, sz_scalar_type(t, type.base, type.bits), value, &i, 1);
+
+      const uint32_t word = sz_ssbo_word_offset(t, intrin->src[2], 0, i);
+      if (word == 0)
+         return;
+      const uint32_t ptr = sz_ssbo_word_ptr(t, array_ptr, word);
+      sz_spv_store(t->m, ptr, sz_type_as_word(t, comp, type.base));
+   }
+   (void)uint_type;
+}
+
 /* `in_vec4_units` selects between the two addressing modes NIR has for uniform
  * buffers: load_ubo counts bytes, load_ubo_vec4 counts vec4s. Both are supported
  * because the frontend picks one or the other from the shader's GLSL version
@@ -4209,6 +4425,51 @@ sz_emit_intrinsic(struct sz_translate *t, nir_intrinsic_instr *intrin)
       sz_spv_raw_function_op(t->m, SpvOpMemoryBarrier, ops, 2);
       return true;
    }
+   case nir_intrinsic_load_ssbo:
+      sz_emit_load_ssbo(t, intrin);
+      return true;
+   case nir_intrinsic_get_ssbo_size: {
+      /* unsized_array.length(), which GL 4.3 defines as the number of elements
+       * the bound range can hold. OpArrayLength answers exactly that for the
+       * block's runtime array member. */
+      const nir_const_value *index_value =
+         nir_src_as_const_value(intrin->src[0]);
+      if (!index_value) {
+         sz_fail(t, "indirect shader buffer selection is not supported");
+         return false;
+      }
+      const unsigned index = index_value[0].u32;
+      if (!sz_ssbo_array_ptr(t, index))
+         return false;
+
+      uint32_t var = 0;
+      for (unsigned i = 0; i < t->num_ssbos; i++)
+         if (t->ssbos[i].index == index)
+            var = t->ssbos[i].var;
+      if (var == 0)
+         return false;
+
+      /* OpArrayLength's member index is a literal, not an id. */
+      const unsigned member = 0;
+      const uint32_t ops[] = { var, member };
+      const uint32_t words =
+         sz_spv_alu(t->m, SpvOpArrayLength, sz_spv_type_uint32(t->m), ops, 2);
+
+      /* get_ssbo_size counts bytes and the runtime array holds 32-bit words, so
+       * the element count has to be widened. The frontend computes
+       * `unsized_array.length()` from this number, which is why the size and not
+       * the count is what it asks for. */
+      const uint32_t word_bytes = sz_spv_const_uint32(t->m, 4);
+      const uint32_t mul_ops[] = { words, word_bytes };
+      const uint32_t value =
+         sz_spv_alu(t->m, SpvOpIMul, sz_spv_type_uint32(t->m), mul_ops, 2);
+      t->defs_id[intrin->def.index] = value;
+      t->def_types[intrin->def.index] = (struct sz_dtype){SZ_BASE_UINT, 32, 1, 0};
+      return true;
+   }
+   case nir_intrinsic_store_ssbo:
+      sz_emit_store_ssbo(t, intrin);
+      return true;
    case nir_intrinsic_load_ubo:
       sz_emit_load_ubo(t, intrin, false);
       return true;

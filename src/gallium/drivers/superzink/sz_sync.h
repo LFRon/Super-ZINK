@@ -35,6 +35,7 @@ enum sz_access {
    SZ_ACCESS_VERTEX_BUFFER, /* reading it as vertex data */
    SZ_ACCESS_INDEX_BUFFER,  /* reading it as index data */
    SZ_ACCESS_UNIFORM_BUFFER, /* reading it as shader constants */
+   SZ_ACCESS_STORAGE_BUFFER, /* reading or writing it as a shader storage block */
    SZ_ACCESS_TEXEL_BUFFER,  /* reading it as a buffer texture */
    SZ_ACCESS_TRANSFER_SRC,  /* copying out of it */
    SZ_ACCESS_TRANSFER_DST,  /* copying into it, or clearing it */

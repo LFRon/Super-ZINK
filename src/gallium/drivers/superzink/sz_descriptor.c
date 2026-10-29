@@ -35,8 +35,9 @@ static const mesa_shader_stage sz_descriptor_stages[SZ_DESCRIPTOR_STAGES] = {
 static bool
 sz_descriptor_layout_create(struct sz_screen *screen, VkDescriptorSetLayout *out)
 {
-   /* Set 0: every stage's uniform buffers, pushed per state change. */
-   VkDescriptorSetLayoutBinding bindings[SZ_DESCRIPTOR_UBO_BINDINGS];
+   /* Set 0: every stage's uniform buffers and shader storage blocks, written
+    * per state change. */
+   VkDescriptorSetLayoutBinding bindings[SZ_DESCRIPTOR_BUFFER_BINDINGS];
 
    for (unsigned s = 0; s < ARRAY_SIZE(sz_descriptor_stages); s++) {
       const mesa_shader_stage stage = sz_descriptor_stages[s];
@@ -46,6 +47,15 @@ sz_descriptor_layout_create(struct sz_screen *screen, VkDescriptorSetLayout *out
          bindings[binding] = (VkDescriptorSetLayoutBinding) {
             .binding = binding,
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = flags,
+         };
+      }
+      for (unsigned i = 0; i < SZ_MAX_SSBO; i++) {
+         const unsigned binding = sz_ssbo_binding(stage, i);
+         bindings[binding] = (VkDescriptorSetLayoutBinding) {
+            .binding = binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 1,
             .stageFlags = flags,
          };
@@ -67,7 +77,7 @@ sz_descriptor_layout_create(struct sz_screen *screen, VkDescriptorSetLayout *out
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
       /* ADR-008: nothing is ever allocated from a pool. */
       .flags = layout_flags,
-      .bindingCount = SZ_DESCRIPTOR_UBO_BINDINGS,
+      .bindingCount = SZ_DESCRIPTOR_BUFFER_BINDINGS,
       .pBindings = bindings,
    };
 
@@ -988,6 +998,47 @@ sz_descriptor_db_emit(struct sz_context *ctx, VkCommandBuffer cmd)
                                      mapped + ubo_offset + binding_offset);
       }
 
+      /* ── shader storage blocks ────────────────────────────────────────── */
+      for (unsigned i = 0; i < SZ_MAX_SSBO; i++) {
+         VkDeviceSize binding_offset = 0;
+         screen->vk.GetDescriptorSetLayoutBindingOffsetEXT(
+            screen->dev, ubo_layout, sz_ssbo_binding(stage, i), &binding_offset);
+
+         const struct pipe_shader_buffer *sb =
+            &ctx->state.shader_buffers[stage][i];
+
+         VkDescriptorAddressInfoEXT address = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+            .format = VK_FORMAT_UNDEFINED,
+            .address = screen->dummy_ubo.address,
+            .range = 256,
+         };
+
+         if (sb->buffer) {
+            struct sz_resource *res = sz_resource(sb->buffer);
+            if (res->buffer != VK_NULL_HANDLE) {
+               sz_resource_access(screen, cmd, res, SZ_ACCESS_STORAGE_BUFFER);
+
+               const uint64_t offset = sb->buffer_offset;
+               uint64_t range = sb->buffer_size ? sb->buffer_size : VK_WHOLE_SIZE;
+               if (range != VK_WHOLE_SIZE)
+                  range = MIN2(range, (uint64_t)sb->buffer->width0 - offset);
+
+               address.address = res->address + offset;
+               address.range = range;
+            }
+         }
+
+         const VkDescriptorGetInfoEXT info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+            .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .data.pStorageBuffer = &address,
+         };
+         screen->vk.GetDescriptorEXT(
+            screen->dev, &info, screen->caps.descriptor_size_storage_buffer,
+            mapped + ubo_offset + binding_offset);
+      }
+
       /* ── combined image samplers ──────────────────────────────────────── */
       for (unsigned i = 0; i < SZ_MAX_SAMPLERS; i++) {
          VkDeviceSize binding_offset = 0;
@@ -1175,8 +1226,8 @@ sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd)
     * one call covers vertex and fragment without the second disturbing the
     * first. */
    {
-      VkDescriptorBufferInfo infos[SZ_DESCRIPTOR_UBO_BINDINGS];
-      VkWriteDescriptorSet writes[SZ_DESCRIPTOR_UBO_BINDINGS];
+      VkDescriptorBufferInfo infos[SZ_DESCRIPTOR_BUFFER_BINDINGS];
+      VkWriteDescriptorSet writes[SZ_DESCRIPTOR_BUFFER_BINDINGS];
       unsigned count = 0;
 
       for (unsigned s = 0; s < ARRAY_SIZE(sz_descriptor_stages); s++) {
@@ -1216,6 +1267,45 @@ sz_descriptor_push(struct sz_context *ctx, VkCommandBuffer cmd)
                .dstBinding = sz_descriptor_binding(stage, i),
                .descriptorCount = 1,
                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+               .pBufferInfo = &infos[count],
+            };
+
+            count++;
+         }
+      }
+
+      for (unsigned s = 0; s < ARRAY_SIZE(sz_descriptor_stages); s++) {
+         const mesa_shader_stage stage = sz_descriptor_stages[s];
+
+         for (unsigned i = 0; i < SZ_MAX_SSBO; i++) {
+            const struct pipe_shader_buffer *sb =
+               &ctx->state.shader_buffers[stage][i];
+            if (!sb->buffer)
+               continue;
+
+            struct sz_resource *res = sz_resource(sb->buffer);
+            if (res->buffer == VK_NULL_HANDLE)
+               continue;
+
+            sz_resource_access(screen, cmd, res, SZ_ACCESS_STORAGE_BUFFER);
+
+            const uint64_t offset = sb->buffer_offset;
+            uint64_t range = sb->buffer_size ? sb->buffer_size : VK_WHOLE_SIZE;
+            if (range != VK_WHOLE_SIZE)
+               range = MIN2(range, (uint64_t)sb->buffer->width0 - offset);
+
+            infos[count] = (VkDescriptorBufferInfo) {
+               .buffer = res->buffer,
+               .offset = offset,
+               .range = range,
+            };
+
+            writes[count] = (VkWriteDescriptorSet) {
+               .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+               .dstSet = VK_NULL_HANDLE,
+               .dstBinding = sz_ssbo_binding(stage, i),
+               .descriptorCount = 1,
+               .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                .pBufferInfo = &infos[count],
             };
 

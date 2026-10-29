@@ -712,6 +712,17 @@ sz_screen_create(struct sw_winsys *winsys, int fd,
        * whether that is honest -- drawIndirectFirstInstance, because GL allows a
        * first instance in the argument buffer, and multiDrawIndirect, because one
        * call can describe several draws. */
+      /* Shader storage blocks. The descriptor is a buffer address plus the range
+       * the application bound, the translator addresses it as a runtime array of
+       * 32-bit words, and the alignment is Vulkan's
+       * minStorageBufferOffsetAlignment. Claiming an alignment is also what makes
+       * the frontend expose ARB_shader_storage_buffer_object at all. */
+      caps->max_shader_buffer_size =
+         MIN2(screen->props.limits.maxStorageBufferRange,
+              (VkDeviceSize)UINT32_MAX);
+      caps->shader_buffer_offset_alignment =
+         MAX2(screen->props.limits.minStorageBufferOffsetAlignment, 1u);
+
       /* Buffer textures. The descriptor is a VkBufferView (pool path) or an
        * address+format (descriptor-buffer path), the SPIR-V side is OpTypeImage
        * with Dim Buffer, and sz_format.c already asks the device whether each

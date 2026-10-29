@@ -321,6 +321,10 @@ struct sz_context {
       /* Same ownership story for the storage images: imageLoad/imageStore name
        * the image through a descriptor this driver writes from here. */
       struct pipe_image_view *shader_images[MESA_SHADER_STAGES][SZ_MAX_IMAGES];
+      /* Shader storage blocks. The buffer is reference counted for the same
+       * reason the images are: a recorded draw names it through a descriptor this
+       * driver writes later, and the application may free it in between. */
+      struct pipe_shader_buffer shader_buffers[MESA_SHADER_STAGES][SZ_MAX_SSBO];
       void *shaders[MESA_SHADER_STAGES];
 
       /* Owned: the context holds a reference to every bound buffer, because

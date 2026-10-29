@@ -1756,6 +1756,26 @@ sz_set_shader_buffers(struct pipe_context *pipe, mesa_shader_stage shader,
                       const struct pipe_shader_buffer *buffers,
                       unsigned writable_bitmask)
 {
+   struct sz_context *ctx = sz_context(pipe);
+
+   /* Recorded draws name whatever was bound when they were queued, so the
+    * bindings they used have to be submitted before any of them changes. */
+   sz_draw_flush(ctx);
+
+   for (unsigned i = 0; i < count; i++) {
+      const unsigned slot = start_slot + i;
+      if (slot >= SZ_MAX_SSBO)
+         break;
+
+      struct pipe_shader_buffer *dst = &ctx->state.shader_buffers[shader][slot];
+      /* pipe_shader_buffer is a plain struct, so the destination already names
+       * the source and pipe_resource_reference() would do nothing. Clearing the
+       * field first is what makes the reference real. */
+      dst->buffer = NULL;
+      pipe_resource_reference(&dst->buffer, buffers[i].buffer);
+      dst->buffer_offset = buffers[i].buffer_offset;
+      dst->buffer_size = buffers[i].buffer_size;
+   }
 }
 
 /* The VkImageView for a bound storage image, and the transition that makes the
@@ -2367,9 +2387,10 @@ sz_emit_draws(struct sz_context *ctx, VkCommandBuffer cmd)
             }
          }
 
-         mesa_logi("SZ: draw %u%s count=%u first=%u bias=%d vh=%08x vb=%" PRIx64
+         mesa_logi("SZ: draw %u%s count=%u first=%u bias=%d inst=%d+%u vh=%08x vb=%" PRIx64
                    "+%" PRIu64 " ubo=%" PRIx64 "+%u/%u idx=%" PRIx64 "+%" PRIu64,
                    i, ctx->pending.indexed ? "i" : "", count, first, index_bias,
+                   ctx->pending.instance_count, ctx->pending.start_instance,
                    hash,
                    vb && vb->buffer.resource
                       ? (uint64_t)(uintptr_t)sz_resource(vb->buffer.resource)->buffer
@@ -3719,6 +3740,16 @@ sz_context_destroy(struct pipe_context *pipe)
                                  NULL);
       for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
          pipe_sampler_view_reference(&ctx->state.sampler_views[sh][i], NULL);
+      for (unsigned i = 0; i < SZ_MAX_IMAGES; i++) {
+         if (!ctx->state.shader_images[sh][i])
+            continue;
+         pipe_resource_reference(&ctx->state.shader_images[sh][i]->resource,
+                                 NULL);
+         FREE(ctx->state.shader_images[sh][i]);
+      }
+      for (unsigned i = 0; i < SZ_MAX_SSBO; i++)
+         pipe_resource_reference(&ctx->state.shader_buffers[sh][i].buffer,
+                                 NULL);
    }
 
    for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++) {

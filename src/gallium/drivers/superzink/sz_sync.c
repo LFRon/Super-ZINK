@@ -102,6 +102,21 @@ sz_sync_state_for(enum sz_access access, bool depth_stencil)
          .layout = VK_IMAGE_LAYOUT_UNDEFINED,
       };
 
+   case SZ_ACCESS_STORAGE_BUFFER:
+      /* A shader storage block is read and written, so the barrier has to make
+       * both directions visible to every stage that can reach it. */
+      return (struct sz_sync_state) {
+         .stages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                   VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+                   VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
+                   VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
+                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+         .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+         .layout = VK_IMAGE_LAYOUT_UNDEFINED,
+      };
+
    case SZ_ACCESS_TEXEL_BUFFER:
       /* A buffer texture is read through the same uniform-read path as a UBO:
        * SPIR-V sees it as OpImageFetch on a DimBuffer image, and Vulkan counts

@@ -87,7 +87,14 @@
 #define SZ_DESCRIPTOR_SET_IMAGES 3
 #define SZ_DESCRIPTOR_SET_COUNT 4
 #define SZ_DESCRIPTOR_STAGES 5
+/* Shader storage blocks live in the same set as the uniform buffers: both are
+ * VK_DESCRIPTOR_TYPE_*_BUFFER written per state change, so a second set would
+ * cost an extra binding and an extra layout for no gain. */
+#define SZ_MAX_SSBO 8
 #define SZ_DESCRIPTOR_UBO_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_CONST_BUFFERS)
+#define SZ_DESCRIPTOR_SSBO_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SSBO)
+#define SZ_DESCRIPTOR_BUFFER_BINDINGS \
+   (SZ_DESCRIPTOR_UBO_BINDINGS + SZ_DESCRIPTOR_SSBO_BINDINGS)
 #define SZ_DESCRIPTOR_SAMPLER_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
 #define SZ_DESCRIPTOR_TEXEL_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_SAMPLERS)
 #define SZ_DESCRIPTOR_IMAGE_BINDINGS (SZ_DESCRIPTOR_STAGES * SZ_MAX_IMAGES)
@@ -131,6 +138,15 @@ static inline unsigned
 sz_descriptor_binding(mesa_shader_stage stage, unsigned slot)
 {
    return sz_descriptor_stage_index(stage) * SZ_MAX_CONST_BUFFERS + slot;
+}
+
+/* Binding of shader storage block `slot` for `stage`. They follow every stage's
+ * constant buffers, so a shader buffer never collides with a uniform buffer. */
+static inline unsigned
+sz_ssbo_binding(mesa_shader_stage stage, unsigned slot)
+{
+   return SZ_DESCRIPTOR_UBO_BINDINGS +
+          sz_descriptor_stage_index(stage) * SZ_MAX_SSBO + slot;
 }
 
 /* Binding of texture unit `slot` for `stage`: the samplers of a stage follow its
