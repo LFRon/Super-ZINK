@@ -9,8 +9,11 @@
  * vkCreateBuffer will actually accept.
  */
 
+#include <stdlib.h>
+
 #include "util/log.h"
 #include "util/macros.h"
+#include "util/format/u_format.h"
 #include "util/u_math.h"
 
 #include "vk_format.h"
@@ -551,6 +554,73 @@ sz_format_supported_image(struct sz_screen *screen,
       sz_format_features_from_bindings(format, bindings) & ~SZ_BUFFER_FEATURES;
 
    return (features & required) == required;
+}
+
+/* One channel's contribution to a compatibility class. */
+struct sz_channel_class {
+   uint8_t size;
+   uint8_t type;
+   uint8_t normalized;
+};
+
+static int
+sz_channel_class_compare(const void *a, const void *b)
+{
+   const struct sz_channel_class *x = a, *y = b;
+   if (x->size != y->size)
+      return x->size < y->size ? -1 : 1;
+   if (x->type != y->type)
+      return x->type < y->type ? -1 : 1;
+   if (x->normalized != y->normalized)
+      return x->normalized < y->normalized ? -1 : 1;
+   return 0;
+}
+
+bool
+sz_format_blit_compatible(enum pipe_format src_format,
+                          enum pipe_format dst_format)
+{
+   if (src_format == dst_format)
+      return true;
+
+   const struct util_format_description *src = util_format_description(src_format);
+   const struct util_format_description *dst = util_format_description(dst_format);
+   if (!src || !dst)
+      return false;
+
+   /* Only plain colour layouts take part in Vulkan's classes; packed, sRGB with
+    * a different base, depth/stencil and compressed layouts are all their own
+    * thing, and a conversion between them is a numeric one GL spells out. */
+   if (src->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
+       dst->layout != UTIL_FORMAT_LAYOUT_PLAIN)
+      return false;
+   if (src->colorspace != dst->colorspace)
+      return false;
+   if (src->block.bits != dst->block.bits)
+      return false;
+
+   struct sz_channel_class a[4], b[4];
+   unsigned na = 0, nb = 0;
+   for (unsigned i = 0; i < 4; i++) {
+      if (src->channel[i].type == UTIL_FORMAT_TYPE_VOID)
+         continue;
+      a[na++] = (struct sz_channel_class){ src->channel[i].size,
+                                           src->channel[i].type,
+                                           src->channel[i].normalized };
+   }
+   for (unsigned i = 0; i < 4; i++) {
+      if (dst->channel[i].type == UTIL_FORMAT_TYPE_VOID)
+         continue;
+      b[nb++] = (struct sz_channel_class){ dst->channel[i].size,
+                                           dst->channel[i].type,
+                                           dst->channel[i].normalized };
+   }
+   if (na != nb || na == 0)
+      return false;
+
+   qsort(a, na, sizeof(a[0]), sz_channel_class_compare);
+   qsort(b, nb, sizeof(b[0]), sz_channel_class_compare);
+   return memcmp(a, b, na * sizeof(a[0])) == 0;
 }
 
 bool

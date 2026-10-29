@@ -90,6 +90,17 @@ bool sz_bindings_require_linear(unsigned bindings);
  * process reads them", which does. */
 bool sz_bindings_require_export(unsigned bindings);
 
+/* Whether vkCmdBlitImage can convert between two formats by itself.
+ *
+ * Vulkan groups formats into compatibility classes: within a class a blit
+ * converts by channel, so the texel size and the multiset of channel types have
+ * to match, while the channel *order* does not. RGBA8 and BGRA8 share a class,
+ * which is the pair GL asks for on every blit to the window of a little-endian
+ * display; a depth value converted from float to unorm is not, and neither is a
+ * 32-bit colour going to 16. */
+bool sz_format_blit_compatible(enum pipe_format src_format,
+                               enum pipe_format dst_format);
+
 /* The single entry point behind pipe_screen::is_format_supported(). */
 bool sz_format_supported(struct sz_screen *screen,
                          enum pipe_format format,
