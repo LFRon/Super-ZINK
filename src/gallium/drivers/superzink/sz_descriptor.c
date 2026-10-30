@@ -630,12 +630,21 @@ sz_resource_is_rendering_target(struct sz_context *ctx, struct sz_resource *res)
  * compressed surfaces make the loop a screenful of noise instead. */
 static bool
 sz_sampled_feedback_copy(struct sz_context *ctx, VkCommandBuffer cmd,
-                         struct sz_resource *res, VkImageView *view_out)
+                         struct sz_resource *res, VkFormat view_format,
+                         VkImageView *view_out)
 {
    struct sz_screen *screen = ctx->screen;
    const VkFormat format = sz_vk_format(screen, res->base.format);
+   /* The copy is of the bytes, so it stays in the storage format; only the view
+    * the sampler reads takes the format the draw asked for. A texture view that
+    * names another format is common here -- glGenerateMipmap reads level N-1 and
+    * renders into level N of the same texture, and the format it asks for is the
+    * view's. Sampling the copy with the storage format instead averages an
+    * R8_SNORM view of an R8 texture as unorm, which is a different number. */
+   const VkFormat copy_view_format =
+      view_format != VK_FORMAT_UNDEFINED ? view_format : format;
 
-   if (!ctx->sampled_copy || ctx->sampled_copy_format != format ||
+   if (!ctx->sampled_copy || ctx->sampled_copy_format != copy_view_format ||
        ctx->sampled_copy_extent[0] != res->base.width0 ||
        ctx->sampled_copy_extent[1] != res->base.height0) {
       pipe_resource_reference(&ctx->sampled_copy, NULL);
@@ -657,7 +666,7 @@ sz_sampled_feedback_copy(struct sz_context *ctx, VkCommandBuffer cmd,
          mesa_loge("SZ: out of memory allocating a feedback copy");
          return false;
       }
-      ctx->sampled_copy_format = format;
+      ctx->sampled_copy_format = copy_view_format;
       ctx->sampled_copy_extent[0] = res->base.width0;
       ctx->sampled_copy_extent[1] = res->base.height0;
    }
@@ -683,8 +692,18 @@ sz_sampled_feedback_copy(struct sz_context *ctx, VkCommandBuffer cmd,
    sz_resource_access(screen, cmd, res, SZ_ACCESS_COLOR_ATTACH);
    sz_resource_access(screen, cmd, copy, SZ_ACCESS_SAMPLED);
 
-   *view_out = copy->view;
-   return true;
+   if (copy_view_format == format) {
+      *view_out = copy->view;
+      return true;
+   }
+
+   /* A view in another format than the copy holds: the view is what names the
+    * numeric type to the sampler, and the texels are the same bytes either way. */
+   *view_out = sz_resource_view(ctx, copy, copy_view_format,
+                               sz_format_aspect(copy->base.format), 0,
+                               VK_REMAINING_MIP_LEVELS, 0,
+                               VK_REMAINING_ARRAY_LAYERS);
+   return *view_out != VK_NULL_HANDLE;
 }
 
 /* Fills the placeholder texture the first time a draw needs it.
@@ -778,10 +797,16 @@ sz_descriptor_prepare_sampled(struct sz_context *ctx, VkCommandBuffer cmd)
           * into a read-only image, and sampling the tiled attachment without it
           * reads noise. A copy of what has been rendered so far is what the GL
           * caller means. */
+         const struct sz_sampler_view *sv = NULL;
+         sz_sampled_resource(ctx, sz_descriptor_stages[s], i, NULL, &sv);
+
          if (sz_resource_is_rendering_target(ctx, res)) {
             if (ctx->rendering)
                sz_renderpass_end(ctx, cmd);
-            if (sz_sampled_feedback_copy(ctx, cmd, res,
+            const VkFormat view_format =
+               sv ? sz_vk_format(ctx->screen, sv->base.format)
+                  : VK_FORMAT_UNDEFINED;
+            if (sz_sampled_feedback_copy(ctx, cmd, res, view_format,
                                          &ctx->sampled_override.view[s][i]))
                continue;
          }

@@ -746,7 +746,26 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
        sz_format_can_blit(ctx->screen, src_format) &&
        sz_format_can_blit(ctx->screen, dst_format));
 
-   if (!natively_blittable) {
+   /* vkCmdBlitImage reads an image with the format the image was created with,
+    * not with the format the blit names. A texture view is the whole point of a
+    * blit whose formats differ from the storage -- glGenerateMipmap on an
+    * R8_SNORM view of an R8 texture averages the texels as unorm and gets the
+    * wrong answer, and an RGBA8 view of an R32F texture reads floats where the
+    * application wrote bytes. Both have to be drawn: the blitter samples through
+    * a view that carries the blit's format, which is what the view means. */
+   const bool storage_formats =
+      src_format == sz_vk_format(ctx->screen, info->src.resource->format) &&
+      dst_format == sz_vk_format(ctx->screen, info->dst.resource->format);
+
+   if (sz_debug_enabled(SZ_DEBUG_TRACE) && !storage_formats)
+      mesa_logi("SZ: blit %s(%s) -> %s(%s) level %u..%u storage-mismatch",
+                util_format_name(info->src.format),
+                util_format_name(info->src.resource->format),
+                util_format_name(info->dst.format),
+                util_format_name(info->dst.resource->format), info->src.level,
+                info->dst.level);
+
+   if (!natively_blittable || !storage_formats) {
       if (src_samples > 1 &&
           (aspect == VK_IMAGE_ASPECT_DEPTH_BIT ||
            aspect == VK_IMAGE_ASPECT_STENCIL_BIT)) {
@@ -758,6 +777,13 @@ sz_blit_aspect(struct sz_context *ctx, VkCommandBuffer cmd,
                          "format");
          return;
       }
+
+      /* A view format the storage does not have: draw it, so the texels are
+       * reinterpreted rather than converted. Falls through to the numeric path
+       * when the blitter declines the format. */
+      if (!storage_formats && sz_blit_blitter(ctx, info))
+         return;
+
       sz_blit_cross_format(&ctx->base, info, aspect);
       return;
    }
@@ -1096,8 +1122,12 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
       return;
    }
 
-   const VkFormat src_format = sz_vk_format(screen, info->src.resource->format);
-   const VkFormat dst_format = sz_vk_format(screen, info->dst.resource->format);
+   /* The blit's own formats, not the resources': GL lets a blit name a texture
+    * view, and glGenerateMipmap on an R8_SNORM view of an R8 texture is exactly
+    * that. Reading the storage format here made every such blit silently convert
+    * the texels as unorm. */
+   const VkFormat src_format = sz_vk_format(screen, info->src.format);
+   const VkFormat dst_format = sz_vk_format(screen, info->dst.format);
    const unsigned src_samples = MAX2(info->src.resource->nr_samples, 1);
    const unsigned dst_samples = MAX2(info->dst.resource->nr_samples, 1);
 
