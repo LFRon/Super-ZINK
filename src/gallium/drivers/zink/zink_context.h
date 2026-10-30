@@ -184,7 +184,8 @@ zink_reset_ds3_states(struct zink_context *ctx);
 bool
 zink_check_batch_completion(struct zink_context *ctx, uint64_t batch_id);
 VkCommandBuffer
-zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst);
+zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst,
+                enum zink_rp_closure_reason reason);
 unsigned
 zink_update_rendering_info(struct zink_context *ctx);
 void

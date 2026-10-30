@@ -511,7 +511,7 @@ zink_clear_texture_dynamic(struct pipe_context *pctx,
          zink_batch_rp(ctx);
    } else {
       zink_blit_barriers(ctx, NULL, res, full_clear);
-      cmdbuf = zink_get_cmdbuf(ctx, NULL, res);
+      cmdbuf = zink_get_cmdbuf(ctx, NULL, res, ZINK_RP_CLOSE_CLEAR);
       if (cmdbuf == ctx->bs->cmdbuf && ctx->in_rp)
          zink_batch_no_rp(ctx, ZINK_RP_CLOSE_CLEAR);
       zink_batch_reference_resource_rw(ctx, res, true);
@@ -575,7 +575,7 @@ zink_clear_buffer(struct pipe_context *pctx,
            or VK_WHOLE_SIZE to fill the range from offset to the end of the buffer
        */
       zink_resource_buffer_transfer_dst_barrier(ctx, res, offset, size);
-      VkCommandBuffer cmdbuf = zink_get_cmdbuf(ctx, NULL, res);
+      VkCommandBuffer cmdbuf = zink_get_cmdbuf(ctx, NULL, res, ZINK_RP_CLOSE_CLEAR);
       zink_batch_reference_resource_rw(ctx, res, true);
       VKCTX(CmdFillBuffer)(cmdbuf, res->obj->buffer, offset, size, *(uint32_t*)clear_value);
       return;
@@ -700,7 +700,7 @@ fb_clears_apply_internal(struct zink_context *ctx, struct pipe_resource *pres, i
        */
       bool can_reorder = !ctx->render_condition_active &&
                          !ctx->unordered_blitting &&
-                         zink_get_cmdbuf(ctx, NULL, res) == ctx->bs->reordered_cmdbuf;
+                         zink_get_cmdbuf(ctx, NULL, res, ZINK_RP_CLOSE_CLEAR) == ctx->bs->reordered_cmdbuf;
       if (can_reorder) {
          /* set unordered_blitting but NOT blitting:
           * let begin_rendering handle layouts

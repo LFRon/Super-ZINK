@@ -49,6 +49,10 @@ enum zink_rp_closure_reason {
    ZINK_RP_CLOSE_BARRIER,
    /* a command needs the ordered cmdbuf, so the pass cannot stay open */
    ZINK_RP_CLOSE_ORDERED_CMD,
+   /* a copy command needs the ordered cmdbuf (buffer or image transfer) */
+   ZINK_RP_CLOSE_TRANSFER,
+   /* an image barrier in the general-layout path */
+   ZINK_RP_CLOSE_IMAGE_BARRIER,
    /* a resource lost unordered access and has to be flushed in order */
    ZINK_RP_CLOSE_UNORDERED_OFF,
    /* query end / qbo update / render condition */

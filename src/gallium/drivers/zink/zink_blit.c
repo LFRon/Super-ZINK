@@ -87,7 +87,7 @@ blit_resolve(struct zink_context *ctx, const struct pipe_blit_info *info, bool n
    }
    VkCommandBuffer cmdbuf = needs_present_readback ?
                             ctx->bs->cmdbuf :
-                            zink_get_cmdbuf(ctx, src, dst);
+                            zink_get_cmdbuf(ctx, src, dst, ZINK_RP_CLOSE_BLIT_END);
    zink_batch_reference_resource_rw(ctx, src, false);
    zink_batch_reference_resource_rw(ctx, dst, true);
 
@@ -320,7 +320,7 @@ blit_native(struct zink_context *ctx, const struct pipe_blit_info *info, bool ne
    }
    VkCommandBuffer cmdbuf = needs_present_readback ?
                             ctx->bs->cmdbuf :
-                            zink_get_cmdbuf(ctx, src, dst);
+                            zink_get_cmdbuf(ctx, src, dst, ZINK_RP_CLOSE_BLIT_END);
    zink_batch_reference_resource_rw(ctx, src, false);
    zink_batch_reference_resource_rw(ctx, dst, true);
 
@@ -523,7 +523,7 @@ zink_blit(struct pipe_context *pctx,
    bool zsbuf_readonly = ctx->zsbuf_readonly;
    ctx->unordered_blitting = !(info->render_condition_enable && ctx->render_condition_active) &&
                              !needs_present_readback &&
-                             zink_get_cmdbuf(ctx, src, dst) == ctx->bs->reordered_cmdbuf;
+                             zink_get_cmdbuf(ctx, src, dst, ZINK_RP_CLOSE_BLIT_END) == ctx->bs->reordered_cmdbuf;
    VkCommandBuffer cmdbuf = ctx->bs->cmdbuf;
    VkPipeline pipeline = ctx->gfx_pipeline_state.pipeline;
    bool in_rp = ctx->in_rp;

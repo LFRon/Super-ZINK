@@ -5473,7 +5473,7 @@ zink_copy_buffer(struct zink_context *ctx, struct zink_resource *dst, struct zin
    bool unordered_dst = zink_resource_buffer_transfer_dst_barrier(ctx, dst, dst_offset, size);
    bool can_unorder = unordered_dst && unordered_src && !ctx->no_reorder;
    VkCommandBuffer cmdbuf = unsync ? ctx->bs->unsynchronized_cmdbuf : 
-                                     can_unorder ? ctx->bs->reordered_cmdbuf : zink_get_cmdbuf(ctx, src, dst);
+                                     can_unorder ? ctx->bs->reordered_cmdbuf : zink_get_cmdbuf(ctx, src, dst, ZINK_RP_CLOSE_TRANSFER);
    ctx->bs->has_reordered_work |= can_unorder;
    ctx->bs->has_unsync |= unsync;
    zink_batch_reference_resource_rw(ctx, src, false);
@@ -5594,7 +5594,7 @@ zink_copy_image_buffer(struct zink_context *ctx, struct zink_resource *dst, stru
                             /* never promote to unordered if swapchain was acquired */
                             needs_present_readback ?
                             ctx->bs->cmdbuf :
-                            buf2img ? zink_get_cmdbuf(ctx, buf, use_img) : zink_get_cmdbuf(ctx, use_img, buf);
+                            buf2img ? zink_get_cmdbuf(ctx, buf, use_img, ZINK_RP_CLOSE_TRANSFER) : zink_get_cmdbuf(ctx, use_img, buf, ZINK_RP_CLOSE_TRANSFER);
    if (unsync) {
       zink_batch_resource_usage_set(ctx->bs, use_img, buf2img, use_img->obj->is_buffer);
       if (!zink_batch_reference_resource_move_unsync(ctx, use_img))
@@ -5850,7 +5850,7 @@ zink_resource_copy_region(struct pipe_context *pctx,
       } else {
          zink_resource_setup_transfer_layouts(ctx, src, dst);
       }
-      VkCommandBuffer cmdbuf = zink_get_cmdbuf(ctx, src, dst);
+      VkCommandBuffer cmdbuf = zink_get_cmdbuf(ctx, src, dst, ZINK_RP_CLOSE_TRANSFER);
       zink_batch_reference_resource_rw(ctx, src, false);
       zink_batch_reference_resource_rw(ctx, dst, true);
 

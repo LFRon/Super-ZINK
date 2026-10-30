@@ -143,7 +143,8 @@ check_unordered_exec(struct zink_context *ctx, struct zink_resource *res, bool i
 }
 
 VkCommandBuffer
-zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst)
+zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink_resource *dst,
+                enum zink_rp_closure_reason reason)
 {
    bool unordered_exec = !ctx->no_reorder;
 
@@ -158,7 +159,7 @@ zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink
 
 
    if (!unordered_exec || ctx->unordered_blitting)
-      zink_batch_no_rp(ctx, ZINK_RP_CLOSE_ORDERED_CMD);
+      zink_batch_no_rp(ctx, reason);
 
    if (unordered_exec) {
       ctx->bs->has_reordered_work = true;
@@ -384,7 +385,7 @@ struct update_unordered_access_and_get_cmdbuf<false> {
        */
          zink_batch_no_rp(ctx, ZINK_RP_CLOSE_UNORDERED_OFF);
       } else {
-         cmdbuf = is_write ? zink_get_cmdbuf(ctx, NULL, res) : zink_get_cmdbuf(ctx, res, NULL);
+         cmdbuf = is_write ? zink_get_cmdbuf(ctx, NULL, res, ZINK_RP_CLOSE_UNORDERED_OFF) : zink_get_cmdbuf(ctx, res, NULL, ZINK_RP_CLOSE_UNORDERED_OFF);
          /* force subsequent barriers to be ordered to avoid layout desync */
          if (cmdbuf != ctx->bs->reordered_cmdbuf) {
             zink_resource_disable_unordered(res, true);
@@ -446,7 +447,7 @@ zink_resource_image_barrier(struct zink_context *ctx, struct zink_resource *res,
    bool completed = !has_usage || zink_resource_usage_check_completion_fast(zink_screen(ctx->base.screen), res, ZINK_RESOURCE_ACCESS_RW);
    bool usage_matches = zink_resource_usage_matches(res, ctx->bs);
    VkCommandBuffer cmdbuf = GENERAL && new_layout == VK_IMAGE_LAYOUT_GENERAL ?
-                            (UNSYNCHRONIZED ? ctx->bs->unsynchronized_cmdbuf : is_write ? zink_get_cmdbuf(ctx, NULL, res) : zink_get_cmdbuf(ctx, res, NULL)) :
+                            (UNSYNCHRONIZED ? ctx->bs->unsynchronized_cmdbuf : is_write ? zink_get_cmdbuf(ctx, NULL, res, ZINK_RP_CLOSE_IMAGE_BARRIER) : zink_get_cmdbuf(ctx, res, NULL, ZINK_RP_CLOSE_IMAGE_BARRIER)) :
                             update_unordered_access_and_get_cmdbuf<UNSYNCHRONIZED>::apply(ctx, res, usage_matches, is_write);
 
    assert(new_layout);
@@ -672,7 +673,7 @@ zink_resource_memory_barrier(struct zink_context *ctx, struct zink_resource *res
 
    if (!can_skip_unordered && !can_skip_ordered) {
       VkCommandBuffer cmdbuf = UNSYNCHRONIZED ? ctx->bs->unsynchronized_cmdbuf :
-                                                is_write ? zink_get_cmdbuf(ctx, NULL, res) : zink_get_cmdbuf(ctx, res, NULL);
+                                                is_write ? zink_get_cmdbuf(ctx, NULL, res, ZINK_RP_CLOSE_IMAGE_BARRIER) : zink_get_cmdbuf(ctx, res, NULL, ZINK_RP_CLOSE_IMAGE_BARRIER);
       bool marker = false;
       ctx->bs->has_unsync |= UNSYNCHRONIZED;
       if (unlikely(zink_tracing)) {
