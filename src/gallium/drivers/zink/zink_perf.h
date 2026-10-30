@@ -109,6 +109,10 @@ enum zink_perf_counter {
    ZINK_PERF_NO_COLOR_OUTPUTS,
    /* gfx program variants compiled with the extra color outputs dropped */
    ZINK_PERF_EXTRA_COLOR_OUTPUTS,
+   /* memory barriers flushed (one flush can carry several) */
+   ZINK_PERF_MB_BARRIERS,
+   /* vkCmdPipelineBarrier(2) calls emitted for those barriers */
+   ZINK_PERF_MB_CALLS,
    ZINK_PERF_LAST,
 };
 

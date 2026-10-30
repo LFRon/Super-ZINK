@@ -90,14 +90,15 @@ zink_perf_tick(void)
            "  | vstate=%" PRIu64 " bind=%" PRIu64 " skip=%" PRIu64
            "  pLookup=%" PRIu64 " pMiss=%" PRIu64
            "  desc=%" PRIu64 " batch=%" PRIu64 " submit=%" PRIu64
-           "  nocolor=%" PRIu64 "/%" PRIu64 "\n",
+           "  nocolor=%" PRIu64 "/%" PRIu64 " mb=%" PRIu64 "/%" PRIu64 "\n",
            draws, draw_ns, ds ? (double)dcycles / (double)ds : 0.0,
            ds ? (double)(zink_perf.pipeline_cycles) / (double)ds : 0.0,
            zink_perf.c[ZINK_PERF_VSTATE_DRAWS], zink_perf.c[ZINK_PERF_VSTATE_BINDS],
            zink_perf.c[ZINK_PERF_VSTATE_SKIPS], zink_perf.c[ZINK_PERF_PIPE_LOOKUPS],
            zink_perf.c[ZINK_PERF_PIPE_MISSES], zink_perf.c[ZINK_PERF_DESC_UPDATES],
            zink_perf.c[ZINK_PERF_BATCHES], zink_perf.c[ZINK_PERF_SUBMITS],
-           zink_perf.c[ZINK_PERF_NO_COLOR_OUTPUTS], zink_perf.c[ZINK_PERF_EXTRA_COLOR_OUTPUTS]);
+           zink_perf.c[ZINK_PERF_NO_COLOR_OUTPUTS], zink_perf.c[ZINK_PERF_EXTRA_COLOR_OUTPUTS],
+           zink_perf.c[ZINK_PERF_MB_BARRIERS], zink_perf.c[ZINK_PERF_MB_CALLS]);
 
    zink_perf.draws_at_last_dump = draws;
    zink_perf.cycles_at_last_dump = zink_perf.draw_cycles;
