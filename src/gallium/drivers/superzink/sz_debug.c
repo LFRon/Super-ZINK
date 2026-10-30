@@ -28,6 +28,7 @@ sz_debug_options[] = {
    { "submit_each", SZ_DEBUG_SUBMIT_EACH, "Submit after every draw batch but do not wait" },
    { "race",      SZ_DEBUG_RACE,      "Warn when the CPU writes a buffer an uncompleted submission still reads" },
    { "stream",    SZ_DEBUG_STREAM,    "Print one line per draw with the buffers and offsets it uses" },
+   { "dump_frame", SZ_DEBUG_DUMP_FRAME, "Write every presented image to a PPM (see sz_dmabuf.c)" },
    DEBUG_NAMED_VALUE_END
 };
 
@@ -36,6 +37,17 @@ DEBUG_GET_ONCE_FLAGS_OPTION(sz_debug, "SZ_DEBUG", sz_debug_options, 0)
 uint32_t sz_debug;
 
 int sz_trace_budget = 400;
+
+void
+sz_log_slow_(const char *what, int64_t start_ns, double threshold_ms)
+{
+   if (!sz_debug_enabled(SZ_DEBUG_STATS))
+      return;
+
+   const double ms = (os_time_get_nano() - start_ns) / 1000000.0;
+   if (ms > threshold_ms)
+      mesa_logi("SZ: slow %s: %.1f ms", what, ms);
+}
 
 void
 sz_trace_(const char *fmt, ...)

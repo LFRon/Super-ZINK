@@ -29,6 +29,7 @@
 
 #include "util/u_debug.h"
 #include "util/u_dl.h"
+#include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
 #include "util/os_file.h"
@@ -456,6 +457,7 @@ sz_screen_destroy(struct pipe_screen *pscreen)
 {
    struct sz_screen *screen = sz_screen(pscreen);
 
+   pipe_resource_reference(&screen->dump_target, NULL);
    sz_queue_state_finish(&screen->batch_state);
    /* The context destroyed the queue idle, so nothing can be reading a retired
     * resource any more. Tear them down while the device is still alive. */

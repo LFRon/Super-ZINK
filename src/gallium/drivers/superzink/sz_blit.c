@@ -33,6 +33,7 @@
 #include "util/u_blitter.h"
 #include "util/macros.h"
 #include "util/u_math.h"
+#include "util/u_inlines.h"
 
 #include <stdlib.h>
 #include <stdlib.h>
@@ -1041,6 +1042,15 @@ sz_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    struct sz_resource *dst = sz_resource(info->dst.resource);
    if (src->image == VK_NULL_HANDLE || dst->image == VK_NULL_HANDLE)
       return;
+
+   /* A blit into a scanout-capable image is how an application presents, and it
+    * is the only place that names the window while the frame is being drawn.
+    * Remembering it here is what lets SZ_DEBUG=dump_frame dump the picture the
+    * display gets rather than the offscreen target the app happened to leave
+    * bound. */
+   if (sz_debug_enabled(SZ_DEBUG_DUMP_FRAME) &&
+       (info->dst.resource->bind & PIPE_BIND_SCANOUT) && dst->exportable)
+      pipe_resource_reference(&screen->dump_target, info->dst.resource);
 
    /* A blit that the destination cannot hold, or that a scissor restricts, goes
     * to the blitter: it draws the rectangle, so the rasteriser clips and scissors

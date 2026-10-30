@@ -13,6 +13,7 @@
  */
 
 #include "sz_context.h"
+#include "sz_dmabuf.h"
 
 #include "nir/tgsi_to_nir.h"
 
@@ -251,11 +252,69 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
     * Without it the compositor can sample a surface the GPU is still writing. */
    if (flags & PIPE_FLUSH_END_OF_FRAME) {
       ctx->screen->stats.end_of_frame++;
+      const int64_t wait_start = sz_time_now();
       sz_queue_wait_idle(&ctx->screen->batch_state);
+      sz_time_slow("queue wait (end of frame)", wait_start);
 
-      /* SZ_DEBUG=stats: a periodic snapshot, because an app killed with
-       * SIGTERM never reaches context destroy. */
+      /* The color buffer bound right now is the one the display is about to
+       * show, which is what a frame dump wants. */
+      struct pipe_resource *presented = ctx->screen->dump_target;
+      if (!presented)
+         presented = ctx->state.framebuffer.cbufs[0].texture;
+      if (presented)
+         sz_dump_frame_if_wanted(ctx->screen, sz_resource(presented));
+
+      /* SZ_DEBUG=stats: frame pacing and a periodic snapshot, because an app
+       * killed with SIGTERM never reaches context destroy.
+       *
+       * "It stutters" is not measurable from the outside: the window manager,
+       * the compositor and the application all add their own pauses. What the
+       * backend sees is the gap between one end-of-frame and the next, together
+       * with what grew in between -- which is the only way to tell a pipeline
+       * compile or a descriptor flood apart from a stall. */
       if (sz_debug_enabled(SZ_DEBUG_STATS)) {
+         static struct {
+            int64_t last_ns;
+            uint64_t draws, submits, builds, pushes, blits;
+            uint64_t wait_ns, wait_calls;
+            uint64_t win_wait_ns, win_wait_calls;
+            double sum_ms, max_ms;
+            unsigned frames;
+            unsigned over_20ms, over_50ms;
+         } pace;
+         const int64_t now = os_time_get_nano();
+         if (pace.last_ns) {
+            const double ms = (now - pace.last_ns) / 1000000.0;
+            pace.sum_ms += ms;
+            pace.max_ms = MAX2(pace.max_ms, ms);
+            if (ms > 20.0)
+               pace.over_20ms++;
+            if (ms > 50.0) {
+               pace.over_50ms++;
+               const struct sz_screen *s = ctx->screen;
+               mesa_logi("SZ: hitch: %.1f ms, drew %" PRIu64
+                         " submitted %" PRIu64 " built %" PRIu64
+                         " pushed %" PRIu64 " blitted %" PRIu64
+                         " waited %" PRIu64 " us in %" PRIu64 " calls",
+                         ms, s->stats.draws - pace.draws,
+                         s->stats.submits - pace.submits,
+                         s->stats.pipeline_builds - pace.builds,
+                         s->stats.descriptor_pushes - pace.pushes,
+                         s->stats.blits - pace.blits,
+                         (s->stats.wait_ns - pace.wait_ns) / 1000,
+                         s->stats.wait_calls - pace.wait_calls);
+            }
+         }
+         pace.last_ns = now;
+         pace.frames++;
+         pace.wait_ns = ctx->screen->stats.wait_ns;
+         pace.wait_calls = ctx->screen->stats.wait_calls;
+         pace.draws = ctx->screen->stats.draws;
+         pace.submits = ctx->screen->stats.submits;
+         pace.builds = ctx->screen->stats.pipeline_builds;
+         pace.pushes = ctx->screen->stats.descriptor_pushes;
+         pace.blits = ctx->screen->stats.blits;
+
          static unsigned frames;
          if (++frames % 120 == 0) {
             const struct sz_screen *screen = ctx->screen;
@@ -274,6 +333,18 @@ sz_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
                       ", copies %" PRIu64 ") end_of_frame=%" PRIu64,
                       screen->stats.blits, screen->stats.resolves,
                       screen->stats.copies, screen->stats.end_of_frame);
+            mesa_logi("SZ: pace: avg %.2f ms, max %.1f ms over %u frames"
+                      " (%u >20ms, %u >50ms), waited %" PRIu64
+                      " us in %" PRIu64 " calls",
+                      pace.sum_ms / pace.frames, pace.max_ms, pace.frames,
+                      pace.over_20ms, pace.over_50ms,
+                      (screen->stats.wait_ns - pace.win_wait_ns) / 1000,
+                      screen->stats.wait_calls - pace.win_wait_calls);
+            pace.sum_ms = pace.max_ms = 0.0;
+            pace.frames = 0;
+            pace.over_20ms = pace.over_50ms = 0;
+            pace.win_wait_ns = screen->stats.wait_ns;
+            pace.win_wait_calls = screen->stats.wait_calls;
          }
       }
 

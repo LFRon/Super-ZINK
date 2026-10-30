@@ -194,6 +194,11 @@ sz_queue_wait_idle(struct sz_queue_state *qs)
    if (!screen)
       return;
 
+   /* How long the CPU spends blocked here is the whole story of whether a frame
+    * is late because the GPU is behind (this wait is long) or because the CPU
+    * could not keep up (it is short). SZ_DEBUG=profile reports it per frame. */
+   const int64_t wait_start = sz_time_now();
+
    const struct sz_queue *queue = sz_queue_for_family(screen, qs->family);
 
    if (!queue) {
@@ -210,6 +215,9 @@ sz_queue_wait_idle(struct sz_queue_state *qs)
    } else {
       qs->completed_value = qs->next_value;
    }
+
+   screen->stats.wait_ns += (uint64_t)(sz_time_now() - wait_start);
+   screen->stats.wait_calls++;
 }
 
 struct sz_batch *
@@ -275,6 +283,7 @@ sz_batch_submit(struct sz_batch *batch, VkPipelineStageFlags2 wait_stage)
       mesa_loge("SZ: submitted a batch that is still recording");
       return false;
    }
+   const int64_t submit_start = sz_time_now();
 
    const struct sz_queue *queue = sz_queue_for_family(screen, qs->family);
    if (!queue) {
@@ -332,6 +341,7 @@ sz_batch_submit(struct sz_batch *batch, VkPipelineStageFlags2 wait_stage)
    }
 
    batch->submit_value = signal_value;
+   sz_time_slow("vkQueueSubmit2", submit_start);
    return true;
 }
 

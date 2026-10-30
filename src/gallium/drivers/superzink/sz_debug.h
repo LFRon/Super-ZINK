@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "util/log.h"
+#include "util/os_time.h"
 #include "util/macros.h"
 
 enum sz_debug_flag {
@@ -32,6 +33,7 @@ enum sz_debug_flag {
    SZ_DEBUG_SUBMIT_EACH = (1 << 13),
    SZ_DEBUG_RACE      = (1 << 14),
    SZ_DEBUG_STREAM    = (1 << 15),
+   SZ_DEBUG_DUMP_FRAME = (1 << 16),
 };
 
 extern uint32_t sz_debug;
@@ -56,6 +58,16 @@ void sz_trace_(const char *fmt, ...) PRINTFLIKE(1, 2);
       if (sz_debug & SZ_DEBUG_TRACE)                                           \
          sz_trace_(fmt, ##__VA_ARGS__);                                        \
    } while (0)
+
+/* Timing for the handful of calls that can block on the GPU, the display or the
+ * allocator. A frame that takes a second is either one slow call or a lot of
+ * small ones, and nothing outside the driver can tell those apart. */
+void sz_log_slow_(const char *what, int64_t start_ns, double threshold_ms);
+
+#define sz_time_now() os_time_get_nano()
+
+#define sz_time_slow(what, start_ns)                                           \
+   sz_log_slow_((what), (start_ns), 20.0)
 
 /* Warnings describe a degraded-but-working path, so they are visible by default
  * and silenced by SZ_DEBUG=quiet. Failures use mesa_loge() and are never

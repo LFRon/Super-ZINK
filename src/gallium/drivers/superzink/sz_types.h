@@ -254,6 +254,15 @@ struct sz_screen {
     * context. */
    struct sz_queue_state batch_state;
 
+   /* The buffer an application last presented to, kept referenced.
+    *
+    * A frame is presented by blitting into the window, which does not bind that
+    * window as a framebuffer, so the color buffer bound at end of frame is the
+    * offscreen target, not what the display shows. SZ_DEBUG=dump_frame needs the
+    * latter, and it needs it alive: the window can be reallocated while a dump
+    * still points at it. */
+   struct pipe_resource *dump_target;
+
    /* Resources awaiting the timeline value in `value`. See
     * sz_screen_resource_destroy().
     *
@@ -440,6 +449,8 @@ struct sz_screen {
       uint64_t copies;           /* of those, same-size image copies */
       uint64_t end_of_frame;     /* flushes that carried PIPE_FLUSH_END_OF_FRAME */
       uint64_t submits;
+      uint64_t wait_ns;          /* CPU time blocked in sz_queue_wait_idle */
+      uint64_t wait_calls;       /* how often that happened */
    } stats;
 };
 

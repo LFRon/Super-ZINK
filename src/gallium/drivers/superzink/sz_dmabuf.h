@@ -34,4 +34,10 @@ void sz_dmabuf_screen_init(struct sz_screen *screen);
  * SZ_DEBUG=selftest path as the render and memory tests. */
 unsigned sz_dmabuf_selftest(struct sz_screen *screen);
 
+/* SZ_DEBUG=dump_frame: writes the image a frame ends up presenting to a PPM.
+ * Separating "the window is wrong" from "the driver drew the wrong thing" needs
+ * the picture the driver handed out, not the picture the compositor shows. */
+struct sz_resource;
+void sz_dump_frame_if_wanted(struct sz_screen *screen, struct sz_resource *res);
+
 #endif /* SZ_DMABUF_H */

@@ -24,6 +24,7 @@
 
 #include "sz_batch.h"
 #include "sz_context.h"
+#include "sz_debug.h"
 #include "sz_device.h"
 #include "sz_format.h"
 #include "sz_resource.h"
@@ -38,6 +39,8 @@
 #include "vk_format.h"
 
 #include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #define SZ_DMABUF_HANDLE_TYPE VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
@@ -208,6 +211,221 @@ sz_screen_resource_get_param(struct pipe_screen *pscreen,
    return true;
 }
 
+/* ── frame dump ──────────────────────────────────────────────────────────── */
+
+/* SZ_DEBUG=dump_frame writes the image the driver is about to hand to the
+ * display to a PPM. This exists because "the window is wrong" and "the driver
+ * drew the wrong thing" are the same picture on screen, and only the second one
+ * is a driver bug: dumping the presented image separates them without depending
+ * on the window being mapped, focused or visible at all.
+ *
+ * One dump happens when /tmp/sz-dump-now exists (the file is removed), and one
+ * every SZ_DUMP_EVERY presented frames otherwise. Files go to SZ_DUMP_DIR,
+ * which defaults to /tmp/sz-frames. */
+static void
+sz_dump_write_ppm(const char *path, const uint8_t *pixels, unsigned width,
+                  unsigned height, unsigned row_pitch, VkFormat format)
+{
+   FILE *f = fopen(path, "wb");
+   if (!f)
+      return;
+
+   fprintf(f, "P6\n%u %u\n255\n", width, height);
+   for (unsigned y = 0; y < height; y++) {
+      const uint8_t *row = pixels + (size_t)y * row_pitch;
+      for (unsigned x = 0; x < width; x++) {
+         const uint8_t *p = row + (size_t)x * 4;
+         /* What a window is allocated in, versus what some configurations end up
+          * with. Every other 32-bit format is reported as blue-green-red too, so
+          * a wrong guess shows up as a colour swap rather than as nothing. */
+         const bool bgr = format == VK_FORMAT_B8G8R8A8_UNORM ||
+                          format == VK_FORMAT_B8G8R8A8_SRGB;
+         fputc(bgr ? p[2] : p[0], f);
+         fputc(p[1], f);
+         fputc(bgr ? p[0] : p[2], f);
+      }
+   }
+   fclose(f);
+}
+
+static void
+sz_dump_frame(struct sz_screen *screen, struct sz_resource *res)
+{
+   const unsigned width = res->base.width0;
+   const unsigned height = res->base.height0;
+   const VkFormat format =
+      res->image != VK_NULL_HANDLE ? sz_vk_format(screen, res->base.format)
+                                   : VK_FORMAT_UNDEFINED;
+
+   if (res->image == VK_NULL_HANDLE || !width || !height ||
+       vk_format_get_blocksize(format) != 4) {
+      mesa_logw("SZ: dump_frame: cannot dump %ux%u %s", width, height,
+                util_format_name(res->base.format));
+      return;
+   }
+
+   const VkImageSubresource subresource = {
+      .aspectMask = sz_dmabuf_layout_aspect(res),
+      .mipLevel = 0,
+      .arrayLayer = 0,
+   };
+   VkSubresourceLayout image_layout;
+   screen->vk.GetImageSubresourceLayout(screen->dev, res->image, &subresource,
+                                        &image_layout);
+
+   const VkBufferCreateInfo buffer_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = image_layout.rowPitch * height,
+      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   VkBuffer buffer = VK_NULL_HANDLE;
+   if (screen->vk.CreateBuffer(screen->dev, &buffer_info, NULL, &buffer) !=
+       VK_SUCCESS) {
+      mesa_loge("SZ: dump_frame: CreateBuffer failed");
+      return;
+   }
+
+   VkMemoryRequirements req;
+   screen->vk.GetBufferMemoryRequirements(screen->dev, buffer, &req);
+   struct sz_bo *bo = sz_bo_alloc(screen, &req,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+   if (!bo) {
+      screen->vk.DestroyBuffer(screen->dev, buffer, NULL);
+      mesa_loge("SZ: dump_frame: no host-visible memory");
+      return;
+   }
+   screen->vk.BindBufferMemory(screen->dev, buffer, sz_bo_memory(bo),
+                               sz_bo_offset(bo));
+
+   /* The image is in whatever layout the frame left it in. Going to
+    * TRANSFER_SRC and back keeps the resource's tracked layout truthful, which
+    * is what everything after this dump relies on. */
+   struct sz_batch *batch = sz_batch_begin(&screen->batch_state);
+   if (!batch) {
+      sz_bo_free(bo);
+      screen->vk.DestroyBuffer(screen->dev, buffer, NULL);
+      mesa_loge("SZ: dump_frame: no command buffer");
+      return;
+   }
+   const VkCommandBuffer cmd = batch->cmd;
+
+   const VkImageMemoryBarrier2 to_src = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+      .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
+      .oldLayout = res->levels ? VK_IMAGE_LAYOUT_GENERAL : res->layout,
+      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = res->image,
+      .subresourceRange = {
+         .aspectMask = subresource.aspectMask,
+         .baseMipLevel = 0, .levelCount = 1,
+         .baseArrayLayer = 0, .layerCount = 1,
+      },
+   };
+   const VkDependencyInfo to_src_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &to_src,
+   };
+   screen->vk.CmdPipelineBarrier2(cmd, &to_src_dep);
+
+   const VkBufferImageCopy region = {
+      .bufferRowLength = image_layout.rowPitch / 4,
+      .bufferImageHeight = height,
+      .imageSubresource = {
+         .aspectMask = subresource.aspectMask,
+         .mipLevel = 0,
+         .baseArrayLayer = 0,
+         .layerCount = 1,
+      },
+      .imageExtent = { width, height, 1 },
+   };
+   screen->vk.CmdCopyImageToBuffer(cmd, res->image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer,
+                                   1, &region);
+
+   VkImageMemoryBarrier2 back = to_src;
+   back.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+   back.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+   back.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+   back.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+   back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+   back.newLayout = to_src.oldLayout;
+   const VkDependencyInfo back_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &back,
+   };
+   screen->vk.CmdPipelineBarrier2(cmd, &back_dep);
+
+   if (!sz_batch_end(batch) ||
+       !sz_batch_submit(batch, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT)) {
+      sz_bo_free(bo);
+      screen->vk.DestroyBuffer(screen->dev, buffer, NULL);
+      mesa_loge("SZ: dump_frame: submit failed");
+      return;
+   }
+   sz_queue_wait_idle(&screen->batch_state);
+
+   static unsigned seq;
+   const char *dir = getenv("SZ_DUMP_DIR");
+   if (!dir || !*dir)
+      dir = "/tmp/sz-frames";
+   char path[512];
+   snprintf(path, sizeof(path), "%s/frame-%05u.ppm", dir, seq++);
+
+   const char *pixels = sz_bo_map(bo);
+   if (pixels) {
+      sz_dump_write_ppm(path, (const uint8_t *)pixels, width, height,
+                        image_layout.rowPitch, format);
+      mesa_logi("SZ: dumped %s (%ux%u %s, bind 0x%x, exportable %d, layout %u)",
+                path, width, height, util_format_name(res->base.format),
+                res->base.bind, res->exportable, (unsigned)res->layout);
+   }
+
+   sz_bo_free(bo);
+   screen->vk.DestroyBuffer(screen->dev, buffer, NULL);
+}
+
+/* Returns true when this presented frame should be dumped. A touch of
+ * /tmp/sz-dump-now asks for exactly one frame, which is what makes it possible
+ * to capture "the frame where it is stuck" instead of a stream of them. */
+static bool
+sz_dump_frame_wanted(void)
+{
+   if (access("/tmp/sz-dump-now", F_OK) == 0) {
+      unlink("/tmp/sz-dump-now");
+      return true;
+   }
+
+   static unsigned every;
+   if (!every) {
+      const char *env = getenv("SZ_DUMP_EVERY");
+      every = env && atoi(env) > 0 ? (unsigned)atoi(env) : 0;
+   }
+
+   static unsigned presented;
+   return every && ++presented % every == 0;
+}
+
+/* Dumps the presented image when a dump was asked for. Called once per frame
+ * from pipe_context::flush, which is the only place that knows a frame is
+ * being handed to the display. */
+void
+sz_dump_frame_if_wanted(struct sz_screen *screen, struct sz_resource *res)
+{
+   if (!sz_debug_enabled(SZ_DEBUG_DUMP_FRAME) || !res || !sz_dump_frame_wanted())
+      return;
+
+   sz_dump_frame(screen, res);
+}
+
 /* ── export ──────────────────────────────────────────────────────────────── */
 
 static bool
@@ -264,7 +482,9 @@ sz_screen_resource_get_handle(struct pipe_screen *pscreen,
     * instead of stalling; VK_KHR_present_wait is not core in any version, so a
     * 1.3 (or a 1.4) device may not have it, and the wait below is then the
     * correct behaviour rather than a degraded one. See SZ_CAP_OPTIONAL_LIST. */
+   const int64_t export_wait = sz_time_now();
    sz_queue_wait_idle(&screen->batch_state);
+   sz_time_slow("queue wait (export to display)", export_wait);
 
    const VkImageSubresource subresource = {
       .aspectMask = sz_dmabuf_layout_aspect(res),
