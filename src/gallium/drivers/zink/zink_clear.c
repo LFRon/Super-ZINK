@@ -207,7 +207,7 @@ zink_clear(struct pipe_context *pctx,
       if (buffers & PIPE_CLEAR_DEPTHSTENCIL && (ctx->zsbuf_unused || ctx->zsbuf_readonly)) {
          /* this will need a layout change */
          assert(!ctx->track_renderpasses || screen->driver_workarounds.general_layout);
-         zink_batch_no_rp(ctx);
+         zink_batch_no_rp(ctx, ZINK_RP_CLOSE_CLEAR);
       } else {
          clear_in_rp(pctx, buffers, scissor_state, pcolor, depth, stencil);
          return;
@@ -513,7 +513,7 @@ zink_clear_texture_dynamic(struct pipe_context *pctx,
       zink_blit_barriers(ctx, NULL, res, full_clear);
       cmdbuf = zink_get_cmdbuf(ctx, NULL, res);
       if (cmdbuf == ctx->bs->cmdbuf && ctx->in_rp)
-         zink_batch_no_rp(ctx);
+         zink_batch_no_rp(ctx, ZINK_RP_CLOSE_CLEAR);
       zink_batch_reference_resource_rw(ctx, res, true);
       needs_rp = true;
    }
@@ -714,7 +714,7 @@ fb_clears_apply_internal(struct zink_context *ctx, struct pipe_resource *pres, i
       /* this will automatically trigger all the clears */
       zink_batch_rp(ctx);
       if (can_reorder) {
-         zink_batch_no_rp(ctx);
+         zink_batch_no_rp(ctx, ZINK_RP_CLOSE_CLEAR);
          ctx->unordered_blitting = false;
          ctx->rp_changed = true;
          ctx->queries_disabled = queries_disabled;

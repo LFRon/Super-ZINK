@@ -786,7 +786,7 @@ copy_pool_results_to_buffer(struct zink_context *ctx, struct zink_query *query, 
 
    bool marker = zink_cmd_debug_marker_begin(ctx, VK_NULL_HANDLE, "update_qbo(%s: id=%u, num_results=%d)", vk_QueryType_to_str(query->vkqtype), query_id, num_results);
 
-   zink_batch_no_rp(ctx);
+   zink_batch_no_rp(ctx, ZINK_RP_CLOSE_QUERY);
    /* if it's a single query that doesn't need special handling, we can copy it and be done */
    zink_batch_reference_resource_rw(ctx, res, true);
    zink_resource_disable_unordered(res, true);
@@ -1114,7 +1114,7 @@ zink_end_query(struct pipe_context *pctx,
    } else if (query->active) {
       /* this should be a tc-optimized query end that doesn't split a renderpass */
       if (!query->started_in_rp)
-         zink_batch_no_rp(ctx);
+         zink_batch_no_rp(ctx, ZINK_RP_CLOSE_QUERY);
       end_query(ctx, query);
    }
 
@@ -1367,7 +1367,7 @@ zink_render_condition(struct pipe_context *pctx,
 {
    struct zink_context *ctx = zink_context(pctx);
    struct zink_query *query = (struct zink_query *)pquery;
-   zink_batch_no_rp(ctx);
+   zink_batch_no_rp(ctx, ZINK_RP_CLOSE_QUERY);
    VkQueryResultFlagBits flags = 0;
 
    ctx->bs->has_work = true;

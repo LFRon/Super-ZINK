@@ -1,6 +1,7 @@
 #include "zink_batch.h"
 #include "util/timespec.h"
 #include "zink_context.h"
+#include "zink_perf.h"
 #include "zink_descriptors.h"
 #include "zink_kopper.h"
 #include "zink_program.h"
@@ -568,6 +569,8 @@ zink_batch_bind_db(struct zink_context *ctx)
 void
 zink_start_batch(struct zink_context *ctx)
 {
+   if (zink_perf.enabled)
+      zink_perf_count(ZINK_PERF_BATCHES);
    MESA_TRACE_FUNC();
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    zink_reset_batch(ctx);
@@ -910,6 +913,8 @@ submit_queue(void *data, void *gdata, int thread_index)
    }
    screen->last_submit_id = batch_id;
    screen->last_submit_is_video = bs->is_video;
+   if (zink_perf.enabled)
+      zink_perf_count(ZINK_PERF_SUBMITS);
    VRAM_ALLOC_LOOP(result,
       VKSCR(QueueSubmit)(bs->is_video ? screen->queue_video_decode : screen->queue, num_si, submit, VK_NULL_HANDLE),
       if (result != VK_SUCCESS) {

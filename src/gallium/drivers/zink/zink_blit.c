@@ -391,7 +391,7 @@ zink_blit(struct pipe_context *pctx,
       if (!resolve)
          resolve = ctx->dynamic_fb.tc_info.resolve[is_depth];
       if (resolve == info->dst.resource) {
-         zink_batch_no_rp_safe(ctx);
+         zink_batch_no_rp_safe(ctx, ZINK_RP_CLOSE_RESOLVE_TARGET);
          ctx->awaiting_resolve = false;
          ctx->rp_tc_info_updated = true;
          return;
@@ -589,7 +589,7 @@ zink_blit(struct pipe_context *pctx,
       ctx->clears_enabled = clears_enabled;
    }
    if (ctx->unordered_blitting) {
-      zink_batch_no_rp(ctx);
+      zink_batch_no_rp(ctx, ZINK_RP_CLOSE_BLIT_END);
       ctx->in_rp = in_rp;
       uint32_t rp_state = zink_update_rendering_info(ctx);
       if (ctx->gfx_pipeline_state.rp_state != rp_state)

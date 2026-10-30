@@ -24,6 +24,7 @@
 #include "zink_screen.h"
 
 #include "zink_kopper.h"
+#include "zink_perf.h"
 #include "zink_compiler.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
@@ -3889,6 +3890,8 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       mesa_loge("Zink requires the nullDescriptor feature of KHR/EXT robustness2.");
       goto fail;
    }
+
+   zink_perf_init();
 
    if (zink_set_driver_strings(screen)) {
       mesa_loge("ZINK: failed to set driver strings\n");

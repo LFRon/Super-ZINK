@@ -28,6 +28,7 @@
 #include "zink_compiler.h"
 #include "nir_to_spirv/nir_to_spirv.h"
 #include "zink_context.h"
+#include "zink_perf.h"
 #include "zink_program.h"
 #include "zink_render_pass.h"
 #include "zink_screen.h"
@@ -73,6 +74,8 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
                          VkPrimitiveTopology primitive_topology,
                          bool optimize)
 {
+   if (zink_perf.enabled)
+      zink_perf_count(ZINK_PERF_PIPE_MISSES);
    struct zink_rasterizer_hw_state *hw_rast_state = (void*)&state->dyn_state3;
    VkPipelineVertexInputStateCreateInfo vertex_input_state;
    bool is_mesh = !prog->shaders[MESA_SHADER_VERTEX];

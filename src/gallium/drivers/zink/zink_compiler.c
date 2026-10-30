@@ -26,6 +26,7 @@
 #include "zink_context.h"
 #include "zink_compiler.h"
 #include "zink_descriptors.h"
+#include "zink_perf.h"
 #include "zink_program.h"
 #include "zink_screen.h"
 #include "nir_to_spirv/nir_to_spirv.h"
@@ -4284,10 +4285,17 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
          if (zink_fs_key(key)->robust_access)
             NIR_PASS(need_optimize, nir, lower_txf_lod_robustness);
 
-         if (zink_fs_key_base(key)->color_mode == ZINK_FS_COLOR_NONE && zink_shader_has_removable_color_outputs(zs))
-            need_optimize |= remove_color_outputs(nir, ZINK_FS_COLOR_OUTPUTS);
-         else if (zink_fs_key_base(key)->color_mode == ZINK_FS_COLOR_SINGLE && zink_shader_has_extra_color_outputs(zs))
-            need_optimize |= remove_color_outputs(nir, ZINK_FS_EXTRA_COLOR_OUTPUTS);
+         if (zink_fs_key_base(key)->color_mode == ZINK_FS_COLOR_NONE && zink_shader_has_removable_color_outputs(zs)) {
+            bool removed = remove_color_outputs(nir, ZINK_FS_COLOR_OUTPUTS);
+            need_optimize |= removed;
+            if (removed && zink_perf.enabled)
+               zink_perf_count(ZINK_PERF_NO_COLOR_OUTPUTS);
+         } else if (zink_fs_key_base(key)->color_mode == ZINK_FS_COLOR_SINGLE && zink_shader_has_extra_color_outputs(zs)) {
+            bool removed = remove_color_outputs(nir, ZINK_FS_EXTRA_COLOR_OUTPUTS);
+            need_optimize |= removed;
+            if (removed && zink_perf.enabled)
+               zink_perf_count(ZINK_PERF_EXTRA_COLOR_OUTPUTS);
+         }
 
          if (!zink_fs_key_base(key)->samples && zink_shader_uses_samples(zs)) {
             /* VK will always use gl_SampleMask[] values even if sample count is 0,

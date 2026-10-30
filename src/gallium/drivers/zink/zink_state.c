@@ -691,7 +691,7 @@ zink_bind_rasterizer_state(struct pipe_context *pctx, void *cso)
           pv_last != ctx->rast_state->hw_state.pv_last &&
           /* without this prop, change in pv mode requires new rp */
           !screen->info.pv_props.provokingVertexModePerPipeline)
-         zink_batch_no_rp(ctx);
+         zink_batch_no_rp(ctx, ZINK_RP_CLOSE_PROVOKING_VERTEX);
       memcpy(&ctx->gfx_pipeline_state.dyn_state3, &ctx->rast_state->hw_state, sizeof(struct zink_rasterizer_hw_state));
 
       if (!zink_screen(pctx->screen)->info.have_EXT_extended_dynamic_state3)

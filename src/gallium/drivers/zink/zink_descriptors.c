@@ -31,6 +31,7 @@
 #include "zink_program.h"
 #include "zink_render_pass.h"
 #include "zink_resource.h"
+#include "zink_perf.h"
 #include "zink_screen.h"
 
 #define XXH_INLINE_ALL
@@ -1945,6 +1946,8 @@ zink_descriptors_update_bindless(struct zink_context *ctx)
             else
                wd.pImageInfo = &ctx->di.bindless[i].img_infos[handle];
             /* this sucks, but sets must be singly updated to be handled correctly */
+            if (zink_perf.enabled)
+               zink_perf_count(ZINK_PERF_DESC_UPDATES);
             VKSCR(UpdateDescriptorSets)(screen->dev, 1, &wd, 0, NULL);
          }
       }

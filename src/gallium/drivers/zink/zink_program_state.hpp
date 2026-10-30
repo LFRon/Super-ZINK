@@ -32,6 +32,7 @@
  */
 #include "zink_types.h"
 #include "zink_pipeline.h"
+#include "zink_perf.h"
 #include "zink_program.h"
 #include "zink_screen.h"
 
@@ -132,6 +133,9 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
    }
 
    struct hash_entry *entry = NULL;
+
+   if (zink_perf.enabled)
+      zink_perf_count(ZINK_PERF_PIPE_LOOKUPS);
 
    /* recalc the base pipeline state hash */
    if (IS_MESH) {

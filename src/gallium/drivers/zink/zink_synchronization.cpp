@@ -158,7 +158,7 @@ zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink
 
 
    if (!unordered_exec || ctx->unordered_blitting)
-      zink_batch_no_rp(ctx);
+      zink_batch_no_rp(ctx, ZINK_RP_CLOSE_ORDERED_CMD);
 
    if (unordered_exec) {
       ctx->bs->has_reordered_work = true;
@@ -382,7 +382,7 @@ struct update_unordered_access_and_get_cmdbuf<false> {
          /* it's impossible to detect this from the caller
        * there should be no valid case where this barrier can occur inside a renderpass
        */
-         zink_batch_no_rp(ctx);
+         zink_batch_no_rp(ctx, ZINK_RP_CLOSE_UNORDERED_OFF);
       } else {
          cmdbuf = is_write ? zink_get_cmdbuf(ctx, NULL, res) : zink_get_cmdbuf(ctx, res, NULL);
          /* force subsequent barriers to be ordered to avoid layout desync */

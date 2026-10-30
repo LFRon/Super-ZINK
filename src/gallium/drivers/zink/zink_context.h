@@ -25,6 +25,7 @@
 #define ZINK_CONTEXT_H
 
 #include "util/u_rect.h"
+#include "zink_perf.h"
 #include "zink_types.h"
 #include "vk_enum_to_str.h"
 
@@ -226,10 +227,11 @@ zink_init_vk_sample_locations(struct zink_context *ctx, VkSampleLocationsInfoEXT
 void
 zink_batch_rp(struct zink_context *ctx);
 
+/* every pass closure names its reason: see zink_perf.h */
 void
-zink_batch_no_rp(struct zink_context *ctx);
+zink_batch_no_rp(struct zink_context *ctx, enum zink_rp_closure_reason reason);
 void
-zink_batch_no_rp_safe(struct zink_context *ctx);
+zink_batch_no_rp_safe(struct zink_context *ctx, enum zink_rp_closure_reason reason);
 
 static inline VkPipelineStageFlags
 zink_pipeline_flags_from_pipe_stage(mesa_shader_stage pstage)

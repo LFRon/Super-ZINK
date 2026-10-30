@@ -2,6 +2,7 @@
 #include "zink_compiler.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
+#include "zink_perf.h"
 #include "zink_program.h"
 #include "zink_program_state.hpp"
 #include "zink_query.h"
@@ -915,7 +916,7 @@ zink_draw_atoms(struct zink_context *ctx,
          case ZINK_ATOM_DEBUG_SYNC:
             if (unlikely(zink_debug & ZINK_DEBUG_SYNC)) {
                zink_mark_atom_dirty(ctx, ZINK_ATOM_DEBUG_SYNC);
-               zink_batch_no_rp(ctx);
+               zink_batch_no_rp(ctx, ZINK_RP_CLOSE_DEBUG_SYNC);
                VkMemoryBarrier mb;
                mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
                mb.pNext = NULL;
@@ -1155,6 +1156,24 @@ zink_draw(struct pipe_context *pctx,
           uint32_t partial_velem_mask)
 {
    MESA_TRACE_FUNC();
+   /* Scoped so every early return still lands the cycle count. */
+   struct zink_perf_draw_scope {
+      uint64_t t0;
+      unsigned ndraws;
+      bool on;
+      zink_perf_draw_scope(unsigned nd) : t0(0), ndraws(nd), on(zink_perf.enabled) {
+         if (on)
+            t0 = zink_perf_clock();
+      }
+      ~zink_perf_draw_scope() {
+         if (!on)
+            return;
+         zink_perf.draw_cycles += zink_perf_clock() - t0;
+         /* one call can carry up to 255 merged draws, so count the real draws */
+         zink_perf_add(ZINK_PERF_DRAWS, ndraws);
+         zink_perf_tick();
+      }
+   } perf_scope(num_draws);
    if (!dindirect && (!draws[0].count || !dinfo->instance_count)) {
       if (VBS == ZINK_VBS_UNOWNED)
          zink_mark_atom_dirty(zink_context(pctx), ZINK_ATOM_VERTEX_BUFFERS);
@@ -1368,7 +1387,7 @@ zink_draw_mesh_tasks(struct pipe_context *pctx, const struct pipe_grid_info *inf
    zink_update_barriers(ctx, false, NULL, info->indirect, info->indirect_draw_count);
 
    if (unlikely(zink_debug & ZINK_DEBUG_SYNC)) {
-      zink_batch_no_rp(ctx);
+      zink_batch_no_rp(ctx, ZINK_RP_CLOSE_DEBUG_SYNC);
       VkMemoryBarrier mb;
       mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
       mb.pNext = NULL;
@@ -1574,6 +1593,8 @@ zink_bind_vertex_state(struct zink_context *ctx, struct pipe_vertex_state *vstat
 
    const unsigned num_bindings = zstate->velems.hw_state.num_bindings;
    const unsigned num_attribs = zstate->velems.hw_state.num_attribs;
+   if (zink_perf.enabled)
+      zink_perf_count(ZINK_PERF_VSTATE_DRAWS);
    /* different vertex states usually share a layout, so compare contents and not pointers */
    if (!ctx->vstate_bound.input_valid ||
        ctx->vstate_bound.full_velem_mask != vstate->input.full_velem_mask ||
@@ -1591,6 +1612,10 @@ zink_bind_vertex_state(struct zink_context *ctx, struct pipe_vertex_state *vstat
       memcpy(ctx->vstate_bound.bindings, zstate->velems.hw_state.dynbindings, num_bindings * sizeof(ctx->vstate_bound.bindings[0]));
       memcpy(ctx->vstate_bound.attribs, zstate->velems.hw_state.dynattribs, num_attribs * sizeof(ctx->vstate_bound.attribs[0]));
       ctx->vstate_bound.buffer_valid = false;
+      if (zink_perf.enabled)
+         zink_perf_count(ZINK_PERF_VSTATE_BINDS);
+   } else if (zink_perf.enabled) {
+      zink_perf_count(ZINK_PERF_VSTATE_SKIPS);
    }
 
    struct zink_resource *res = zink_resource(vstate->input.vbuffer.buffer.resource);
@@ -1679,7 +1704,7 @@ zink_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       zink_flush_memory_barrier(ctx);
 
    if (unlikely(zink_debug & ZINK_DEBUG_SYNC)) {
-      zink_batch_no_rp(ctx);
+      zink_batch_no_rp(ctx, ZINK_RP_CLOSE_DEBUG_SYNC);
       VkMemoryBarrier mb;
       mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
       mb.pNext = NULL;
@@ -1732,7 +1757,7 @@ zink_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       zink_descriptors_update_bindless(ctx);
 
    ctx->work_count++;
-   zink_batch_no_rp(ctx);
+   zink_batch_no_rp(ctx, ZINK_RP_CLOSE_COMPUTE);
    if (!ctx->queries_disabled)
       zink_resume_cs_query(ctx);
    if (info->indirect) {
