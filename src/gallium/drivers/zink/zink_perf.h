@@ -78,6 +78,15 @@ enum zink_rp_closure_reason {
    ZINK_RP_CLOSE_COUNT,
 };
 
+/* what kind of resource an image barrier that had to break the pass was for */
+enum zink_perf_ib_kind {
+   ZINK_PERF_IB_ATTACHMENT,
+   ZINK_PERF_IB_SAMPLED,
+   ZINK_PERF_IB_SWAPCHAIN,
+   ZINK_PERF_IB_BUFFER,
+   ZINK_PERF_IB_KIND_COUNT,
+};
+
 enum zink_perf_counter {
    ZINK_PERF_DRAWS,
    /* draws that went through the vertex-state (display list) path */
@@ -115,6 +124,8 @@ struct zink_perf_counters {
    uint64_t rp_closes[ZINK_RP_CLOSE_COUNT];
    /* bytes that a closed pass had to write back because storeOp != DONT_CARE */
    uint64_t rp_store_bytes;
+   /* pass-closing barriers by resource kind */
+   uint64_t ib_kind[ZINK_PERF_IB_KIND_COUNT];
    uint64_t draws_at_last_dump;
    uint64_t cycles_at_last_dump;
    uint64_t wall_at_last_dump;
@@ -147,6 +158,15 @@ static inline void
 zink_perf_add(enum zink_perf_counter i, uint64_t v)
 {
    zink_perf.c[i] += v;
+}
+
+static inline void
+zink_perf_ib(bool is_buffer, bool is_attachment, bool is_swapchain)
+{
+   const enum zink_perf_ib_kind k = is_buffer ? ZINK_PERF_IB_BUFFER :
+                                   is_attachment ? ZINK_PERF_IB_ATTACHMENT :
+                                   is_swapchain ? ZINK_PERF_IB_SWAPCHAIN : ZINK_PERF_IB_SAMPLED;
+   zink_perf.ib_kind[k]++;
 }
 
 static inline void

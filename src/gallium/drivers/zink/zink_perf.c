@@ -56,6 +56,7 @@ zink_perf_tick(void)
    static uint64_t rp_opens_at_last_dump;
    static uint64_t rp_closes_at_last_dump[ZINK_RP_CLOSE_COUNT];
    static uint64_t rp_store_at_last_dump;
+   static uint64_t ib_at_last_dump[ZINK_PERF_IB_KIND_COUNT];
 
    if (!zink_perf.enabled)
       return;
@@ -120,6 +121,22 @@ zink_perf_tick(void)
          fprintf(stderr, "ZINKPERF rp   %-20s %" PRIu64 "  (%.1f%%)\n",
                  zink_rp_closure_reason_str[i], d,
                  closes_delta ? 100.0 * (double)d / (double)closes_delta : 0.0);
+      }
+   }
+   {
+      static const char *const kinds[ZINK_PERF_IB_KIND_COUNT] = {
+         "attachment", "sampled", "swapchain", "buffer",
+      };
+      uint64_t total = 0;
+      for (unsigned i = 0; i < ZINK_PERF_IB_KIND_COUNT; i++)
+         total += zink_perf.ib_kind[i] - ib_at_last_dump[i];
+      if (total)
+         fprintf(stderr, "ZINKPERF ib total=%" PRIu64 "\n", total);
+      for (unsigned i = 0; i < ZINK_PERF_IB_KIND_COUNT; i++) {
+         const uint64_t d = zink_perf.ib_kind[i] - ib_at_last_dump[i];
+         if (d)
+            fprintf(stderr, "ZINKPERF ib   %-12s %" PRIu64 "\n", kinds[i], d);
+         ib_at_last_dump[i] = zink_perf.ib_kind[i];
       }
    }
    rp_opens_at_last_dump = rp_opens;

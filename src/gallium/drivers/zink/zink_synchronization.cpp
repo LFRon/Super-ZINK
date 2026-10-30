@@ -26,6 +26,7 @@
 
 #include "zink_batch.h"
 #include "zink_context.h"
+#include "zink_perf.h"
 #include "zink_descriptors.h"
 #include "zink_resource.h"
 #include "zink_screen.h"
@@ -672,6 +673,8 @@ zink_resource_memory_barrier(struct zink_context *ctx, struct zink_resource *res
       can_skip_unordered = can_skip_ordered = false;
 
    if (!can_skip_unordered && !can_skip_ordered) {
+      if (zink_perf.enabled && ctx->in_rp)
+         zink_perf_ib(res->obj->is_buffer, res->fb_bind_count > 0, !!res->obj->dt);
       VkCommandBuffer cmdbuf = UNSYNCHRONIZED ? ctx->bs->unsynchronized_cmdbuf :
                                                 is_write ? zink_get_cmdbuf(ctx, NULL, res, ZINK_RP_CLOSE_IMAGE_BARRIER) : zink_get_cmdbuf(ctx, res, NULL, ZINK_RP_CLOSE_IMAGE_BARRIER);
       bool marker = false;
